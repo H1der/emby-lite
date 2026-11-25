@@ -1,0 +1,691 @@
+package server
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+
+	"emby-lite/internal/audit"
+	"emby-lite/internal/auth"
+	"emby-lite/internal/backup"
+	"emby-lite/internal/cache"
+	"emby-lite/internal/config"
+	"emby-lite/internal/database"
+	"emby-lite/internal/files"
+	imgpipe "emby-lite/internal/image"
+	"emby-lite/internal/migration"
+	"emby-lite/internal/model"
+	"emby-lite/internal/playback"
+	"emby-lite/internal/scanner"
+	"emby-lite/internal/scraper"
+	"emby-lite/internal/task"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+)
+
+type AdminHandler struct {
+	db        *database.DB
+	cache     cache.Store
+	cfg       *config.Config
+	auth      *auth.Service
+	scanner   *scanner.Service
+	playback  *playback.Service
+	tasks     *task.Queue
+	images    *imgpipe.Pipeline
+	scraper   *scraper.Service
+	files     *files.Manager
+	backups   *backup.Service
+	migration *migration.Service
+	audit     *audit.Logger
+}
+
+func NewAdminHandler(
+	db *database.DB,
+	cacheStore cache.Store,
+	cfg *config.Config,
+	authSvc *auth.Service,
+	scanSvc *scanner.Service,
+	pbSvc *playback.Service,
+	taskQueue *task.Queue,
+	imgPipeline *imgpipe.Pipeline,
+	scraperSvc *scraper.Service,
+	fileMgr *files.Manager,
+	backupSvc *backup.Service,
+	migSvc *migration.Service,
+	auditLog *audit.Logger,
+) *AdminHandler {
+	return &AdminHandler{
+		db:        db,
+		cache:     cacheStore,
+		cfg:       cfg,
+		auth:      authSvc,
+		scanner:   scanSvc,
+		playback:  pbSvc,
+		tasks:     taskQueue,
+		images:    imgPipeline,
+		scraper:   scraperSvc,
+		files:     fileMgr,
+		backups:   backupSvc,
+		migration: migSvc,
+		audit:     auditLog,
+	}
+}
+
+func (a *AdminHandler) RequireAdmin() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		p, err := a.auth.AuthenticateRequest(c.Request)
+		if err != nil || p == nil || p.IsAPIKey || p.User == nil || !p.User.IsAdmin {
+			c.JSON(http.StatusForbidden, gin.H{"error": "administrator login required"})
+			c.Abort()
+			return
+		}
+		c.Set("admin_principal", p)
+		c.Next()
+	}
+}
+
+// --- Web Bootstrap & Setup Wizard ---
+
+func (a *AdminHandler) Bootstrap(c *gin.Context) {
+	initialized, err := a.auth.IsInitialized()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"initialized": initialized,
+		"server_name": a.db.GetSetting("server_name", a.cfg.Server.ServerName),
+		"server_id":   a.db.GetSetting("server_id", ""),
+		"version":     "0.1.0-m1",
+	})
+}
+
+func (a *AdminHandler) Setup(c *gin.Context) {
+	var body struct {
+		Username   string `json:"username" binding:"required"`
+		Password   string `json:"password" binding:"required,min=4"`
+		ServerName string `json:"server_name"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	user, err := a.auth.CreateInitialAdmin(body.Username, body.Password, body.ServerName)
+	if err != nil {
+		status := http.StatusBadRequest
+		if err == auth.ErrAlreadyInitialized {
+			status = http.StatusConflict
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
+		return
+	}
+	meta := auth.ExtractClientMeta(c.Request)
+	if meta.Client == "" {
+		meta.Client = "Emby-Lite Web"
+	}
+	if meta.Device == "" {
+		meta.Device = "Browser"
+	}
+	_, token, err := a.auth.AuthenticateByName(c.Request.Context(), body.Username, body.Password, meta)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{
+		"user":         user,
+		"access_token": token,
+	})
+}
+
+// ExternalPlay returns direct stream URL + external player URI schemes (IINA, PotPlayer, Infuse).
+func (a *AdminHandler) ExternalPlay(c *gin.Context) {
+	p, err := a.auth.AuthenticateRequest(c.Request)
+	if err != nil || p == nil || p.User == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+		return
+	}
+	itemID := c.Param("itemId")
+	var item model.Item
+	if err := a.db.Gorm.Where("id = ? AND soft_deleted_at IS NULL", itemID).First(&item).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
+		return
+	}
+	if !a.auth.CanAccessLibrary(p, item.LibraryID) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
+		return
+	}
+	sources := a.playback.BuildMediaSources(c.Request, p, &item)
+	if len(sources) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no playable source"})
+		return
+	}
+	directURL, _ := sources[0]["Path"].(string)
+	encoded := url.QueryEscape(directURL)
+	c.JSON(http.StatusOK, gin.H{
+		"item_id":    item.ID,
+		"name":       item.Name,
+		"direct_url": directURL,
+		"players": gin.H{
+			"iina":      "iina://weblink?url=" + encoded,
+			"potplayer": "potplayer://" + directURL,
+			"infuse":    "infuse://x-callback-url/play?url=" + encoded,
+			"vlc":       "vlc://" + directURL,
+		},
+		"sources": sources,
+	})
+}
+
+// --- Admin Dashboard ---
+
+func (a *AdminHandler) Dashboard(c *gin.Context) {
+	var libCount, movieCount, seriesCount, episodeCount, userCount, activeLeases int64
+	a.db.Gorm.Model(&model.Library{}).Count(&libCount)
+	a.db.Gorm.Model(&model.Item{}).Where("type = ? AND soft_deleted_at IS NULL", "Movie").Count(&movieCount)
+	a.db.Gorm.Model(&model.Item{}).Where("type = ? AND soft_deleted_at IS NULL", "Series").Count(&seriesCount)
+	a.db.Gorm.Model(&model.Item{}).Where("type = ? AND soft_deleted_at IS NULL", "Episode").Count(&episodeCount)
+	a.db.Gorm.Model(&model.User{}).Count(&userCount)
+	a.db.Gorm.Model(&model.PlaybackLease{}).Where("expires_at >= ?", time.Now().UTC()).Count(&activeLeases)
+
+	var imgStats imgpipe.CacheStats
+	if a.images != nil {
+		imgStats = a.images.Stats()
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"server_name":       a.db.GetSetting("server_name", a.cfg.Server.ServerName),
+		"server_id":         a.db.GetSetting("server_id", ""),
+		"database":          a.db.Dialect,
+		"has_fts5":          a.db.HasFTS5,
+		"has_trgm":          a.db.HasTrgm,
+		"cache":             a.cache.BackendName(),
+		"ffprobe_available": a.scanner.Prober().HasFFprobe(),
+		"image_cache_files": imgStats.FileCount,
+		"image_cache_bytes": imgStats.TotalBytes,
+		"scanning":          a.scanner.IsScanning() || (a.tasks != nil && a.tasks.HasActive("scan")),
+		"libraries":         libCount,
+		"movies":            movieCount,
+		"series":            seriesCount,
+		"episodes":          episodeCount,
+		"users":             userCount,
+		"active_streams":    activeLeases,
+	})
+}
+
+// --- Admin Libraries ---
+
+type libraryPayload struct {
+	Name         string   `json:"name" binding:"required"`
+	Kind         string   `json:"kind" binding:"required"` // movies | tvshows | mixed
+	Paths        []string `json:"paths" binding:"required,min=1"`
+	Hidden       bool     `json:"hidden"`
+	SortOrder    int      `json:"sort_order"`
+	ScanSchedule string   `json:"scan_schedule"`
+}
+
+func (a *AdminHandler) ListLibraries(c *gin.Context) {
+	var libs []model.Library
+	if err := a.db.Gorm.Order("sort_order ASC, name ASC").Find(&libs).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	out := make([]map[string]any, 0, len(libs))
+	for _, l := range libs {
+		var paths []string
+		_ = json.Unmarshal([]byte(l.PathsJSON), &paths)
+		out = append(out, map[string]any{
+			"id":              l.ID,
+			"name":            l.Name,
+			"kind":            l.Kind,
+			"paths":           paths,
+			"hidden":          l.Hidden,
+			"sort_order":      l.SortOrder,
+			"scan_schedule":   l.ScanSchedule,
+			"status":          l.Status,
+			"last_error":      l.LastError,
+			"item_count":      l.ItemCount,
+			"last_scanned_at": l.LastScannedAt,
+			"scanning":        a.scanner.IsLibraryScanning(l.ID),
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"items": out})
+}
+
+func (a *AdminHandler) CreateLibrary(c *gin.Context) {
+	var body libraryPayload
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	kind := strings.ToLower(strings.TrimSpace(body.Kind))
+	if kind != "movies" && kind != "tvshows" && kind != "mixed" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "kind must be movies, tvshows, or mixed"})
+		return
+	}
+	pathsBytes, _ := json.Marshal(cleanPaths(body.Paths))
+	lib := model.Library{
+		ID:           strings.ReplaceAll(uuid.NewString(), "-", ""),
+		Name:         strings.TrimSpace(body.Name),
+		Kind:         kind,
+		PathsJSON:    string(pathsBytes),
+		Hidden:       body.Hidden,
+		SortOrder:    body.SortOrder,
+		ScanSchedule: body.ScanSchedule,
+		Status:       "idle",
+	}
+	if err := a.db.Gorm.Create(&lib).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	a.db.BumpLibraryRevision()
+	c.JSON(http.StatusCreated, gin.H{"id": lib.ID, "name": lib.Name, "kind": lib.Kind, "paths": cleanPaths(body.Paths)})
+}
+
+func (a *AdminHandler) UpdateLibrary(c *gin.Context) {
+	id := c.Param("id")
+	var lib model.Library
+	if err := a.db.Gorm.Where("id = ?", id).First(&lib).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "library not found"})
+		return
+	}
+	var body libraryPayload
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	pathsBytes, _ := json.Marshal(cleanPaths(body.Paths))
+	lib.Name = strings.TrimSpace(body.Name)
+	lib.Kind = strings.ToLower(strings.TrimSpace(body.Kind))
+	lib.PathsJSON = string(pathsBytes)
+	lib.Hidden = body.Hidden
+	lib.SortOrder = body.SortOrder
+	lib.ScanSchedule = body.ScanSchedule
+	if err := a.db.Gorm.Save(&lib).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	a.db.BumpLibraryRevision()
+	c.JSON(http.StatusOK, gin.H{"id": lib.ID, "name": lib.Name})
+}
+
+func (a *AdminHandler) DeleteLibrary(c *gin.Context) {
+	id := c.Param("id")
+	_ = a.db.Gorm.Where("library_id = ?", id).Delete(&model.ScanFile{}).Error
+	_ = a.db.Gorm.Where("library_id = ?", id).Delete(&model.Item{}).Error
+	_ = a.db.Gorm.Where("library_id = ?", id).Delete(&model.UserLibrary{}).Error
+	_ = a.db.Gorm.Where("library_id = ?", id).Delete(&model.GroupLibrary{}).Error
+	if err := a.db.Gorm.Where("id = ?", id).Delete(&model.Library{}).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	a.db.BumpLibraryRevision()
+	c.Status(http.StatusNoContent)
+}
+
+func (a *AdminHandler) ScanLibrary(c *gin.Context) {
+	id := c.Param("id")
+	if c.Query("sync") == "true" {
+		stats, err := a.scanner.ScanLibrary(c.Request.Context(), id)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "stats": stats})
+			return
+		}
+		c.JSON(http.StatusOK, stats)
+		return
+	}
+	if a.tasks != nil {
+		t, created, err := a.tasks.Enqueue("scan", 10, map[string]string{"library_id": id}, "等待扫描媒体库")
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusAccepted, gin.H{"started": created, "library_id": id, "task": t})
+		return
+	}
+	started := a.scanner.ScanLibraryAsync(id)
+	c.JSON(http.StatusAccepted, gin.H{"started": started, "library_id": id})
+}
+
+func (a *AdminHandler) ProbeLibrary(c *gin.Context) {
+	id := c.Param("id")
+	includeSTRM := strings.EqualFold(c.Query("include_strm"), "true")
+	if c.Query("sync") == "true" {
+		n, err := a.scanner.ProbeLibrarySources(c.Request.Context(), id, includeSTRM, nil)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"probed": n, "library_id": id})
+		return
+	}
+	t, created, err := a.tasks.Enqueue("probe", 5, map[string]any{
+		"library_id":   id,
+		"include_strm": includeSTRM,
+	}, "等待探测媒体信息")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{"started": created, "library_id": id, "task": t})
+}
+
+func (a *AdminHandler) ScanAll(c *gin.Context) {
+	if a.tasks != nil {
+		var libs []model.Library
+		_ = a.db.Gorm.Find(&libs).Error
+		queued := 0
+		for _, l := range libs {
+			if _, created, err := a.tasks.Enqueue("scan", 10, map[string]string{"library_id": l.ID}, "等待扫描："+l.Name); err == nil && created {
+				queued++
+			}
+		}
+		c.JSON(http.StatusAccepted, gin.H{"started": queued})
+		return
+	}
+	started := a.scanner.ScanAllAsync()
+	c.JSON(http.StatusAccepted, gin.H{"started": started})
+}
+
+// --- Background Tasks & SSE ---
+
+func (a *AdminHandler) ListTasks(c *gin.Context) {
+	tasks, err := a.tasks.List(50)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"items": tasks})
+}
+
+func (a *AdminHandler) CancelTask(c *gin.Context) {
+	if err := a.tasks.Cancel(c.Param("id")); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (a *AdminHandler) TaskEventsSSE(c *gin.Context) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	sub := a.tasks.Subscribe()
+	defer a.tasks.Unsubscribe(sub)
+
+	flusher, ok := c.Writer.(http.Flusher)
+	if ok {
+		_, _ = fmt.Fprint(c.Writer, "event: connected\ndata: {\"ok\":true}\n\n")
+		flusher.Flush()
+	}
+
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
+
+	ctx := c.Request.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-heartbeat.C:
+			_, _ = fmt.Fprint(c.Writer, ": ping\n\n")
+			if ok {
+				flusher.Flush()
+			}
+		case ev, open := <-sub:
+			if !open {
+				return
+			}
+			b, err := json.Marshal(ev)
+			if err != nil {
+				continue
+			}
+			_, _ = fmt.Fprintf(c.Writer, "event: task\ndata: %s\n\n", b)
+			if ok {
+				flusher.Flush()
+			}
+		}
+	}
+}
+
+// --- Image & Runtime Cache Management ---
+
+func (a *AdminHandler) CacheStats(c *gin.Context) {
+	var imgStats imgpipe.CacheStats
+	if a.images != nil {
+		imgStats = a.images.Stats()
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"cache_backend": a.cache.BackendName(),
+		"image_cache":   imgStats,
+	})
+}
+
+func (a *AdminHandler) ClearCache(c *gin.Context) {
+	var cleared int64
+	if a.images != nil {
+		n, err := a.images.Clear()
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		cleared = n
+	}
+	_ = a.cache.DeletePrefix(c.Request.Context(), "")
+	c.JSON(http.StatusOK, gin.H{
+		"ok":                  true,
+		"image_files_cleared": cleared,
+	})
+}
+
+// --- Admin Users & Permission Groups ---
+
+func (a *AdminHandler) ListUsers(c *gin.Context) {
+	var users []model.User
+	_ = a.db.Gorm.Order("created_at ASC").Find(&users).Error
+	out := make([]map[string]any, 0, len(users))
+	for i := range users {
+		u := users[i]
+		var libIDs []string
+		_ = a.db.Gorm.Model(&model.UserLibrary{}).Where("user_id = ?", u.ID).Pluck("library_id", &libIDs).Error
+		policy := a.auth.ResolvePolicy(&u)
+		out = append(out, map[string]any{
+			"id":                  u.ID,
+			"username":            u.Username,
+			"display_name":        u.DisplayName,
+			"is_admin":            u.IsAdmin,
+			"is_primary_admin":    u.IsPrimaryAdmin,
+			"permission_group_id": u.PermissionGroupID,
+			"disabled":            u.Disabled,
+			"can_download":        policy.AllowDownload,
+			"allow_playback":      policy.AllowPlayback,
+			"max_devices":         policy.MaxDevices,
+			"library_ids":         libIDs,
+			"last_login_at":       u.LastLoginAt,
+			"created_at":          u.CreatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"items": out})
+}
+
+func (a *AdminHandler) CreateUser(c *gin.Context) {
+	var body struct {
+		Username          string   `json:"username" binding:"required"`
+		Password          string   `json:"password" binding:"required,min=4"`
+		IsAdmin           bool     `json:"is_admin"`
+		PermissionGroupID string   `json:"permission_group_id"`
+		CanDownload       *bool    `json:"can_download"`
+		LibraryIDs        []string `json:"library_ids"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	user, err := a.auth.CreateUser(body.Username, body.Password, body.IsAdmin, body.PermissionGroupID, body.CanDownload)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	for _, lid := range body.LibraryIDs {
+		_ = a.db.Gorm.Create(&model.UserLibrary{UserID: user.ID, LibraryID: lid}).Error
+	}
+	c.JSON(http.StatusCreated, user)
+}
+
+func (a *AdminHandler) UpdateUser(c *gin.Context) {
+	id := c.Param("id")
+	var user model.User
+	if err := a.db.Gorm.Where("id = ?", id).First(&user).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+	var body struct {
+		DisplayName       *string  `json:"display_name"`
+		Password          string   `json:"password"`
+		IsAdmin           *bool    `json:"is_admin"`
+		Disabled          *bool    `json:"disabled"`
+		PermissionGroupID *string  `json:"permission_group_id"`
+		CanDownload       *bool    `json:"can_download"`
+		LibraryIDs        []string `json:"library_ids"`
+		UpdateLibraries   bool     `json:"update_libraries"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if user.IsPrimaryAdmin {
+		if body.Disabled != nil && *body.Disabled {
+			c.JSON(http.StatusForbidden, gin.H{"error": "cannot disable primary administrator"})
+			return
+		}
+		if body.IsAdmin != nil && !*body.IsAdmin {
+			c.JSON(http.StatusForbidden, gin.H{"error": "cannot demote primary administrator"})
+			return
+		}
+	}
+	if body.DisplayName != nil {
+		user.DisplayName = strings.TrimSpace(*body.DisplayName)
+	}
+	if body.Password != "" {
+		hash, err := auth.HashPassword(body.Password)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		user.PasswordHash = hash
+	}
+	if body.IsAdmin != nil {
+		user.IsAdmin = *body.IsAdmin
+	}
+	if body.Disabled != nil {
+		user.Disabled = *body.Disabled
+	}
+	if body.PermissionGroupID != nil {
+		user.PermissionGroupID = *body.PermissionGroupID
+	}
+	if body.CanDownload != nil {
+		user.CanDownload = body.CanDownload
+	}
+	if err := a.db.Gorm.Save(&user).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if body.UpdateLibraries {
+		_ = a.db.Gorm.Where("user_id = ?", user.ID).Delete(&model.UserLibrary{}).Error
+		for _, lid := range body.LibraryIDs {
+			_ = a.db.Gorm.Create(&model.UserLibrary{UserID: user.ID, LibraryID: lid}).Error
+		}
+	}
+	a.auth.InvalidateUserCache(c.Request.Context(), user.ID)
+	c.JSON(http.StatusOK, user)
+}
+
+func (a *AdminHandler) DeleteUser(c *gin.Context) {
+	id := c.Param("id")
+	var user model.User
+	if err := a.db.Gorm.Where("id = ?", id).First(&user).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+	if user.IsPrimaryAdmin {
+		c.JSON(http.StatusForbidden, gin.H{"error": "cannot delete primary administrator"})
+		return
+	}
+	_ = a.db.Gorm.Where("user_id = ?", id).Delete(&model.Token{}).Error
+	_ = a.db.Gorm.Where("user_id = ?", id).Delete(&model.UserLibrary{}).Error
+	_ = a.db.Gorm.Where("user_id = ?", id).Delete(&model.UserDevice{}).Error
+	_ = a.db.Gorm.Where("id = ?", id).Delete(&model.User{}).Error
+	a.auth.InvalidateUserCache(c.Request.Context(), id)
+	c.Status(http.StatusNoContent)
+}
+
+func (a *AdminHandler) ListPermissionGroups(c *gin.Context) {
+	var groups []model.PermissionGroup
+	_ = a.db.Gorm.Order("created_at ASC").Find(&groups).Error
+	c.JSON(http.StatusOK, gin.H{"items": groups})
+}
+
+// --- Settings ---
+
+func (a *AdminHandler) GetSettings(c *gin.Context) {
+	metaDir := strings.TrimSpace(a.db.GetSetting("emby_metadata_dir", a.cfg.Storage.EmbyMetadataDir))
+	defWB := "false"
+	if a.cfg.Storage.EmbyMetadataWriteback {
+		defWB = "true"
+	}
+	writeback := strings.EqualFold(a.db.GetSetting("emby_metadata_writeback", defWB), "true")
+	metaExists, metaWritable := imgpipe.CheckDirectoryWritable(metaDir)
+
+	c.JSON(http.StatusOK, gin.H{
+		"server_name":             a.db.GetSetting("server_name", a.cfg.Server.ServerName),
+		"server_id":               a.db.GetSetting("server_id", ""),
+		"database":                a.db.Dialect,
+		"cache":                   a.cache.BackendName(),
+		"listen_addr":             a.cfg.Server.ListenAddr,
+		"emby_metadata_dir":       metaDir,
+		"emby_metadata_writeback": writeback,
+		"emby_metadata_exists":    metaExists,
+		"emby_metadata_writable":  metaWritable,
+	})
+}
+
+func (a *AdminHandler) UpdateSettings(c *gin.Context) {
+	var body struct {
+		ServerName            string  `json:"server_name"`
+		EmbyMetadataDir       *string `json:"emby_metadata_dir"`
+		EmbyMetadataWriteback *bool   `json:"emby_metadata_writeback"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if strings.TrimSpace(body.ServerName) != "" {
+		_ = a.db.SetSetting("server_name", strings.TrimSpace(body.ServerName), false)
+	}
+	if body.EmbyMetadataDir != nil {
+		_ = a.db.SetSetting("emby_metadata_dir", strings.TrimSpace(*body.EmbyMetadataDir), false)
+	}
+	if body.EmbyMetadataWriteback != nil {
+		val := "false"
+		if *body.EmbyMetadataWriteback {
+			val = "true"
+		}
+		_ = a.db.SetSetting("emby_metadata_writeback", val, false)
+	}
+	a.recordAudit(c, "settings.update", "settings", "global", nil)
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func cleanPaths(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}

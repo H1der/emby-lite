@@ -1,0 +1,48 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: emby-lite-pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: embylite
+      POSTGRES_USER: embylite
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-embylite_change_me}
+    volumes:
+      - ./postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U embylite -d embylite"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  emby-lite:
+    image: hider188/emby-lite:latest
+    container_name: emby-lite
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${HOST_PORT:-8096}:8096"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PUID: ${PUID:-65532}
+      PGID: ${PGID:-65532}
+      PORT: 8096
+      DATA_DIR: /data
+      CACHE_DIR: /cache
+      BACKUP_DIR: /backups
+      DB_TYPE: postgres
+      DSN: postgres://embylite:${POSTGRES_PASSWORD:-embylite_change_me}@postgres:5432/embylite?sslmode=disable
+      SERVER_NAME: ${SERVER_NAME:-Emby-Lite}
+      # 可选：共享原 Emby 的 metadata 目录（复用并补全 people 演员头像；支持 :rw 或 :ro）
+      # EMBY_METADATA_DIR: /emby-metadata
+      # EMBY_METADATA_WRITEBACK: "true"
+    volumes:
+      - ./data:/data
+      - ./cache:/cache
+      - ./backups:/backups
+      - ./media:/media:ro
+      # - /宿主机原Emby路径/metadata:/emby-metadata:rw
+      # - /宿主机原Emby配置目录:/emby-config:ro

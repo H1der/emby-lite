@@ -1,0 +1,29 @@
+services:
+  emby-lite:
+    image: hider188/emby-lite:latest
+    container_name: emby-lite
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${HOST_PORT:-8096}:8096"
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      PUID: ${PUID:-65532}
+      PGID: ${PGID:-65532}
+      PORT: 8096
+      DATA_DIR: /data
+      CACHE_DIR: /cache
+      BACKUP_DIR: /backups
+      DB_TYPE: ${DB_TYPE:-sqlite}
+      DSN: ${DSN:-}
+      SERVER_NAME: ${SERVER_NAME:-Emby-Lite}
+      # 可选：共享原 Emby 的 metadata 目录（复用并补全 people 演员头像；支持 :rw 或 :ro）
+      # EMBY_METADATA_DIR: /emby-metadata
+      # EMBY_METADATA_WRITEBACK: "true"
+    volumes:
+      - ./data:/data
+      - ./cache:/cache
+      - ./backups:/backups
+      - ./media:/media:ro
+      # - /宿主机原Emby路径/metadata:/emby-metadata:rw
+      # - /宿主机原Emby配置目录:/emby-config:ro

@@ -1,0 +1,17 @@
+bin/
+data/
+cache/
+backups/
+*.db
+*.db-shm
+*.db-wal
+*.exe
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep

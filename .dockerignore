@@ -1,0 +1,32 @@
+# Binaries & build outputs
+bin/
+*.exe
+*.test
+coverage.out
+
+# Frontend build artifacts (rebuilt cleanly in Dockerfile Stage 1)
+web/node_modules
+web/dist
+
+# Runtime data (mounted as volumes)
+data/
+cache/
+backups/
+*.db
+*.db-wal
+*.db-shm
+
+# Local env & logs
+.env
+.env.*
+!.env.example
+*.log
+
+# VCS & IDE
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.md
