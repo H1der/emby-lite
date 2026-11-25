@@ -1,318 +1,380 @@
 <template>
   <div class="space-y-6">
-    <div class="flex items-center justify-between">
-      <h1 class="text-xl font-semibold">管理控制台</h1>
-      <n-button size="small" type="primary" secondary @click="scanAll">扫描全部媒体库</n-button>
+    <!-- Frosted Glass Admin Header -->
+    <div class="glass-panel rounded-3xl p-4 sm:p-5 flex flex-wrap items-center justify-between gap-4">
+      <div>
+        <h1 class="text-xl sm:text-2xl font-bold text-ink tracking-tight">管理控制台</h1>
+        <p class="text-xs text-ink-muted mt-0.5">媒体库调度、并发扫描引擎、权限治理与系统运维</p>
+      </div>
+      <div class="flex items-center gap-2">
+        <n-button size="small" secondary @click="refreshActiveTab">刷新当前页</n-button>
+        <n-button size="small" type="primary" @click="scanAll">⚡ 扫描全部媒体库</n-button>
+      </div>
     </div>
 
-    <n-tabs v-model:value="activeTab" type="line" animated>
-      <!-- Dashboard -->
-      <n-tab-pane name="dashboard" tab="概览">
-        <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-2">
-          <n-card size="small" title="媒体库">{{ dash.libraries ?? 0 }}</n-card>
-          <n-card size="small" title="电影">{{ dash.movies ?? 0 }}</n-card>
-          <n-card size="small" title="剧集 / 单集">{{ dash.series ?? 0 }} / {{ dash.episodes ?? 0 }}</n-card>
-          <n-card size="small" title="用户 / 活跃播放">{{ dash.users ?? 0 }} / {{ dash.active_streams ?? 0 }}</n-card>
+    <!-- Responsive Glass Pill Navigation (horizontal scroll on mobile, clean bar on desktop) -->
+    <div class="flex items-center gap-1.5 overflow-x-auto pb-1">
+      <button
+        v-for="tab in tabs"
+        :key="tab.key"
+        type="button"
+        class="px-3.5 py-2 rounded-2xl text-xs sm:text-sm font-semibold whitespace-nowrap transition flex items-center gap-1.5 shrink-0"
+        :class="
+          activeTab === tab.key
+            ? 'accent-gradient text-white shadow-md'
+            : 'glass-pill text-ink-secondary hover:text-sky-600 dark:hover:text-sky-400'
+        "
+        @click="selectTab(tab.key)"
+      >
+        <span>{{ tab.icon }}</span>
+        <span>{{ tab.label }}</span>
+        <span
+          v-if="tab.key === 'scraper' && matchQueue.length > 0"
+          class="px-1.5 py-0.2 rounded-full text-[10px] bg-amber-400 text-slate-950 font-bold"
+        >
+          {{ matchQueue.length }}
+        </span>
+        <span
+          v-if="tab.key === 'tasks' && runningTaskCount > 0"
+          class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"
+        ></span>
+      </button>
+    </div>
+
+    <!-- Tab: Dashboard -->
+    <div v-if="activeTab === 'dashboard'" class="space-y-5">
+      <div class="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <div class="glass-card rounded-2xl p-4 sm:p-5 space-y-1">
+          <div class="text-xs text-ink-muted font-medium">媒体库总数</div>
+          <div class="text-2xl sm:text-3xl font-bold text-ink">{{ dash.libraries ?? 0 }}</div>
         </div>
-        <n-card size="small" title="运行环境与引擎能力" class="mt-4">
-          <div class="text-sm text-slate-300 space-y-1.5">
-            <div>服务器名称：{{ dash.server_name }}（ID: <code>{{ dash.server_id }}</code>）</div>
-            <div>
-              主数据库：<strong>{{ dash.database }}</strong>
-              <n-tag v-if="dash.has_fts5" size="tiny" type="success" class="ml-1.5">FTS5 全文检索</n-tag>
-              <n-tag v-if="dash.has_trgm" size="tiny" type="success" class="ml-1.5">pg_trgm 模糊搜索</n-tag>
-              · 缓存后端：<strong>{{ dash.cache }}</strong>
+        <div class="glass-card rounded-2xl p-4 sm:p-5 space-y-1">
+          <div class="text-xs text-ink-muted font-medium">电影条目</div>
+          <div class="text-2xl sm:text-3xl font-bold text-sky-600 dark:text-sky-400">{{ dash.movies ?? 0 }}</div>
+        </div>
+        <div class="glass-card rounded-2xl p-4 sm:p-5 space-y-1">
+          <div class="text-xs text-ink-muted font-medium">剧集 / 单集</div>
+          <div class="text-2xl sm:text-3xl font-bold text-indigo-600 dark:text-indigo-400">
+            {{ dash.series ?? 0 }} <span class="text-base font-medium text-ink-muted">/ {{ dash.episodes ?? 0 }}</span>
+          </div>
+        </div>
+        <div class="glass-card rounded-2xl p-4 sm:p-5 space-y-1">
+          <div class="text-xs text-ink-muted font-medium">用户 / 活跃播放</div>
+          <div class="text-2xl sm:text-3xl font-bold text-emerald-600 dark:text-emerald-400">
+            {{ dash.users ?? 0 }} <span class="text-base font-medium text-ink-muted">/ {{ dash.active_streams ?? 0 }}</span>
+          </div>
+        </div>
+      </div>
+
+      <n-card size="small" title="运行环境与高性能引擎能力">
+        <div class="text-sm text-ink-secondary space-y-2.5">
+          <div>
+            服务器名称：<strong class="text-ink">{{ dash.server_name }}</strong>
+            <span class="text-xs text-ink-muted ml-2 font-mono">ID: {{ dash.server_id }}</span>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <span>主数据库：<strong class="text-ink uppercase">{{ dash.database }}</strong></span>
+            <n-tag v-if="dash.database === 'sqlite'" size="tiny" type="info">WAL 读写分离池</n-tag>
+            <n-tag v-if="dash.has_fts5" size="tiny" type="success">FTS5 全文检索</n-tag>
+            <n-tag v-if="dash.has_trgm" size="tiny" type="success">pg_trgm 模糊搜索</n-tag>
+            <span class="text-ink-muted">·</span>
+            <span>热缓存后端：<strong class="text-ink uppercase">{{ dash.cache }}</strong></span>
+            <span class="text-ink-muted">·</span>
+            <span>扫描并发：<strong class="text-ink">{{ dash.scan_concurrency ?? 4 }} 线程</strong></span>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <span>媒体探测：<strong class="text-ink">纯 Go 原生容器头并发快探 (MP4/MKV/Range)</strong></span>
+            <n-tag size="tiny" :type="dash.ffprobe_available ? 'info' : 'default'">
+              {{ dash.ffprobe_available ? '异步 ffprobe 兜底可用' : '纯静态零外部依赖' }}
+            </n-tag>
+          </div>
+          <div class="flex flex-wrap items-center gap-3 pt-1">
+            <span>
+              图片缩略图磁盘缓存：<strong class="text-ink">{{ dash.image_cache_files ?? 0 }}</strong> 个文件（{{ formatBytes(dash.image_cache_bytes || 0) }}）
+            </span>
+            <n-button size="tiny" secondary type="warning" @click="clearCache">清理图片与热缓存</n-button>
+          </div>
+        </div>
+      </n-card>
+    </div>
+
+    <!-- Tab: Libraries -->
+    <div v-if="activeTab === 'libraries'" class="space-y-4">
+      <div class="flex justify-end">
+        <n-button type="primary" size="small" @click="openCreateLibrary">+ 新建媒体库</n-button>
+      </div>
+      <div v-if="libraries.length === 0" class="glass-panel rounded-2xl p-10 text-center text-sm text-ink-muted">
+        暂无媒体库，点击右上角创建。
+      </div>
+      <div v-else class="space-y-3">
+        <n-card v-for="lib in libraries" :key="lib.id" size="small">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="min-w-0">
+              <div class="font-semibold text-ink flex items-center flex-wrap gap-1.5">
+                <span>{{ lib.name }}</span>
+                <n-tag size="tiny" type="info">{{ lib.kind }}</n-tag>
+                <n-tag v-if="lib.hidden" size="tiny" type="warning">隐藏</n-tag>
+                <n-tag v-if="lib.scanning" size="tiny" type="success">扫描中</n-tag>
+              </div>
+              <div class="text-xs text-ink-muted mt-1 break-all">
+                路径：{{ (lib.paths || []).join(' ; ') }} · {{ lib.item_count }} 项 · 状态：{{ lib.scanning ? '扫描中' : lib.status }}
+              </div>
             </div>
-            <div>
-              媒体探测：<strong>纯 Go 原生解析 (MP4/MKV/Range)</strong>
-              <n-tag size="tiny" :type="dash.ffprobe_available ? 'info' : 'default'" class="ml-1.5">
-                {{ dash.ffprobe_available ? 'ffprobe 兜底可用' : '纯静态零外部依赖' }}
-              </n-tag>
-            </div>
-            <div class="flex flex-wrap items-center gap-3 pt-1">
-              <span>图片缩略图磁盘缓存：{{ dash.image_cache_files ?? 0 }} 个文件（{{ formatBytes(dash.image_cache_bytes || 0) }}）</span>
-              <n-button size="tiny" secondary type="warning" @click="clearCache">清理图片与热缓存</n-button>
+            <div class="flex flex-wrap items-center gap-1.5">
+              <n-button size="small" secondary @click="generateLibCover(lib.id)">拼贴封面</n-button>
+              <n-button size="small" secondary @click="triggerCoverUpload(lib.id)">传封面</n-button>
+              <n-button size="small" secondary @click="openEditLibrary(lib)">编辑</n-button>
+              <n-button size="small" secondary @click="probeLibrary(lib.id)">探测</n-button>
+              <n-button size="small" type="info" secondary @click="scrapeLibrary(lib.id)">刮削</n-button>
+              <n-button size="small" type="primary" @click="scanLibrary(lib.id)">扫描</n-button>
+              <n-button size="small" type="error" quaternary @click="deleteLibrary(lib.id)">删除</n-button>
             </div>
           </div>
         </n-card>
-      </n-tab-pane>
+      </div>
+    </div>
 
-      <!-- Libraries -->
-      <n-tab-pane name="libraries" tab="媒体库">
-        <div class="flex justify-end mb-3">
-          <n-button type="primary" size="small" @click="openCreateLibrary">+ 新建媒体库</n-button>
-        </div>
-        <div class="space-y-3">
-          <n-card v-for="lib in libraries" :key="lib.id" size="small">
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <div class="font-medium text-white">
-                  {{ lib.name }}
-                  <n-tag size="tiny" class="ml-2">{{ lib.kind }}</n-tag>
-                  <n-tag v-if="lib.hidden" size="tiny" type="warning" class="ml-1">隐藏</n-tag>
-                </div>
-                <div class="text-xs text-slate-400 mt-1">
-                  路径：{{ (lib.paths || []).join(' ; ') }} · {{ lib.item_count }} 项 · 状态：{{ lib.scanning ? '扫描中' : lib.status }}
-                </div>
-              </div>
-              <div class="flex items-center gap-2">
-                <n-button size="small" secondary @click="generateLibCover(lib.id)">拼贴封面</n-button>
-                <n-button size="small" secondary @click="triggerCoverUpload(lib.id)">传封面</n-button>
-                <n-button size="small" secondary @click="openEditLibrary(lib)">编辑</n-button>
-                <n-button size="small" secondary @click="probeLibrary(lib.id)">探测</n-button>
-                <n-button size="small" type="info" secondary @click="scrapeLibrary(lib.id)">刮削</n-button>
-                <n-button size="small" type="primary" secondary @click="scanLibrary(lib.id)">扫描</n-button>
-                <n-button size="small" type="error" quaternary @click="deleteLibrary(lib.id)">删除</n-button>
-              </div>
-            </div>
-          </n-card>
-        </div>
-      </n-tab-pane>
+    <!-- Tab: Virtual Libraries & Intro Skip -->
+    <div v-if="activeTab === 'virtual'">
+      <AdminVirtualAndIntro :libraries="libraries" />
+    </div>
 
-      <!-- Virtual Libraries & Intro Skip -->
-      <n-tab-pane name="virtual" tab="虚拟库与片头跳过">
-        <AdminVirtualAndIntro :libraries="libraries" />
-      </n-tab-pane>
-
-      <!-- TMDB & Manual Match Queue -->
-      <n-tab-pane name="scraper" :tab="`TMDB 与刮削${matchQueue.length ? ` (${matchQueue.length})` : ''}`">
-        <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mt-2">
-          <!-- TMDB Config Card -->
-          <n-card size="small" title="TMDB 刮削配置（凭据加密存储，只写不回显）">
-            <n-form label-placement="top" size="small" @submit.prevent="saveTMDB">
-              <n-form-item>
-                <template #label>
-                  <span>TMDB v3 API Key</span>
-                  <n-tag v-if="tmdbStatus.has_api_key" size="tiny" type="success" class="ml-2">已加密保存</n-tag>
-                </template>
-                <n-input v-model:value="tmdbForm.api_key" type="password" show-password-on="click" placeholder="留空表示保持现有密钥不变" />
-              </n-form-item>
-              <n-form-item>
-                <template #label>
-                  <span>TMDB v4 Read Access Token（与上方二选一）</span>
-                  <n-tag v-if="tmdbStatus.has_read_token" size="tiny" type="success" class="ml-2">已加密保存</n-tag>
-                </template>
-                <n-input v-model:value="tmdbForm.read_token" type="password" show-password-on="click" placeholder="留空表示保持现有 Token 不变" />
-              </n-form-item>
-              <div class="grid grid-cols-2 gap-3">
-                <n-form-item label="API Base URL（可填镜像）">
-                  <n-input v-model:value="tmdbForm.api_base_url" />
-                </n-form-item>
-                <n-form-item label="图片 Base URL">
-                  <n-input v-model:value="tmdbForm.image_base_url" />
-                </n-form-item>
-                <n-form-item label="语言">
-                  <n-input v-model:value="tmdbForm.language" placeholder="zh-CN" />
-                </n-form-item>
-                <n-form-item label="自动匹配分数阈值 (0-100)">
-                  <n-input-number v-model:value="tmdbForm.auto_threshold" :min="10" :max="100" class="w-full" />
-                </n-form-item>
-              </div>
-              <n-form-item>
-                <template #label>
-                  <span>HTTP / SOCKS 代理（可选）</span>
-                  <n-tag v-if="tmdbStatus.has_proxy" size="tiny" type="info" class="ml-2">已配置</n-tag>
-                </template>
-                <n-input v-model:value="tmdbForm.proxy_url" placeholder="http://127.0.0.1:7890（填 __clear__ 可清除）" />
-              </n-form-item>
-              <n-form-item>
-                <n-checkbox v-model:checked="tmdbForm.write_nfo">刮削成功后自动回写本地 NFO</n-checkbox>
-              </n-form-item>
-              <div class="flex items-center gap-2">
-                <n-button type="primary" attr-type="submit">保存配置</n-button>
-                <n-button secondary :loading="testingTMDB" @click="testTMDB">测试连接</n-button>
-              </div>
-            </n-form>
-          </n-card>
-
-          <!-- Manual Match Queue -->
-          <n-card size="small" title="待人工匹配队列（低置信度候选并列对比）">
-            <template #header-extra>
-              <n-button size="tiny" secondary @click="loadMatchQueue">刷新</n-button>
+    <!-- Tab: TMDB & Match Queue -->
+    <div v-if="activeTab === 'scraper'" class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <n-card size="small" title="TMDB 刮削配置（凭据加密存储，只写不回显）">
+        <n-form label-placement="top" size="small" @submit.prevent="saveTMDB">
+          <n-form-item>
+            <template #label>
+              <span>TMDB v3 API Key</span>
+              <n-tag v-if="tmdbStatus.has_api_key" size="tiny" type="success" class="ml-2">已加密保存</n-tag>
             </template>
-            <div v-if="matchQueue.length === 0" class="py-10 text-center text-sm text-slate-400">
-              当前没有待人工确认的刮削条目
-            </div>
-            <div v-else class="space-y-4 max-h-[520px] overflow-y-auto pr-1">
-              <div
-                v-for="entry in matchQueue"
-                :key="entry.item_id"
-                class="rounded-xl border border-cinema-border bg-cinema-bg p-3 space-y-3"
-              >
-                <div class="flex items-center justify-between gap-2">
-                  <div>
-                    <div class="text-sm font-semibold text-white">
-                      {{ entry.item_name }}
-                      <span v-if="entry.item_year" class="text-slate-400 font-normal">({{ entry.item_year }})</span>
-                    </div>
-                    <div class="text-xs text-slate-400">
-                      类型：{{ entry.item_type }} · 最高匹配分：{{ entry.best_score }}
-                    </div>
-                  </div>
-                  <div class="flex items-center gap-1.5">
-                    <n-button size="tiny" secondary @click="openManualSearch(entry)">手动搜 TMDB</n-button>
-                    <n-button size="tiny" type="warning" quaternary @click="ignoreMatch(entry.item_id)">忽略</n-button>
-                  </div>
-                </div>
+            <n-input v-model:value="tmdbForm.api_key" type="password" show-password-on="click" placeholder="留空表示保持现有密钥不变" />
+          </n-form-item>
+          <n-form-item>
+            <template #label>
+              <span>TMDB v4 Read Access Token（与上方二选一）</span>
+              <n-tag v-if="tmdbStatus.has_read_token" size="tiny" type="success" class="ml-2">已加密保存</n-tag>
+            </template>
+            <n-input v-model:value="tmdbForm.read_token" type="password" show-password-on="click" placeholder="留空表示保持现有 Token 不变" />
+          </n-form-item>
+          <div class="grid grid-cols-2 gap-3">
+            <n-form-item label="API Base URL（可填镜像）">
+              <n-input v-model:value="tmdbForm.api_base_url" />
+            </n-form-item>
+            <n-form-item label="图片 Base URL">
+              <n-input v-model:value="tmdbForm.image_base_url" />
+            </n-form-item>
+            <n-form-item label="语言">
+              <n-input v-model:value="tmdbForm.language" placeholder="zh-CN" />
+            </n-form-item>
+            <n-form-item label="自动匹配分数阈值 (0-100)">
+              <n-input-number v-model:value="tmdbForm.auto_threshold" :min="10" :max="100" class="w-full" />
+            </n-form-item>
+          </div>
+          <n-form-item>
+            <template #label>
+              <span>HTTP / SOCKS 代理（可选）</span>
+              <n-tag v-if="tmdbStatus.has_proxy" size="tiny" type="info" class="ml-2">已配置</n-tag>
+            </template>
+            <n-input v-model:value="tmdbForm.proxy_url" placeholder="http://127.0.0.1:7890（填 __clear__ 可清除）" />
+          </n-form-item>
+          <n-form-item>
+            <n-checkbox v-model:checked="tmdbForm.write_nfo">刮削成功后自动回写本地 NFO</n-checkbox>
+          </n-form-item>
+          <div class="flex items-center gap-2">
+            <n-button type="primary" attr-type="submit">保存配置</n-button>
+            <n-button secondary :loading="testingTMDB" @click="testTMDB">测试连接</n-button>
+          </div>
+        </n-form>
+      </n-card>
 
-                <div v-if="entry.candidates && entry.candidates.length > 0" class="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  <div
-                    v-for="c in entry.candidates.slice(0, 4)"
-                    :key="c.provider_id"
-                    class="flex gap-2.5 p-2 rounded-lg border border-cinema-border/60 bg-cinema-card"
-                  >
-                    <img
-                      v-if="c.poster_url"
-                      :src="c.poster_url"
-                      class="w-12 h-18 object-cover rounded shrink-0 bg-slate-900"
-                    />
-                    <div class="min-w-0 flex-1 space-y-1">
-                      <div class="text-xs font-medium text-white truncate">{{ c.title }} ({{ c.year || '?' }})</div>
-                      <div class="text-[11px] text-emerald-400">匹配分 {{ c.score }} · ★ {{ c.rating }}</div>
-                      <div class="text-[10px] text-slate-400 truncate">{{ (c.reasons || []).join(' / ') }}</div>
-                      <n-button size="tiny" type="primary" secondary @click="resolveMatch(entry.item_id, c.media_type, c.provider_id)">
-                        选用此匹配
-                      </n-button>
-                    </div>
-                  </div>
+      <n-card size="small" title="待人工匹配队列（低置信度候选并列对比）">
+        <template #header-extra>
+          <n-button size="tiny" secondary @click="loadMatchQueue">刷新</n-button>
+        </template>
+        <div v-if="matchQueue.length === 0" class="py-10 text-center text-sm text-ink-muted">
+          当前没有待人工确认的刮削条目
+        </div>
+        <div v-else class="space-y-4 max-h-[520px] overflow-y-auto pr-1">
+          <div
+            v-for="entry in matchQueue"
+            :key="entry.item_id"
+            class="rounded-2xl neu-inset p-3.5 space-y-3"
+          >
+            <div class="flex items-center justify-between gap-2">
+              <div>
+                <div class="text-sm font-semibold text-ink">
+                  {{ entry.item_name }}
+                  <span v-if="entry.item_year" class="text-ink-muted font-normal">({{ entry.item_year }})</span>
                 </div>
-                <div v-else class="text-xs text-slate-500">无自动候选，请点击“手动搜 TMDB”定位。</div>
+                <div class="text-xs text-ink-muted">
+                  类型：{{ entry.item_type }} · 最高匹配分：{{ entry.best_score }}
+                </div>
+              </div>
+              <div class="flex items-center gap-1.5">
+                <n-button size="tiny" secondary @click="openManualSearch(entry)">手动搜 TMDB</n-button>
+                <n-button size="tiny" type="warning" quaternary @click="ignoreMatch(entry.item_id)">忽略</n-button>
               </div>
             </div>
-          </n-card>
-        </div>
-      </n-tab-pane>
 
-      <!-- Background Tasks (SSE Live) -->
-      <n-tab-pane name="tasks" tab="后台任务 (SSE)">
-        <div class="flex items-center justify-between mb-3">
-          <div class="text-xs text-slate-400 flex items-center gap-2">
-            <span class="inline-block w-2 h-2 rounded-full" :class="sseConnected ? 'bg-emerald-400' : 'bg-slate-500'"></span>
-            <span>{{ sseConnected ? 'SSE 实时推送已连接' : 'SSE 未连接' }}</span>
-          </div>
-          <n-button size="small" secondary @click="loadTasks">刷新任务列表</n-button>
-        </div>
-        <div v-if="tasks.length === 0" class="text-sm text-slate-400 py-8 text-center">暂无后台任务记录</div>
-        <div v-else class="space-y-2.5">
-          <n-card v-for="t in tasks" :key="t.id" size="small">
-            <div class="space-y-2">
-              <div class="flex flex-wrap items-center justify-between gap-2">
-                <div class="flex items-center gap-2">
-                  <n-tag size="tiny" :type="taskStatusType(t.status)">{{ taskStatusLabel(t.status) }}</n-tag>
-                  <span class="text-sm font-medium text-white">{{ taskTypeLabel(t.type) }}</span>
-                  <span class="text-xs text-slate-400">{{ t.message }}</span>
-                </div>
-                <div class="flex items-center gap-2">
-                  <span class="text-xs text-slate-500">{{ formatTime(t.created_at) }}</span>
-                  <n-button
-                    v-if="t.status === 'pending' || t.status === 'running'"
-                    size="tiny"
-                    type="error"
-                    secondary
-                    @click="cancelTask(t.id)"
-                  >
-                    取消
+            <div v-if="entry.candidates && entry.candidates.length > 0" class="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <div
+                v-for="c in entry.candidates.slice(0, 4)"
+                :key="c.provider_id"
+                class="flex gap-2.5 p-2 rounded-xl glass-card"
+              >
+                <img
+                  v-if="c.poster_url"
+                  :src="c.poster_url"
+                  class="w-12 h-18 object-cover rounded-lg shrink-0 bg-slate-200 dark:bg-slate-800"
+                />
+                <div class="min-w-0 flex-1 space-y-1">
+                  <div class="text-xs font-semibold text-ink truncate">{{ c.title }} ({{ c.year || '?' }})</div>
+                  <div class="text-[11px] text-sky-600 dark:text-sky-400 font-medium">匹配分 {{ c.score }} · ★ {{ c.rating }}</div>
+                  <div class="text-[10px] text-ink-muted truncate">{{ (c.reasons || []).join(' / ') }}</div>
+                  <n-button size="tiny" type="primary" secondary @click="resolveMatch(entry.item_id, c.media_type, c.provider_id)">
+                    选用此匹配
                   </n-button>
                 </div>
               </div>
-              <n-progress
-                v-if="t.total > 0"
-                type="line"
-                :percentage="Math.min(100, Math.round((t.progress / t.total) * 100))"
-                :status="t.status === 'failed' ? 'error' : t.status === 'completed' ? 'success' : 'default'"
-                :height="6"
-              />
-              <div v-if="t.error" class="text-xs text-rose-400">错误：{{ t.error }}</div>
             </div>
-          </n-card>
+            <div v-else class="text-xs text-ink-muted">无自动候选，请点击“手动搜 TMDB”定位。</div>
+          </div>
         </div>
-      </n-tab-pane>
+      </n-card>
+    </div>
 
-      <!-- Users -->
-      <n-tab-pane name="users" tab="用户与权限">
-        <div class="flex justify-end mb-3">
-          <n-button type="primary" size="small" @click="openCreateUser">+ 新建用户</n-button>
+    <!-- Tab: Tasks -->
+    <div v-if="activeTab === 'tasks'" class="space-y-3">
+      <div class="flex items-center justify-between">
+        <div class="text-xs text-ink-muted flex items-center gap-2 glass-pill px-3 py-1.5 rounded-full">
+          <span class="inline-block w-2 h-2 rounded-full" :class="sseConnected ? 'bg-emerald-500' : 'bg-slate-400'"></span>
+          <span>{{ sseConnected ? 'SSE 实时推送已连接' : 'SSE 未连接' }}</span>
         </div>
-        <div class="space-y-3">
-          <n-card v-for="u in users" :key="u.id" size="small">
-            <div class="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <div class="font-medium text-white">
-                  {{ u.username }}
-                  <n-tag v-if="u.is_admin" size="tiny" type="success" class="ml-2">管理员</n-tag>
-                  <n-tag v-if="u.can_download" size="tiny" type="info" class="ml-1">允许下载</n-tag>
-                  <n-tag v-if="u.disabled" size="tiny" type="error" class="ml-1">已禁用</n-tag>
-                </div>
-                <div class="text-xs text-slate-400 mt-1">
-                  可见库：{{ u.is_admin ? '全部' : (u.library_ids?.length ? `${u.library_ids.length} 个指定库` : '默认非隐藏库') }}
-                </div>
+        <n-button size="small" secondary @click="loadTasks">刷新任务列表</n-button>
+      </div>
+      <div v-if="tasks.length === 0" class="glass-panel rounded-2xl text-sm text-ink-muted py-10 text-center">
+        暂无后台任务记录
+      </div>
+      <div v-else class="space-y-2.5">
+        <n-card v-for="t in tasks" :key="t.id" size="small">
+          <div class="space-y-2">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="flex items-center gap-2 flex-wrap">
+                <n-tag size="tiny" :type="taskStatusType(t.status)">{{ taskStatusLabel(t.status) }}</n-tag>
+                <span class="text-sm font-semibold text-ink">{{ taskTypeLabel(t.type) }}</span>
+                <span class="text-xs text-ink-secondary">{{ t.message }}</span>
               </div>
               <div class="flex items-center gap-2">
-                <n-button v-if="!u.is_primary_admin" size="small" secondary @click="openEditUser(u)">
-                  编辑权限
-                </n-button>
-                <n-button v-if="!u.is_primary_admin" size="small" secondary @click="toggleDownload(u)">
-                  {{ u.can_download ? '关闭下载' : '开启下载' }}
-                </n-button>
-                <n-button v-if="!u.is_primary_admin" size="small" type="error" quaternary @click="deleteUser(u.id)">
-                  删除
+                <span class="text-xs text-ink-muted">{{ formatTime(t.created_at) }}</span>
+                <n-button
+                  v-if="t.status === 'pending' || t.status === 'running'"
+                  size="tiny"
+                  type="error"
+                  secondary
+                  @click="cancelTask(t.id)"
+                >
+                  取消
                 </n-button>
               </div>
             </div>
-          </n-card>
-        </div>
-
-        <AdminAccessPanel :libraries="libraries" @changed="loadAll" />
-      </n-tab-pane>
-
-      <!-- File Manager -->
-      <n-tab-pane name="files" tab="文件管理">
-        <AdminFilesPanel />
-      </n-tab-pane>
-
-      <!-- Backups, Migration, API Keys & Audit Logs -->
-      <n-tab-pane name="ops" tab="运维与迁移">
-        <AdminOpsPanel />
-      </n-tab-pane>
-
-      <!-- Settings -->
-      <n-tab-pane name="settings" tab="基础设置">
-        <n-card size="small" class="max-w-xl mt-2">
-          <n-form label-placement="top" @submit.prevent="saveSettings">
-            <n-form-item label="服务器显示名称">
-              <n-input v-model:value="settingsForm.server_name" />
-            </n-form-item>
-            <n-form-item label="Emby 元数据目录（共享/复用 metadata/people 演员头像）">
-              <div class="w-full space-y-2">
-                <div class="flex items-center gap-2">
-                  <n-button size="small" type="primary" secondary @click="showMetaDirPicker = true">
-                    📁 选择目录
-                  </n-button>
-                  <n-button v-if="settingsForm.emby_metadata_dir" size="small" quaternary @click="settingsForm.emby_metadata_dir = ''">
-                    清除
-                  </n-button>
-                  <n-tag v-if="settingsForm.emby_metadata_dir && settingsStatus.exists" size="tiny" :type="settingsStatus.writable ? 'success' : 'info'">
-                    {{ settingsStatus.writable ? '可读写 (:rw)' : '仅只读 (:ro)' }}
-                  </n-tag>
-                  <n-tag v-else-if="settingsForm.emby_metadata_dir && !settingsStatus.exists" size="tiny" type="warning">
-                    目录不存在
-                  </n-tag>
-                </div>
-                <div class="px-3 py-1.5 rounded bg-cinema-bg border border-cinema-border text-xs font-mono text-slate-300 truncate">
-                  {{ settingsForm.emby_metadata_dir || '未配置（可挂载原 Emby 的 metadata 或 metadata/people 目录）' }}
-                </div>
-              </div>
-            </n-form-item>
-            <n-form-item>
-              <n-checkbox v-model:checked="settingsForm.emby_metadata_writeback">
-                目录可写时，将 TMDB 新获取的演员头像按 Emby 规范补写到 metadata/people（只补缺、绝不覆盖原文件）
-              </n-checkbox>
-            </n-form-item>
-            <n-button type="primary" attr-type="submit">保存设置</n-button>
-          </n-form>
+            <n-progress
+              v-if="t.total > 0"
+              type="line"
+              :percentage="Math.min(100, Math.round((t.progress / t.total) * 100))"
+              :status="t.status === 'failed' ? 'error' : t.status === 'completed' ? 'success' : 'default'"
+              :height="6"
+            />
+            <div v-if="t.error" class="text-xs text-rose-500">错误：{{ t.error }}</div>
+          </div>
         </n-card>
-      </n-tab-pane>
-    </n-tabs>
+      </div>
+    </div>
+
+    <!-- Tab: Users -->
+    <div v-if="activeTab === 'users'" class="space-y-4">
+      <div class="flex justify-end">
+        <n-button type="primary" size="small" @click="openCreateUser">+ 新建用户</n-button>
+      </div>
+      <div class="space-y-3">
+        <n-card v-for="u in users" :key="u.id" size="small">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div class="font-semibold text-ink flex items-center gap-1.5 flex-wrap">
+                <span>{{ u.username }}</span>
+                <n-tag v-if="u.is_admin" size="tiny" type="success">管理员</n-tag>
+                <n-tag v-if="u.can_download" size="tiny" type="info">允许下载</n-tag>
+                <n-tag v-if="u.disabled" size="tiny" type="error">已禁用</n-tag>
+              </div>
+              <div class="text-xs text-ink-muted mt-1">
+                可见库：{{ u.is_admin ? '全部' : (u.library_ids?.length ? `${u.library_ids.length} 个指定库` : '默认非隐藏库') }}
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <n-button v-if="!u.is_primary_admin" size="small" secondary @click="openEditUser(u)">
+                编辑权限
+              </n-button>
+              <n-button v-if="!u.is_primary_admin" size="small" secondary @click="toggleDownload(u)">
+                {{ u.can_download ? '关闭下载' : '开启下载' }}
+              </n-button>
+              <n-button v-if="!u.is_primary_admin" size="small" type="error" quaternary @click="deleteUser(u.id)">
+                删除
+              </n-button>
+            </div>
+          </div>
+        </n-card>
+      </div>
+
+      <AdminAccessPanel :libraries="libraries" @changed="loadUsersTab" />
+    </div>
+
+    <!-- Tab: Files -->
+    <div v-if="activeTab === 'files'">
+      <AdminFilesPanel />
+    </div>
+
+    <!-- Tab: Ops -->
+    <div v-if="activeTab === 'ops'">
+      <AdminOpsPanel />
+    </div>
+
+    <!-- Tab: Settings -->
+    <div v-if="activeTab === 'settings'">
+      <n-card size="small" class="max-w-xl" title="全局基础配置">
+        <n-form label-placement="top" @submit.prevent="saveSettings">
+          <n-form-item label="服务器显示名称">
+            <n-input v-model:value="settingsForm.server_name" />
+          </n-form-item>
+          <n-form-item label="Emby 元数据目录（共享/复用 metadata/people 演员头像）">
+            <div class="w-full space-y-2">
+              <div class="flex items-center gap-2">
+                <n-button size="small" type="primary" secondary @click="showMetaDirPicker = true">
+                  📁 选择目录
+                </n-button>
+                <n-button v-if="settingsForm.emby_metadata_dir" size="small" quaternary @click="settingsForm.emby_metadata_dir = ''">
+                  清除
+                </n-button>
+                <n-tag v-if="settingsForm.emby_metadata_dir && settingsStatus.exists" size="tiny" :type="settingsStatus.writable ? 'success' : 'info'">
+                  {{ settingsStatus.writable ? '可读写 (:rw)' : '仅只读 (:ro)' }}
+                </n-tag>
+                <n-tag v-else-if="settingsForm.emby_metadata_dir && !settingsStatus.exists" size="tiny" type="warning">
+                  目录不存在
+                </n-tag>
+              </div>
+              <div class="px-3 py-2 rounded-xl neu-inset text-xs font-mono text-ink-secondary truncate">
+                {{ settingsForm.emby_metadata_dir || '未配置（可挂载原 Emby 的 metadata 或 metadata/people 目录）' }}
+              </div>
+            </div>
+          </n-form-item>
+          <n-form-item>
+            <n-checkbox v-model:checked="settingsForm.emby_metadata_writeback">
+              目录可写时，将 TMDB 新获取的演员头像按 Emby 规范补写到 metadata/people（只补缺、绝不覆盖原文件）
+            </n-checkbox>
+          </n-form-item>
+          <n-button type="primary" attr-type="submit">保存设置</n-button>
+        </n-form>
+      </n-card>
+    </div>
 
     <!-- Manual TMDB Search Modal -->
     <n-modal v-model:show="showManualSearchModal" preset="card" :title="`手动搜索 TMDB：${manualSearchTarget?.item_name || ''}`" class="max-w-xl">
@@ -322,16 +384,16 @@
           <n-input-number v-model:value="manualYear" placeholder="年份" :min="0" :max="2100" class="w-28" />
           <n-button type="primary" :loading="searchingManual" @click="runManualSearch">搜索</n-button>
         </div>
-        <div v-if="manualResults.length === 0" class="text-xs text-slate-500 py-6 text-center">输入关键词搜索 TMDB 候选条目</div>
+        <div v-if="manualResults.length === 0" class="text-xs text-ink-muted py-6 text-center">输入关键词搜索 TMDB 候选条目</div>
         <div v-else class="space-y-2 max-h-80 overflow-y-auto">
           <div
             v-for="c in manualResults"
             :key="c.provider_id"
-            class="flex items-center justify-between gap-3 p-2.5 rounded-lg border border-cinema-border bg-cinema-bg"
+            class="flex items-center justify-between gap-3 p-3 rounded-xl neu-inset"
           >
             <div class="min-w-0">
-              <div class="text-sm font-medium text-white truncate">{{ c.title }} ({{ c.year || '?' }})</div>
-              <div class="text-xs text-slate-400 truncate">{{ c.original_title }} · TMDB #{{ c.provider_id }}</div>
+              <div class="text-sm font-semibold text-ink truncate">{{ c.title }} ({{ c.year || '?' }})</div>
+              <div class="text-xs text-ink-muted truncate">{{ c.original_title }} · TMDB #{{ c.provider_id }}</div>
             </div>
             <n-button
               size="small"
@@ -360,12 +422,12 @@
               <n-button type="primary" secondary size="small" @click="showDirPicker = true">
                 📁 浏览并选择目录
               </n-button>
-              <span class="text-xs text-slate-400">支持添加多个根目录</span>
+              <span class="text-xs text-ink-muted">支持添加多个根目录</span>
             </div>
 
             <div
               v-if="libForm.paths.length === 0"
-              class="rounded-lg border border-dashed border-cinema-border p-3 text-xs text-slate-500 text-center"
+              class="rounded-xl border border-dashed border-slate-300 dark:border-white/20 p-3 text-xs text-ink-muted text-center"
             >
               暂未选择目录，请点击上方“浏览并选择目录”
             </div>
@@ -373,9 +435,9 @@
               <div
                 v-for="(p, idx) in libForm.paths"
                 :key="p"
-                class="flex items-center justify-between gap-2 px-3 py-1.5 rounded bg-cinema-bg border border-cinema-border text-xs"
+                class="flex items-center justify-between gap-2 px-3 py-1.5 rounded-xl neu-inset text-xs"
               >
-                <span class="font-mono text-slate-200 truncate" :title="p">{{ p }}</span>
+                <span class="font-mono text-ink truncate" :title="p">{{ p }}</span>
                 <n-button size="tiny" type="error" quaternary @click="removeLibPath(idx)">移除</n-button>
               </div>
             </div>
@@ -388,14 +450,7 @@
       </n-form>
     </n-modal>
 
-    <!-- Directory Picker Modal (Libraries) -->
-    <DirectoryPicker
-      v-model:show="showDirPicker"
-      :selected-paths="libForm.paths"
-      @select="addLibPath"
-    />
-
-    <!-- Directory Picker Modal (Emby Metadata Dir) -->
+    <DirectoryPicker v-model:show="showDirPicker" :selected-paths="libForm.paths" @select="addLibPath" />
     <DirectoryPicker
       v-model:show="showMetaDirPicker"
       :selected-paths="settingsForm.emby_metadata_dir ? [settingsForm.emby_metadata_dir] : []"
@@ -433,11 +488,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
-  NButton, NCard, NCheckbox, NForm, NFormItem, NInput, NInputNumber, NModal, NProgress, NSelect, NTabPane, NTabs, NTag, useMessage,
+  NButton, NCard, NCheckbox, NForm, NFormItem, NInput, NInputNumber, NModal, NProgress, NSelect, NTag, useMessage,
 } from 'naive-ui'
-import { apiFetch, getToken } from '../api/client'
+import { apiFetch, getToken, invalidateApiCache } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import DirectoryPicker from '../components/DirectoryPicker.vue'
 import AdminVirtualAndIntro from '../components/AdminVirtualAndIntro.vue'
@@ -445,10 +501,27 @@ import AdminAccessPanel from '../components/AdminAccessPanel.vue'
 import AdminFilesPanel from '../components/AdminFilesPanel.vue'
 import AdminOpsPanel from '../components/AdminOpsPanel.vue'
 
+const tabs = [
+  { key: 'dashboard', label: '概览', icon: '📊' },
+  { key: 'libraries', label: '媒体库', icon: '🎞️' },
+  { key: 'virtual', label: '虚拟库与片头', icon: '✨' },
+  { key: 'scraper', label: 'TMDB 与刮削', icon: '🔎' },
+  { key: 'tasks', label: '后台任务', icon: '⚡' },
+  { key: 'users', label: '用户与权限', icon: '👥' },
+  { key: 'files', label: '文件管理', icon: '📁' },
+  { key: 'ops', label: '运维与迁移', icon: '🛠️' },
+  { key: 'settings', label: '基础设置', icon: '⚙️' },
+]
+
 const message = useMessage()
 const auth = useAuthStore()
+const route = useRoute()
+const router = useRouter()
 
-const activeTab = ref('dashboard')
+const validTabs = new Set(tabs.map((t) => t.key))
+const activeTab = ref(typeof route.query.tab === 'string' && validTabs.has(route.query.tab) ? route.query.tab : 'dashboard')
+const loadedTabs = reactive<Record<string, boolean>>({})
+
 const dash = ref<any>({})
 const libraries = ref<any[]>([])
 const users = ref<any[]>([])
@@ -456,6 +529,8 @@ const tasks = ref<any[]>([])
 const matchQueue = ref<any[]>([])
 const sseConnected = ref(false)
 let evtSource: EventSource | null = null
+
+const runningTaskCount = computed(() => tasks.value.filter((t) => t.status === 'running' || t.status === 'pending').length)
 
 const settingsForm = reactive({
   server_name: '',
@@ -525,8 +600,7 @@ function formatBytes(bytes: number): string {
 }
 
 function formatTime(iso: string): string {
-  if (!iso) return ''
-  return new Date(iso).toLocaleString()
+  return iso ? new Date(iso).toLocaleString() : ''
 }
 
 function taskTypeLabel(tp: string): string {
@@ -557,27 +631,21 @@ function taskStatusLabel(status: string): string {
   }
 }
 
-async function loadAll() {
-  const [d, l, u, s, t, tmdb, q, pg] = await Promise.all([
-    apiFetch('/api/admin/dashboard'),
-    apiFetch('/api/admin/libraries'),
-    apiFetch('/api/admin/users'),
-    apiFetch('/api/admin/settings'),
-    apiFetch('/api/admin/tasks'),
+// Per-tab lazy loaders so entering /admin only fetches what is visible!
+async function loadDashboardTab() {
+  dash.value = await apiFetch('/api/admin/dashboard')
+}
+
+async function loadLibrariesTab() {
+  const res = await apiFetch('/api/admin/libraries')
+  libraries.value = res.items || []
+}
+
+async function loadScraperTab() {
+  const [tmdb, q] = await Promise.all([
     apiFetch('/api/admin/tmdb'),
     apiFetch('/api/admin/scraper/queue?status=pending'),
-    apiFetch('/api/admin/permission-groups'),
   ])
-  dash.value = d
-  libraries.value = l.items || []
-  users.value = u.items || []
-  permissionGroups.value = pg.items || []
-  settingsForm.server_name = s.server_name || ''
-  settingsForm.emby_metadata_dir = s.emby_metadata_dir || ''
-  settingsForm.emby_metadata_writeback = Boolean(s.emby_metadata_writeback)
-  settingsStatus.exists = Boolean(s.emby_metadata_exists)
-  settingsStatus.writable = Boolean(s.emby_metadata_writable)
-  tasks.value = t.items || []
   tmdbStatus.value = tmdb
   tmdbForm.api_base_url = tmdb.api_base_url || 'https://api.themoviedb.org/3'
   tmdbForm.image_base_url = tmdb.image_base_url || 'https://image.tmdb.org/t/p'
@@ -590,6 +658,65 @@ async function loadAll() {
 async function loadTasks() {
   const res = await apiFetch('/api/admin/tasks')
   tasks.value = res.items || []
+}
+
+async function loadUsersTab() {
+  const [u, pg, l] = await Promise.all([
+    apiFetch('/api/admin/users'),
+    apiFetch('/api/admin/permission-groups'),
+    libraries.value.length ? Promise.resolve({ items: libraries.value }) : apiFetch('/api/admin/libraries'),
+  ])
+  users.value = u.items || []
+  permissionGroups.value = pg.items || []
+  if (l.items) libraries.value = l.items
+}
+
+async function loadSettingsTab() {
+  const s = await apiFetch('/api/admin/settings')
+  settingsForm.server_name = s.server_name || ''
+  settingsForm.emby_metadata_dir = s.emby_metadata_dir || ''
+  settingsForm.emby_metadata_writeback = Boolean(s.emby_metadata_writeback)
+  settingsStatus.exists = Boolean(s.emby_metadata_exists)
+  settingsStatus.writable = Boolean(s.emby_metadata_writable)
+}
+
+async function ensureTabLoaded(tabKey: string, force = false) {
+  if (!force && loadedTabs[tabKey]) return
+  loadedTabs[tabKey] = true
+  switch (tabKey) {
+    case 'dashboard':
+      await loadDashboardTab()
+      break
+    case 'libraries':
+      await loadLibrariesTab()
+      break
+    case 'virtual':
+      if (!libraries.value.length) await loadLibrariesTab()
+      break
+    case 'scraper':
+      await loadScraperTab()
+      break
+    case 'tasks':
+      await loadTasks()
+      break
+    case 'users':
+      await loadUsersTab()
+      break
+    case 'settings':
+      await loadSettingsTab()
+      break
+  }
+}
+
+function selectTab(key: string) {
+  activeTab.value = key
+  router.replace({ query: { ...route.query, tab: key } })
+  ensureTabLoaded(key)
+}
+
+async function refreshActiveTab() {
+  await ensureTabLoaded(activeTab.value, true)
+  message.success('已刷新')
 }
 
 async function loadMatchQueue() {
@@ -615,7 +742,10 @@ function connectSSE() {
         tasks.value.unshift(ev.task)
       }
       if (ev.event === 'completed' || ev.event === 'failed') {
-        loadAll()
+        invalidateApiCache('/api/web/home')
+        invalidateApiCache('/emby/')
+        if (activeTab.value === 'dashboard') loadDashboardTab()
+        if (activeTab.value === 'libraries') loadLibrariesTab()
       }
     } catch {
       // ignore malformed frame
@@ -628,10 +758,7 @@ function connectSSE() {
 
 async function saveTMDB() {
   try {
-    const res = await apiFetch('/api/admin/tmdb', {
-      method: 'PUT',
-      body: JSON.stringify(tmdbForm),
-    })
+    const res = await apiFetch('/api/admin/tmdb', { method: 'PUT', body: JSON.stringify(tmdbForm) })
     tmdbStatus.value = res
     tmdbForm.api_key = ''
     tmdbForm.read_token = ''
@@ -669,11 +796,7 @@ async function runManualSearch() {
     const mediaType = manualSearchTarget.value?.item_type === 'Series' ? 'tv' : 'movie'
     const res = await apiFetch('/api/admin/scraper/search', {
       method: 'POST',
-      body: JSON.stringify({
-        query: manualQuery.value.trim(),
-        year: manualYear.value || 0,
-        media_type: mediaType,
-      }),
+      body: JSON.stringify({ query: manualQuery.value.trim(), year: manualYear.value || 0, media_type: mediaType }),
     })
     manualResults.value = res.candidates || []
   } catch (e: any) {
@@ -690,6 +813,7 @@ async function resolveMatch(itemId: string, mediaType: string, tmdbId: number) {
       body: JSON.stringify({ tmdb_id: tmdbId, media_type: mediaType }),
     })
     showManualSearchModal.value = false
+    invalidateApiCache('/api/web/home')
     message.success('已应用选中匹配')
     await loadMatchQueue()
   } catch (e: any) {
@@ -747,25 +871,21 @@ async function saveLibrary() {
     hidden: libForm.hidden,
   }
   if (editingLibId.value) {
-    await apiFetch(`/api/admin/libraries/${editingLibId.value}`, {
-      method: 'PUT',
-      body: JSON.stringify(payload),
-    })
+    await apiFetch(`/api/admin/libraries/${editingLibId.value}`, { method: 'PUT', body: JSON.stringify(payload) })
     message.success('媒体库已更新')
   } else {
-    await apiFetch('/api/admin/libraries', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    })
+    await apiFetch('/api/admin/libraries', { method: 'POST', body: JSON.stringify(payload) })
     message.success('媒体库已创建')
   }
   showLibModal.value = false
-  await loadAll()
+  invalidateApiCache('/api/web/home')
+  invalidateApiCache('/emby/')
+  await loadLibrariesTab()
 }
 
 async function scanLibrary(id: string) {
   await apiFetch(`/api/admin/libraries/${id}/scan`, { method: 'POST' })
-  message.success('扫描任务已加入队列')
+  message.success('并发扫描任务已加入队列')
   await loadTasks()
 }
 
@@ -783,7 +903,7 @@ async function scrapeLibrary(id: string) {
 
 async function scanAll() {
   await apiFetch('/api/admin/scan-all', { method: 'POST' })
-  message.success('全库扫描任务已加入队列')
+  message.success('全库并发扫描任务已加入队列')
   await loadTasks()
 }
 
@@ -794,20 +914,25 @@ async function cancelTask(id: string) {
 
 async function clearCache() {
   const res = await apiFetch('/api/admin/cache/clear', { method: 'POST' })
+  invalidateApiCache()
   message.success(`已清理 ${res.image_files_cleared ?? 0} 个缩略图缓存文件并清空热缓存`)
-  await loadAll()
+  await loadDashboardTab()
 }
 
 async function deleteLibrary(id: string) {
   await apiFetch(`/api/admin/libraries/${id}`, { method: 'DELETE' })
+  invalidateApiCache('/api/web/home')
+  invalidateApiCache('/emby/')
   message.success('已删除媒体库')
-  await loadAll()
+  await loadLibrariesTab()
 }
 
 async function generateLibCover(id: string) {
   const res = await apiFetch(`/api/admin/libraries/${id}/cover/generate`, { method: 'POST' })
+  invalidateApiCache('/api/web/home')
+  invalidateApiCache('/emby/')
   message.success(`拼贴封面已生成（使用了 ${res.poster_count ?? 0} 张海报）`)
-  await loadAll()
+  await loadLibrariesTab()
 }
 
 function triggerCoverUpload(id: string) {
@@ -828,8 +953,9 @@ async function onCoverFileSelected(e: Event) {
       body: fd,
     })
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    invalidateApiCache('/api/web/home')
     message.success('自定义封面上传成功')
-    await loadAll()
+    await loadLibrariesTab()
   } catch (err: any) {
     message.error(err.message || '封面上传失败')
   } finally {
@@ -878,7 +1004,7 @@ async function saveUser() {
     editingUserId.value = ''
     showUserModal.value = false
     message.success('用户权限已更新')
-    await loadAll()
+    await loadUsersTab()
     return
   }
   if (!userForm.username.trim() || userForm.password.length < 4) {
@@ -901,22 +1027,19 @@ async function saveUser() {
   userForm.password = ''
   userForm.library_ids = []
   message.success('用户已创建')
-  await loadAll()
+  await loadUsersTab()
 }
 
 async function toggleDownload(u: any) {
-  await apiFetch(`/api/admin/users/${u.id}`, {
-    method: 'PUT',
-    body: JSON.stringify({ can_download: !u.can_download }),
-  })
+  await apiFetch(`/api/admin/users/${u.id}`, { method: 'PUT', body: JSON.stringify({ can_download: !u.can_download }) })
   message.success('权限已更新')
-  await loadAll()
+  await loadUsersTab()
 }
 
 async function deleteUser(id: string) {
   await apiFetch(`/api/admin/users/${id}`, { method: 'DELETE' })
   message.success('用户已删除')
-  await loadAll()
+  await loadUsersTab()
 }
 
 function selectMetaDir(path: string) {
@@ -936,11 +1059,21 @@ async function saveSettings() {
   })
   auth.serverName = settingsForm.server_name
   message.success('设置已保存')
-  await loadAll()
+  await loadSettingsTab()
 }
 
+watch(
+  () => route.query.tab,
+  (t) => {
+    if (typeof t === 'string' && validTabs.has(t) && t !== activeTab.value) {
+      activeTab.value = t
+      ensureTabLoaded(t)
+    }
+  },
+)
+
 onMounted(() => {
-  loadAll()
+  ensureTabLoaded(activeTab.value)
   connectSSE()
 })
 

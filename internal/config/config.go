@@ -18,8 +18,13 @@ type Config struct {
 	Database DatabaseConfig `yaml:"database"`
 	Redis    RedisConfig    `yaml:"redis"`
 	Storage  StorageConfig  `yaml:"storage"`
+	Scanner  ScannerConfig  `yaml:"scanner"`
 	Auth     AuthConfig     `yaml:"auth"`
 	Log      LogConfig      `yaml:"log"`
+}
+
+type ScannerConfig struct {
+	Concurrency int `yaml:"concurrency"`
 }
 
 type ServerConfig struct {
@@ -215,6 +220,9 @@ func applyEnv(cfg *Config) {
 	}
 	if v := envFirst("EMBY_METADATA_WRITEBACK", "EMBY_LITE_EMBY_METADATA_WRITEBACK"); v != "" {
 		cfg.Storage.EmbyMetadataWriteback = strings.EqualFold(v, "true") || v == "1"
+	}
+	if v, ok := envIntFirst("SCAN_CONCURRENCY", "EMBY_LITE_SCAN_CONCURRENCY"); ok && v > 0 {
+		cfg.Scanner.Concurrency = v
 	}
 
 	if v := envFirst("ADMIN_USER", "EMBY_LITE_ADMIN_USER"); v != "" {

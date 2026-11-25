@@ -55,6 +55,17 @@ func (p *Prober) HasFFprobe() bool {
 
 // ProbeLocal probes a local media file using pure-Go parsers first, with optional ffprobe fallback.
 func (p *Prober) ProbeLocal(ctx context.Context, path string) (*Result, error) {
+	if res, err := p.ProbeLocalNativeOnly(ctx, path); err == nil {
+		return res, nil
+	}
+	if p.ffprobeBin != "" {
+		return p.probeWithFFprobe(ctx, path)
+	}
+	return nil, errors.New("unsupported container for nativeprobe and ffprobe fallback unavailable")
+}
+
+// ProbeLocalNativeOnly performs fast pure-Go container header probing without invoking external ffprobe.
+func (p *Prober) ProbeLocalNativeOnly(_ context.Context, path string) (*Result, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -66,14 +77,7 @@ func (p *Prober) ProbeLocal(ctx context.Context, path string) (*Result, error) {
 	}
 
 	ext := strings.ToLower(filepath.Ext(path))
-	if res, err := probeReadSeeker(f, fi.Size(), ext); err == nil {
-		return res, nil
-	}
-
-	if p.ffprobeBin != "" {
-		return p.probeWithFFprobe(ctx, path)
-	}
-	return nil, errors.New("unsupported container for nativeprobe and ffprobe fallback unavailable")
+	return probeReadSeeker(f, fi.Size(), ext)
 }
 
 // ProbeRemoteURL probes an HTTP/HTTPS STRM target using bounded Range requests (never downloads the whole file).

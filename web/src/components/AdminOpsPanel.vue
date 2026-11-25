@@ -11,19 +11,19 @@
             </n-button>
           </div>
         </template>
-        <div class="text-xs text-slate-400 mb-3">
+        <div class="text-xs text-ink-muted mb-3">
           可移植 ZIP 归档支持 <strong>SQLite ↔ PostgreSQL</strong> 跨库迁移恢复。目录：<code>{{ backupDir }}</code>
         </div>
-        <div v-if="backups.length === 0" class="py-6 text-center text-xs text-slate-500">暂无备份归档</div>
+        <div v-if="backups.length === 0" class="py-6 text-center text-xs text-ink-muted">暂无备份归档</div>
         <div v-else class="space-y-2 max-h-72 overflow-y-auto">
           <div
             v-for="b in backups"
             :key="b.filename"
-            class="rounded-lg border border-cinema-border bg-cinema-bg p-2.5 flex items-center justify-between gap-2"
+            class="rounded-xl neu-inset p-3 flex items-center justify-between gap-2"
           >
             <div class="min-w-0">
-              <div class="text-xs font-mono text-white truncate">{{ b.filename }}</div>
-              <div class="text-[11px] text-slate-400">{{ b.format }} · {{ (b.size / 1024).toFixed(1) }} KB</div>
+              <div class="text-xs font-mono font-medium text-ink truncate">{{ b.filename }}</div>
+              <div class="text-[11px] text-ink-muted">{{ b.format }} · {{ (b.size / 1024).toFixed(1) }} KB</div>
             </div>
             <div class="flex items-center gap-1 shrink-0">
               <n-button size="tiny" secondary @click="downloadBackup(b.filename)">下载</n-button>
@@ -38,7 +38,7 @@
 
       <!-- Emby Full Migration Wizard -->
       <n-card size="small" title="从旧 Emby 完整迁移（媒体库 / 元数据 / 用户 / 观看进度）">
-        <div class="text-xs text-slate-400 mb-3">
+        <div class="text-xs text-ink-muted mb-3">
           纯 Go 只读读取原 Emby 配置目录，自动识别 <code>root/default</code>（媒体库）、<code>data/library.db</code>（影视元数据）与 <code>data/users.db</code>（用户与观看记录）。
         </div>
         <n-form label-placement="top" size="small">
@@ -93,12 +93,12 @@
           <div class="mb-3">
             <button
               type="button"
-              class="text-xs text-emerald-400 hover:underline"
+              class="text-xs text-sky-600 dark:text-sky-400 font-medium hover:underline"
               @click="showAdvancedMig = !showAdvancedMig"
             >
               {{ showAdvancedMig ? '▾ 收起手动指定路径与高级选项' : '▸ 高级选项（手动指定 db / root 路径、覆盖策略）' }}
             </button>
-            <div v-if="showAdvancedMig" class="mt-2 p-2.5 rounded-lg bg-cinema-bg/70 border border-cinema-border/70 space-y-2">
+            <div v-if="showAdvancedMig" class="mt-2 p-3 rounded-xl neu-inset space-y-2">
               <n-form-item label="root/default 目录（可选覆盖）" :show-feedback="false">
                 <div class="flex gap-2 w-full">
                   <n-input v-model:value="migForm.root_default_dir" placeholder="例如：/emby-config/root/default" />
@@ -126,61 +126,61 @@
         <!-- Preview Report -->
         <div
           v-if="migPreview"
-          class="mt-3 p-3 rounded-lg bg-cinema-bg border border-cinema-border text-xs text-slate-300 space-y-2"
+          class="mt-3 p-3.5 rounded-2xl neu-inset text-xs text-ink-secondary space-y-2"
         >
-          <div class="font-medium text-emerald-400">预检报告</div>
-          <div v-if="migPreview.resolved" class="text-[11px] text-slate-400 space-y-0.5 font-mono break-all">
+          <div class="font-semibold text-sky-600 dark:text-sky-400">预检报告</div>
+          <div v-if="migPreview.resolved" class="text-[11px] text-ink-muted space-y-0.5 font-mono break-all">
             <div v-if="migPreview.resolved.root_default_dir">root/default: {{ migPreview.resolved.root_default_dir }}</div>
             <div v-if="migPreview.resolved.library_db_path">library.db: {{ migPreview.resolved.library_db_path }}</div>
             <div v-if="migPreview.resolved.users_db_path">users.db: {{ migPreview.resolved.users_db_path }}</div>
           </div>
 
           <div class="grid grid-cols-2 gap-2 pt-1">
-            <div class="rounded bg-cinema-card/70 px-2.5 py-1.5">
+            <div class="rounded-xl glass-card px-2.5 py-1.5">
               媒体库：<strong>{{ migPreview.libraries_found }}</strong>（新建 {{ migPreview.new_libraries_to_create }}）
             </div>
-            <div class="rounded bg-cinema-card/70 px-2.5 py-1.5">
+            <div class="rounded-xl glass-card px-2.5 py-1.5">
               影视条目：<strong>{{ migPreview.items_found }}</strong>
-              <span class="text-[11px] text-slate-400 ml-1">
+              <span class="text-[11px] text-ink-muted ml-1">
                 (电影 {{ migPreview.movies_found }} / 剧集 {{ migPreview.series_found }} / 季 {{ migPreview.seasons_found }} / 集 {{ migPreview.episodes_found }})
               </span>
             </div>
-            <div class="rounded bg-cinema-card/70 px-2.5 py-1.5">
+            <div class="rounded-xl glass-card px-2.5 py-1.5">
               旧用户：<strong>{{ migPreview.users_found }}</strong>（新建 {{ migPreview.new_users_to_create }}）
             </div>
-            <div class="rounded bg-cinema-card/70 px-2.5 py-1.5">
+            <div class="rounded-xl glass-card px-2.5 py-1.5">
               观看记录：<strong>{{ migPreview.watch_records_found }}</strong>（预计可关联 <strong>{{ migPreview.matched_watch_records }}</strong>）
             </div>
           </div>
 
           <div v-if="migPreview.libraries && migPreview.libraries.length > 0" class="space-y-1 pt-1">
-            <div class="text-[11px] text-slate-400">识别到的媒体库（路径已应用前缀映射）：</div>
+            <div class="text-[11px] text-ink-muted">识别到的媒体库（路径已应用前缀映射）：</div>
             <div class="max-h-36 overflow-y-auto space-y-1">
               <div
                 v-for="lib in migPreview.libraries"
                 :key="lib.name"
-                class="rounded border border-cinema-border/60 px-2 py-1 flex flex-col gap-0.5"
+                class="rounded-xl glass-card px-2.5 py-1.5 flex flex-col gap-0.5"
               >
                 <div class="flex items-center justify-between gap-2">
-                  <span class="font-medium text-white">{{ lib.name }}</span>
+                  <span class="font-semibold text-ink">{{ lib.name }}</span>
                   <div class="flex items-center gap-1.5">
-                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">{{ lib.kind }}</span>
+                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-200/70 dark:bg-slate-800 text-ink-secondary">{{ lib.kind }}</span>
                     <span
-                      class="text-[10px] px-1.5 py-0.5 rounded"
-                      :class="lib.exists ? 'bg-amber-950 text-amber-300' : 'bg-emerald-950 text-emerald-300'"
+                      class="text-[10px] px-1.5 py-0.5 rounded font-medium"
+                      :class="lib.exists ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300' : 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300'"
                     >
                       {{ lib.exists ? '已存在（合并路径）' : '将新建' }}
                     </span>
                   </div>
                 </div>
-                <div class="text-[11px] font-mono text-slate-400 break-all">
+                <div class="text-[11px] font-mono text-ink-muted break-all">
                   {{ (lib.paths || []).join(' ; ') || '（无目录路径）' }}
                 </div>
               </div>
             </div>
           </div>
 
-          <div v-if="migPreview.warnings && migPreview.warnings.length > 0" class="pt-1 space-y-0.5 text-amber-300">
+          <div v-if="migPreview.warnings && migPreview.warnings.length > 0" class="pt-1 space-y-0.5 text-amber-600 dark:text-amber-300">
             <div class="font-medium">注意事项：</div>
             <div v-for="(w, i) in migPreview.warnings" :key="i">• {{ w }}</div>
           </div>
@@ -195,20 +195,20 @@
           <n-input v-model:value="newKeyName" size="small" placeholder="输入密钥备注名（如 MoviePilot）" />
           <n-button size="small" type="primary" @click="createKey">生成 Key</n-button>
         </div>
-        <div v-if="createdPlainKey" class="mb-3 p-2.5 rounded-lg bg-emerald-950/60 border border-emerald-600/60 text-xs space-y-1">
-          <div class="text-emerald-300 font-medium">新 API Key（仅展示一次，请立即复制保存）：</div>
-          <div class="font-mono text-white break-all">{{ createdPlainKey }}</div>
+        <div v-if="createdPlainKey" class="mb-3 p-3 rounded-xl bg-emerald-500/12 border border-emerald-500/35 text-xs space-y-1">
+          <div class="text-emerald-700 dark:text-emerald-300 font-semibold">新 API Key（仅展示一次，请立即复制保存）：</div>
+          <div class="font-mono text-ink break-all">{{ createdPlainKey }}</div>
         </div>
-        <div v-if="apiKeys.length === 0" class="py-4 text-center text-xs text-slate-500">暂无 API Key</div>
+        <div v-if="apiKeys.length === 0" class="py-4 text-center text-xs text-ink-muted">暂无 API Key</div>
         <div v-else class="space-y-2">
           <div
             v-for="k in apiKeys"
             :key="k.id"
-            class="rounded-lg border border-cinema-border bg-cinema-bg px-3 py-2 flex items-center justify-between"
+            class="rounded-xl neu-inset px-3 py-2 flex items-center justify-between"
           >
             <div>
-              <div class="text-xs font-medium text-white">{{ k.name }}</div>
-              <div class="text-[11px] text-slate-400">创建于 {{ formatTime(k.created_at) }}</div>
+              <div class="text-xs font-semibold text-ink">{{ k.name }}</div>
+              <div class="text-[11px] text-ink-muted">创建于 {{ formatTime(k.created_at) }}</div>
             </div>
             <n-button size="tiny" type="error" quaternary @click="deleteKey(k.id)">吊销</n-button>
           </div>
@@ -219,19 +219,19 @@
         <template #header-extra>
           <n-button size="tiny" secondary @click="load">刷新</n-button>
         </template>
-        <div v-if="auditLogs.length === 0" class="py-6 text-center text-xs text-slate-500">暂无审计日志</div>
+        <div v-if="auditLogs.length === 0" class="py-6 text-center text-xs text-ink-muted">暂无审计日志</div>
         <div v-else class="space-y-1.5 max-h-72 overflow-y-auto">
           <div
             v-for="log in auditLogs"
             :key="log.id"
-            class="rounded border border-cinema-border/60 bg-cinema-bg px-2.5 py-1.5 text-xs flex items-center justify-between gap-2"
+            class="rounded-xl neu-inset px-3 py-2 text-xs flex items-center justify-between gap-2"
           >
             <div class="min-w-0 truncate">
-              <span class="text-emerald-400 font-mono">{{ log.action }}</span>
-              <span class="text-slate-300 ml-1.5">{{ log.username || 'admin' }}</span>
-              <span class="text-slate-500 ml-1.5">{{ log.target_id }}</span>
+              <span class="text-sky-600 dark:text-sky-400 font-mono font-medium">{{ log.action }}</span>
+              <span class="text-ink-secondary ml-1.5">{{ log.username || 'admin' }}</span>
+              <span class="text-ink-muted ml-1.5">{{ log.target_id }}</span>
             </div>
-            <span class="text-[10px] text-slate-500 shrink-0">{{ formatTime(log.created_at) }}</span>
+            <span class="text-[10px] text-ink-muted shrink-0">{{ formatTime(log.created_at) }}</span>
           </div>
         </div>
       </n-card>

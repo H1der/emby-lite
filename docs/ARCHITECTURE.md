@@ -38,7 +38,7 @@
 | 图片流水线 | 标准库 `image` + `golang.org/x/image` + 纯 Go WebP 编解码 + 磁盘内容寻址缓存 | 零 CGO 依赖，支持按需缩放、ETag/304、媒体库拼贴封面 |
 | 鉴权与加密 | `golang.org/x/crypto/argon2`（口令哈希）、HMAC-SHA256（图片签名 Tag / 游标签名）、AES-GCM（敏感设置加密存库） | 密钥与 API Token 只写不回显 |
 | 配置与日志 | `log/slog`（结构化日志 + 文件滚动）、YAML/TOML 配置 + 环境变量覆盖 | 优先级：内置默认 < 配置文件 < 环境变量 < 管理后台动态设置 |
-| 前端 | Vue 3 + TypeScript + Vite + Pinia + Vue Router + Tailwind CSS + Naive UI | 暗色影视风媒体端 + 高效后台管理端；产物通过 `go:embed` 内嵌二进制 |
+| 前端 | Vue 3 + TypeScript + Vite + Pinia + Vue Router + Tailwind CSS + Naive UI | 浅色拟态毛玻璃（Glacial Glass + Soft Neumorphism）为主、支持浅色/深色一键切换与多分辨率三态自适应布局（手机底栏/平板图标栏/桌面可折叠侧边栏/2K-4K 宽屏多列网格），含 Ctrl+K 实时搜索、无限滚动多维筛选、`/api/web/home` 聚合与前端 SWR 缓存；产物通过 `go:embed` 内嵌二进制 |
 
 ---
 

@@ -5,13 +5,27 @@ export default {
   theme: {
     extend: {
       colors: {
-        cinema: {
-          bg: '#0b0e14',
-          surface: '#141923',
-          card: '#1a2230',
-          border: '#263042',
-          accent: '#10b981',
+        // Semantic theme-aware colors backed by CSS variables
+        brand: {
+          DEFAULT: 'var(--accent)',
+          hover: 'var(--accent-hover)',
+          soft: 'var(--accent-soft)',
         },
+        cinema: {
+          bg: 'var(--surface-inset)',
+          surface: 'var(--glass-bg)',
+          card: 'var(--glass-card)',
+          border: 'var(--glass-border)',
+          accent: 'var(--accent)',
+        },
+      },
+      screens: {
+        '3xl': '1800px',
+        '4xl': '2300px',
+      },
+      borderRadius: {
+        '2xl': '1rem',
+        '3xl': '1.375rem',
       },
     },
   },

@@ -59,13 +59,54 @@ func NewService(db *database.DB, authSvc *auth.Service, cfg *config.Config, cust
 
 // BuildMediaSources builds Emby-compatible MediaSources DTO list for an Item.
 func (s *Service) BuildMediaSources(r *http.Request, p *auth.Principal, item *model.Item) []map[string]any {
-	var sources []model.MediaSource
-	if err := s.db.Gorm.Where("item_id = ?", item.ID).Order("id ASC").Find(&sources).Error; err != nil || len(sources) == 0 {
+	if item == nil {
 		return []map[string]any{}
 	}
+	res := s.BuildMediaSourcesBatch(r, p, []model.Item{*item})
+	if out, ok := res[item.ID]; ok {
+		return out
+	}
+	return []map[string]any{}
+}
 
-	out := make([]map[string]any, 0, len(sources))
+// BuildMediaSourcesBatch builds Emby-compatible MediaSources DTOs for multiple items in 2 batched queries.
+func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, items []model.Item) map[string][]map[string]any {
+	result := make(map[string][]map[string]any, len(items))
+	if len(items) == 0 {
+		return result
+	}
+
+	itemByID := make(map[string]*model.Item, len(items))
+	itemIDs := make([]string, 0, len(items))
+	for i := range items {
+		itemByID[items[i].ID] = &items[i]
+		itemIDs = append(itemIDs, items[i].ID)
+	}
+
+	var sources []model.MediaSource
+	if err := s.db.Read().Where("item_id IN ?", itemIDs).Order("id ASC").Find(&sources).Error; err != nil || len(sources) == 0 {
+		return result
+	}
+
+	sourceIDs := make([]string, 0, len(sources))
 	for _, src := range sources {
+		sourceIDs = append(sourceIDs, src.ID)
+	}
+
+	subsBySource := make(map[string][]model.MediaSubtitle, len(sourceIDs))
+	var allSubs []model.MediaSubtitle
+	if err := s.db.Read().Where("media_source_id IN ?", sourceIDs).Order("stream_index ASC").Find(&allSubs).Error; err == nil {
+		for _, sub := range allSubs {
+			subsBySource[sub.MediaSourceID] = append(subsBySource[sub.MediaSourceID], sub)
+		}
+	}
+
+	origin := PublicOrigin(r, s.cfg.Server.PublicURL)
+	for _, src := range sources {
+		item := itemByID[src.ItemID]
+		if item == nil {
+			continue
+		}
 		ext := src.Container
 		if ext == "" {
 			ext = "mkv"
@@ -84,26 +125,24 @@ func (s *Service) BuildMediaSources(r *http.Request, p *auth.Principal, item *mo
 			}
 		}
 
-		var subs []model.MediaSubtitle
-		_ = s.db.Gorm.Where("media_source_id = ?", src.ID).Order("stream_index ASC").Find(&subs).Error
-		for _, sub := range subs {
+		for _, sub := range subsBySource[src.ID] {
 			subURL := fmt.Sprintf("/Videos/%s/%s/Subtitles/%d/Stream.%s", item.ID, src.ID, sub.StreamIndex, sub.Codec)
 			if p != nil && p.Token != "" {
 				subURL += "?api_key=" + url.QueryEscape(p.Token)
 			}
 			streams = append(streams, map[string]any{
-				"Type":                  "Subtitle",
-				"Index":                 sub.StreamIndex,
-				"Codec":                 sub.Codec,
-				"Language":              sub.Language,
-				"DisplayTitle":          sub.Title,
-				"Title":                 sub.Title,
-				"IsExternal":            sub.IsExternal,
-				"IsDefault":             sub.IsDefault,
-				"IsForced":              sub.IsForced,
+				"Type":                   "Subtitle",
+				"Index":                  sub.StreamIndex,
+				"Codec":                  sub.Codec,
+				"Language":               sub.Language,
+				"DisplayTitle":           sub.Title,
+				"Title":                  sub.Title,
+				"IsExternal":             sub.IsExternal,
+				"IsDefault":              sub.IsDefault,
+				"IsForced":               sub.IsForced,
 				"SupportsExternalStream": true,
-				"DeliveryMethod":        "External",
-				"DeliveryUrl":           subURL,
+				"DeliveryMethod":         "External",
+				"DeliveryUrl":            subURL,
 			})
 		}
 
@@ -117,7 +156,7 @@ func (s *Service) BuildMediaSources(r *http.Request, p *auth.Principal, item *mo
 			runtimeTicks = int64(src.DurationSecs * 1e7)
 		}
 
-		pathVal := PublicOrigin(r, s.cfg.Server.PublicURL) + "/emby" + relURL
+		pathVal := origin + "/emby" + relURL
 		if p != nil && p.IsAPIKey {
 			if src.SourceType == "strm" && src.StrmURL != "" {
 				pathVal = src.StrmURL
@@ -127,20 +166,32 @@ func (s *Service) BuildMediaSources(r *http.Request, p *auth.Principal, item *mo
 		}
 
 		ms := map[string]any{
-			"Id":                   src.ID,
-			"Name":                 name,
-			"Protocol":             "Http",
-			"Type":                 "Default",
-			"Container":            ext,
-			"Size":                 src.FileSize,
-			"Path":                 pathVal,
-			"DirectStreamUrl":      relURL,
-			"SupportsDirectPlay":   true,
-			"SupportsDirectStream": true,
-			"SupportsTranscoding":  false,
-			"IsRemote":             src.SourceType == "strm",
+			"Id":                    src.ID,
+			"Name":                  name,
+			"Protocol":              "Http",
+			"Type":                  "Default",
+			"Container":             ext,
+			"Size":                  src.FileSize,
+			"Path":                  pathVal,
+			"DirectStreamUrl":       relURL,
+			"SupportsDirectPlay":    true,
+			"SupportsDirectStream":  true,
+			"SupportsTranscoding":   false,
+			"IsRemote":              src.SourceType == "strm",
 			"ReadAtNativeFramerate": false,
-			"MediaStreams":         streams,
+			"MediaStreams":          streams,
+		}
+		if src.Width > 0 {
+			ms["Width"] = src.Width
+		}
+		if src.Height > 0 {
+			ms["Height"] = src.Height
+		}
+		if src.VideoCodec != "" {
+			ms["VideoCodec"] = src.VideoCodec
+		}
+		if src.HDRType != "" {
+			ms["HDRType"] = src.HDRType
 		}
 		if runtimeTicks > 0 {
 			ms["RunTimeTicks"] = runtimeTicks
@@ -148,9 +199,9 @@ func (s *Service) BuildMediaSources(r *http.Request, p *auth.Principal, item *mo
 		if src.Bitrate > 0 {
 			ms["Bitrate"] = src.Bitrate
 		}
-		out = append(out, ms)
+		result[item.ID] = append(result[item.ID], ms)
 	}
-	return out
+	return result
 }
 
 // BuildPlaybackInfo builds the full Emby PlaybackInfo JSON payload.

@@ -9,7 +9,7 @@
     <div class="space-y-3">
       <!-- Quick Roots (Drives / Allowed Media Roots) -->
       <div v-if="roots.length > 0" class="flex flex-wrap items-center gap-1.5">
-        <span class="text-xs text-slate-400 mr-1">根目录：</span>
+        <span class="text-xs text-ink-muted mr-1">根目录：</span>
         <n-button
           v-for="r in roots"
           :key="r.path"
@@ -28,7 +28,7 @@
           ↑ 上级目录
         </n-button>
         <div
-          class="flex-1 px-3 py-1.5 rounded bg-cinema-bg border border-cinema-border text-xs text-slate-200 font-mono truncate"
+          class="flex-1 px-3 py-1.5 rounded-xl neu-inset text-xs text-ink font-mono truncate"
           :title="current || '根目录'"
         >
           {{ current || '请选择磁盘或根目录' }}
@@ -47,26 +47,26 @@
       </div>
 
       <!-- Directory Listing -->
-      <div class="border border-cinema-border rounded-lg bg-cinema-bg h-72 overflow-y-auto divide-y divide-cinema-border/40">
-        <div v-if="loading" class="h-full flex items-center justify-center text-sm text-slate-400">
+      <div class="neu-inset rounded-2xl h-72 overflow-y-auto divide-y divide-slate-200/60 dark:divide-white/10">
+        <div v-if="loading" class="h-full flex items-center justify-center text-sm text-ink-muted">
           正在读取目录...
         </div>
-        <div v-else-if="errorMsg" class="h-full flex items-center justify-center text-sm text-rose-400 px-4 text-center">
+        <div v-else-if="errorMsg" class="h-full flex items-center justify-center text-sm text-rose-500 px-4 text-center">
           {{ errorMsg }}
         </div>
-        <div v-else-if="filteredEntries.length === 0" class="h-full flex items-center justify-center text-sm text-slate-500">
+        <div v-else-if="filteredEntries.length === 0" class="h-full flex items-center justify-center text-sm text-ink-muted">
           此目录下没有子文件夹（可点击右上角“选择当前目录”）
         </div>
         <div
           v-else
           v-for="entry in filteredEntries"
           :key="entry.path"
-          class="flex items-center justify-between gap-2 px-3 py-2 hover:bg-cinema-card/80 transition cursor-pointer"
+          class="flex items-center justify-between gap-2 px-3.5 py-2.5 hover:bg-white/60 dark:hover:bg-white/5 transition cursor-pointer"
           @click="browse(entry.path)"
         >
           <div class="flex items-center gap-2 min-w-0">
-            <span class="text-amber-400 shrink-0">📁</span>
-            <span class="text-sm text-slate-100 truncate">{{ entry.name }}</span>
+            <span class="text-amber-500 shrink-0">📁</span>
+            <span class="text-sm text-ink truncate">{{ entry.name }}</span>
           </div>
           <div class="flex items-center gap-1.5 shrink-0" @click.stop>
             <n-button
@@ -83,7 +83,7 @@
 
       <!-- Selected Summary Footer -->
       <div class="flex items-center justify-between pt-1">
-        <div class="text-xs text-slate-400">
+        <div class="text-xs text-ink-muted">
           已选 {{ selectedPaths.length }} 个目录
         </div>
         <n-button type="primary" size="small" @click="emit('update:show', false)">

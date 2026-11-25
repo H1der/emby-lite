@@ -2,7 +2,7 @@
   <div class="space-y-4 mt-2">
     <div class="flex flex-wrap items-center justify-between gap-2">
       <div class="flex flex-wrap items-center gap-1.5">
-        <span class="text-xs text-slate-400">允许根目录：</span>
+        <span class="text-xs text-ink-muted">允许根目录：</span>
         <n-button
           v-for="r in roots"
           :key="r"
@@ -21,18 +21,18 @@
       </div>
     </div>
 
-    <div class="px-3 py-1.5 rounded bg-cinema-bg border border-cinema-border text-xs font-mono text-slate-300 truncate">
+    <div class="px-3.5 py-2 rounded-xl neu-inset text-xs font-mono text-ink-secondary truncate">
       {{ current || '请选择一个媒体根目录进行浏览（严格限制在已配置媒体目录范围内）' }}
     </div>
 
-    <div class="border border-cinema-border rounded-xl bg-cinema-bg divide-y divide-cinema-border/40 min-h-[280px]">
-      <div v-if="loading" class="py-12 text-center text-sm text-slate-400">加载中...</div>
-      <div v-else-if="entries.length === 0" class="py-12 text-center text-sm text-slate-500">当前目录为空</div>
+    <div class="glass-panel rounded-2xl divide-y divide-slate-200/60 dark:divide-white/10 min-h-[280px] overflow-hidden">
+      <div v-if="loading" class="py-12 text-center text-sm text-ink-muted">加载中...</div>
+      <div v-else-if="entries.length === 0" class="py-12 text-center text-sm text-ink-muted">当前目录为空</div>
       <div
         v-else
         v-for="e in entries"
         :key="e.path"
-        class="flex flex-wrap items-center justify-between gap-3 px-3.5 py-2.5 hover:bg-cinema-card/70 transition"
+        class="flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 hover:bg-white/60 dark:hover:bg-white/5 transition"
       >
         <div
           class="flex items-center gap-2.5 min-w-0 flex-1"
@@ -40,8 +40,8 @@
           @click="e.is_dir && browse(e.path)"
         >
           <span>{{ e.is_dir ? '📁' : '📄' }}</span>
-          <span class="text-sm text-slate-100 truncate">{{ e.name }}</span>
-          <span v-if="!e.is_dir" class="text-xs text-slate-500 shrink-0">{{ formatSize(e.size) }}</span>
+          <span class="text-sm font-medium text-ink truncate">{{ e.name }}</span>
+          <span v-if="!e.is_dir" class="text-xs text-ink-muted shrink-0">{{ formatSize(e.size) }}</span>
         </div>
         <div v-if="current" class="flex items-center gap-1.5 shrink-0">
           <n-button v-if="!e.is_dir" size="tiny" secondary @click="downloadFile(e.path)">下载</n-button>

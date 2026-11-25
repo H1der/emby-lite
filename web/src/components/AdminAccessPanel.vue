@@ -9,11 +9,11 @@
         <div
           v-for="g in groups"
           :key="g.id"
-          class="rounded-xl border border-cinema-border bg-cinema-bg p-3 flex items-start justify-between gap-3"
+          class="rounded-2xl neu-inset p-3.5 flex items-start justify-between gap-3"
         >
           <div class="space-y-1 min-w-0">
-            <div class="font-medium text-white">{{ g.name }}</div>
-            <div class="text-xs text-slate-400">{{ g.description || '无描述' }}</div>
+            <div class="font-semibold text-ink">{{ g.name }}</div>
+            <div class="text-xs text-ink-muted">{{ g.description || '无描述' }}</div>
             <div class="flex flex-wrap gap-1.5 pt-1">
               <n-tag size="tiny" :type="g.allow_playback ? 'success' : 'error'">
                 {{ g.allow_playback ? '允许播放' : '禁播' }}
@@ -39,19 +39,19 @@
         <template #header-extra>
           <n-button size="tiny" secondary @click="load">刷新</n-button>
         </template>
-        <div v-if="devices.length === 0" class="py-6 text-center text-xs text-slate-500">暂无设备记录</div>
+        <div v-if="devices.length === 0" class="py-6 text-center text-xs text-ink-muted">暂无设备记录</div>
         <div v-else class="space-y-2 max-h-80 overflow-y-auto">
           <div
             v-for="d in devices"
             :key="d.user_id + ':' + d.device_id"
-            class="rounded-lg border border-cinema-border bg-cinema-bg p-2.5 flex items-center justify-between gap-2"
+            class="rounded-xl neu-inset p-3 flex items-center justify-between gap-2"
           >
             <div class="min-w-0">
-              <div class="text-xs font-medium text-white truncate">
+              <div class="text-xs font-semibold text-ink truncate">
                 {{ d.username || d.user_id }} · {{ d.client }} ({{ d.device_name }})
                 <n-tag v-if="d.blocked" size="tiny" type="error" class="ml-1">已封禁</n-tag>
               </div>
-              <div class="text-[11px] text-slate-400">
+              <div class="text-[11px] text-ink-muted">
                 IP: {{ d.ip }} · 最近活跃：{{ formatTime(d.last_seen_at) }}
               </div>
             </div>
@@ -66,18 +66,18 @@
       </n-card>
 
       <n-card size="small" title="活跃播放会话">
-        <div v-if="sessions.length === 0" class="py-6 text-center text-xs text-slate-500">当前无活跃播放</div>
+        <div v-if="sessions.length === 0" class="py-6 text-center text-xs text-ink-muted">当前无活跃播放</div>
         <div v-else class="space-y-2 max-h-80 overflow-y-auto">
           <div
             v-for="s in sessions"
             :key="s.play_session_id"
-            class="rounded-lg border border-cinema-border bg-cinema-bg p-2.5 flex items-center justify-between gap-2"
+            class="rounded-xl neu-inset p-3 flex items-center justify-between gap-2"
           >
             <div class="min-w-0">
-              <div class="text-xs font-medium text-white truncate">
+              <div class="text-xs font-semibold text-ink truncate">
                 {{ s.username }} 正在观看：{{ s.item_name || s.item_id }}
               </div>
-              <div class="text-[11px] text-slate-400">
+              <div class="text-[11px] text-ink-muted">
                 {{ s.client }} ({{ s.device_name }}) · {{ s.is_paused ? '已暂停' : '播放中' }}
               </div>
             </div>

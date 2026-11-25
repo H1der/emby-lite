@@ -1,26 +1,29 @@
 <template>
   <div class="space-y-4">
-    <div class="flex items-center justify-between gap-4">
-      <div class="flex items-center gap-3">
+    <!-- Glass Player Control Header -->
+    <div class="glass-panel rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+      <div class="flex items-center gap-3 min-w-0">
         <n-button size="small" secondary @click="router.back()">← 返回</n-button>
-        <h1 class="text-lg font-semibold truncate">{{ itemName }}</h1>
+        <h1 class="text-base sm:text-lg font-bold text-ink truncate">{{ itemName }}</h1>
       </div>
-      <div v-if="extPlay" class="flex items-center gap-2">
+      <div v-if="extPlay" class="flex flex-wrap items-center gap-1.5">
         <n-button size="small" secondary @click="copyUrl">复制直链</n-button>
         <n-button size="small" quaternary tag="a" :href="extPlay.players.iina">IINA</n-button>
         <n-button size="small" quaternary tag="a" :href="extPlay.players.potplayer">PotPlayer</n-button>
         <n-button size="small" quaternary tag="a" :href="extPlay.players.infuse">Infuse</n-button>
+        <n-button v-if="extPlay.players.vlc" size="small" quaternary tag="a" :href="extPlay.players.vlc">VLC</n-button>
       </div>
     </div>
 
-    <div class="rounded-xl overflow-hidden bg-black border border-cinema-border aspect-video relative">
+    <!-- Cinema Dark Theater Container (always dark for true video contrast) -->
+    <div class="rounded-3xl overflow-hidden bg-slate-950 border border-white/20 shadow-2xl aspect-video relative max-h-[80vh] mx-auto w-full">
       <video
         v-if="streamUrl"
         ref="videoRef"
         :src="streamUrl"
         controls
         autoplay
-        class="w-full h-full"
+        class="w-full h-full bg-black"
         @loadedmetadata="onLoadedMetadata"
         @timeupdate="onTimeUpdate"
         @play="report('start')"
@@ -28,21 +31,35 @@
         @ended="report('stop')"
         @error="onVideoError"
       />
-      <!-- Skip Intro Floating Button -->
+      <div v-else class="w-full h-full flex items-center justify-center text-slate-400 text-sm">
+        正在准备直连播放流...
+      </div>
+
+      <!-- Skip Intro Floating Glass Button -->
       <div v-if="showSkipIntro" class="absolute right-6 bottom-16 z-20">
-        <n-button type="primary" size="medium" class="shadow-lg" @click="skipIntro">
+        <button
+          type="button"
+          class="px-5 py-2.5 rounded-2xl bg-white/90 hover:bg-white text-slate-900 font-semibold text-sm shadow-2xl backdrop-blur-md transition"
+          @click="skipIntro"
+        >
           跳过片头 →
-        </n-button>
+        </button>
       </div>
       <div v-if="inCredits" class="absolute right-6 bottom-16 z-20">
-        <span class="px-3 py-1.5 rounded-lg bg-black/75 border border-cinema-border text-xs text-slate-200">
+        <span class="px-3.5 py-2 rounded-xl bg-black/70 backdrop-blur-md border border-white/20 text-xs text-slate-100">
           片尾已开始
         </span>
       </div>
-      <div v-if="playbackError" class="absolute inset-0 bg-black/85 flex flex-col items-center justify-center p-6 text-center">
-        <p class="text-amber-400 font-medium mb-2">浏览器无法直接解码当前视频格式（本服务为纯直连/302 模式，不转码）</p>
-        <p class="text-xs text-slate-400 mb-4">建议使用上方外部播放器（IINA / PotPlayer / Infuse）或复制直链播放。</p>
-        <n-button v-if="extPlay" type="primary" size="small" @click="copyUrl">复制直连播放地址</n-button>
+
+      <!-- Direct-play decode fallback notice -->
+      <div v-if="playbackError" class="absolute inset-0 bg-slate-950/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center">
+        <p class="text-amber-400 font-semibold text-base mb-2">
+          浏览器无法直接解码当前视频编码（本服务为纯直连 / 302 模式，不转码）
+        </p>
+        <p class="text-xs text-slate-300 mb-5 max-w-md">
+          建议使用上方外部原生播放器（IINA / PotPlayer / Infuse / VLC）或复制直链获得无损硬解播放体验。
+        </p>
+        <n-button v-if="extPlay" type="primary" @click="copyUrl">复制直连播放地址</n-button>
       </div>
     </div>
   </div>
@@ -52,7 +69,7 @@
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { NButton, useMessage } from 'naive-ui'
-import { apiFetch } from '../api/client'
+import { apiFetch, invalidateApiCache } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 
 const route = useRoute()
@@ -95,6 +112,9 @@ async function report(kind: 'start' | 'progress' | 'stop') {
       IsPaused: v ? v.paused : false,
     }),
   }).catch(() => {})
+  if (kind === 'stop') {
+    invalidateApiCache('/api/web/home')
+  }
 }
 
 function onLoadedMetadata() {

@@ -249,26 +249,21 @@ func (h *Handler) UserViews(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": 0})
 		return
 	}
-	var libs []model.Library
-	if err := h.db.Gorm.Where("id IN ?", visibleIDs).Order("sort_order ASC, name ASC").Find(&libs).Error; err != nil {
-		jsonErr(c, http.StatusInternalServerError, err.Error())
-		return
+	uid := "anon"
+	if p != nil && p.User != nil {
+		uid = p.User.ID
 	}
-	items := make([]map[string]any, 0, len(libs))
-	for i := range libs {
-		items = append(items, h.libraryViewDTO(&libs[i], p))
-	}
-	// Append enabled virtual/composite libraries.
-	var vlibs []model.VirtualLibrary
-	if err := h.db.Gorm.Where("enabled = ?", true).Order("sort_order ASC, name ASC").Find(&vlibs).Error; err == nil {
-		for i := range vlibs {
-			items = append(items, h.virtualLibraryViewDTO(&vlibs[i], p))
+	cacheKey := "views:" + h.db.GetLibraryRevision() + ":" + uid + ":" + visibleIDsHash(visibleIDs)
+	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
+		items, err := h.buildUserViewsItems(p, visibleIDs)
+		if err != nil {
+			return nil, err
 		}
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"Items":            items,
-		"TotalRecordCount": len(items),
-		"StartIndex":       0,
+		return gin.H{
+			"Items":            items,
+			"TotalRecordCount": len(items),
+			"StartIndex":       0,
+		}, nil
 	})
 }
 
@@ -400,7 +395,7 @@ func (h *Handler) GetItems(c *gin.Context) {
 		limit = cp.Limit
 	}
 
-	q := h.db.Gorm.Model(&model.Item{}).
+	q := h.db.Read().Model(&model.Item{}).
 		Where("items.soft_deleted_at IS NULL AND items.library_id IN ?", visibleIDs)
 
 	if idsParam != "" {
@@ -551,10 +546,7 @@ func (h *Handler) GetItems(c *gin.Context) {
 	fields := strings.ToLower(queryCI(c, "Fields"))
 	needDetail := strings.Contains(fields, "mediasources") || strings.Contains(fields, "mediastreams") || strings.Contains(fields, "people")
 
-	out := make([]map[string]any, 0, len(rows))
-	for i := range rows {
-		out = append(out, h.itemDTO(c.Request, p, &rows[i], needDetail))
-	}
+	out := h.itemsToDTOs(c.Request, p, rows, needDetail)
 	if total == 0 && len(out) > 0 {
 		total = int64(startIndex + len(out))
 	}
@@ -635,19 +627,15 @@ func (h *Handler) GetLatest(c *gin.Context) {
 		limit = 20
 	}
 
-	q := h.db.Gorm.Model(&model.Item{}).
-		Where("soft_deleted_at IS NULL AND library_id IN ? AND type IN ?", visibleIDs, []string{"Movie", "Series"})
-	if parentID != "" {
-		q = q.Where("library_id = ?", parentID)
+	uid := "anon"
+	if p != nil && p.User != nil {
+		uid = p.User.ID
 	}
-	var rows []model.Item
-	_ = q.Order("added_at DESC, id ASC").Limit(limit).Find(&rows).Error
-	out := make([]map[string]any, 0, len(rows))
-	for i := range rows {
-		out = append(out, h.itemDTO(c.Request, p, &rows[i], false))
-	}
-	// Per Emby spec, /Items/Latest returns a plain JSON array.
-	c.JSON(http.StatusOK, out)
+	cacheKey := "latest:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), uid) + ":" + uid + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.Itoa(limit)
+	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
+		// Per Emby spec, /Items/Latest returns a plain JSON array.
+		return h.buildLatestDTOs(c.Request, p, visibleIDs, parentID, limit), nil
+	})
 }
 
 func (h *Handler) GetResume(c *gin.Context) {
@@ -669,23 +657,14 @@ func (h *Handler) GetResume(c *gin.Context) {
 		limit = 20
 	}
 
-	var rows []model.Item
-	_ = h.db.Gorm.Table("items").
-		Joins("JOIN user_data ON user_data.item_id = items.id").
-		Where("items.soft_deleted_at IS NULL AND items.library_id IN ?", visibleIDs).
-		Where("user_data.user_id = ? AND user_data.position_ticks > 0 AND user_data.played = ? AND user_data.hide_from_resume = ?", p.User.ID, false, false).
-		Order("user_data.updated_at DESC").
-		Limit(limit).
-		Find(&rows).Error
-
-	out := make([]map[string]any, 0, len(rows))
-	for i := range rows {
-		out = append(out, h.itemDTO(c.Request, p, &rows[i], false))
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"Items":            out,
-		"TotalRecordCount": len(out),
-		"StartIndex":       0,
+	cacheKey := "resume:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), p.User.ID) + ":" + p.User.ID + ":" + visibleIDsHash(visibleIDs) + ":" + strconv.Itoa(limit)
+	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
+		out := h.buildResumeDTOs(c.Request, p, visibleIDs, limit)
+		return gin.H{
+			"Items":            out,
+			"TotalRecordCount": len(out),
+			"StartIndex":       0,
+		}, nil
 	})
 }
 
@@ -698,12 +677,9 @@ func (h *Handler) GetSeasons(c *gin.Context) {
 		return
 	}
 	var seasons []model.Item
-	_ = h.db.Gorm.Where("series_id = ? AND type = ? AND soft_deleted_at IS NULL", seriesID, "Season").
+	_ = h.db.Read().Where("series_id = ? AND type = ? AND soft_deleted_at IS NULL", seriesID, "Season").
 		Order("season_num ASC").Find(&seasons).Error
-	out := make([]map[string]any, 0, len(seasons))
-	for i := range seasons {
-		out = append(out, h.itemDTO(c.Request, p, &seasons[i], false))
-	}
+	out := h.itemsToDTOs(c.Request, p, seasons, false)
 	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": len(out), "StartIndex": 0})
 }
 
@@ -715,7 +691,7 @@ func (h *Handler) GetEpisodes(c *gin.Context) {
 		jsonErr(c, http.StatusNotFound, "series not found")
 		return
 	}
-	q := h.db.Gorm.Where("series_id = ? AND type = ? AND soft_deleted_at IS NULL", seriesID, "Episode")
+	q := h.db.Read().Where("series_id = ? AND type = ? AND soft_deleted_at IS NULL", seriesID, "Episode")
 	if sid := queryCI(c, "SeasonId"); sid != "" {
 		q = q.Where("season_id = ?", sid)
 	}
@@ -726,10 +702,7 @@ func (h *Handler) GetEpisodes(c *gin.Context) {
 	}
 	var eps []model.Item
 	_ = q.Order("season_num ASC, episode_num ASC, sort_name ASC").Find(&eps).Error
-	out := make([]map[string]any, 0, len(eps))
-	for i := range eps {
-		out = append(out, h.itemDTO(c.Request, p, &eps[i], true))
-	}
+	out := h.itemsToDTOs(c.Request, p, eps, true)
 	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": len(out), "StartIndex": 0})
 }
 
@@ -749,37 +722,11 @@ func (h *Handler) GetNextUp(c *gin.Context) {
 		limit = 20
 	}
 
-	// Find recently watched episodes per series and pick the next unplayed episode.
-	var playedEps []model.Item
-	_ = h.db.Gorm.Table("items").
-		Joins("JOIN user_data ON user_data.item_id = items.id").
-		Where("items.soft_deleted_at IS NULL AND items.type = ? AND items.library_id IN ?", "Episode", visibleIDs).
-		Where("user_data.user_id = ? AND user_data.played = ?", p.User.ID, true).
-		Order("user_data.updated_at DESC").
-		Limit(50).
-		Find(&playedEps).Error
-
-	seenSeries := map[string]bool{}
-	out := []map[string]any{}
-	for _, ep := range playedEps {
-		if ep.SeriesID == "" || seenSeries[ep.SeriesID] {
-			continue
-		}
-		seenSeries[ep.SeriesID] = true
-		var next model.Item
-		err := h.db.Gorm.Where("series_id = ? AND type = ? AND soft_deleted_at IS NULL", ep.SeriesID, "Episode").
-			Where("(season_num > ? OR (season_num = ? AND episode_num > ?))", ep.SeasonNum, ep.SeasonNum, ep.EpisodeNum).
-			Where("id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true).
-			Order("season_num ASC, episode_num ASC").
-			First(&next).Error
-		if err == nil {
-			out = append(out, h.itemDTO(c.Request, p, &next, false))
-			if len(out) >= limit {
-				break
-			}
-		}
-	}
-	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": len(out), "StartIndex": 0})
+	cacheKey := "nextup:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), p.User.ID) + ":" + p.User.ID + ":" + visibleIDsHash(visibleIDs) + ":" + strconv.Itoa(limit)
+	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
+		out := h.buildNextUpDTOs(c.Request, p, visibleIDs, limit)
+		return gin.H{"Items": out, "TotalRecordCount": len(out), "StartIndex": 0}, nil
+	})
 }
 
 func (h *Handler) GetSimilar(c *gin.Context) {
@@ -791,101 +738,111 @@ func (h *Handler) GetSimilar(c *gin.Context) {
 	}
 	limit := queryIntCI(c, "Limit", 12)
 	var rows []model.Item
-	_ = h.db.Gorm.Where("library_id = ? AND type = ? AND id <> ? AND soft_deleted_at IS NULL", item.LibraryID, item.Type, item.ID).
+	_ = h.db.Read().Where("library_id = ? AND type = ? AND id <> ? AND soft_deleted_at IS NULL", item.LibraryID, item.Type, item.ID).
 		Order("added_at DESC").Limit(limit).Find(&rows).Error
-	out := make([]map[string]any, 0, len(rows))
-	for i := range rows {
-		out = append(out, h.itemDTO(c.Request, p, &rows[i], false))
-	}
+	out := h.itemsToDTOs(c.Request, p, rows, false)
 	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": len(out)})
 }
 
 func (h *Handler) GetCounts(c *gin.Context) {
 	p := getPrincipal(c)
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
-	var movieCount, seriesCount, episodeCount int64
-	if len(visibleIDs) > 0 {
-		h.db.Gorm.Model(&model.Item{}).Where("library_id IN ? AND type = ? AND soft_deleted_at IS NULL", visibleIDs, "Movie").Count(&movieCount)
-		h.db.Gorm.Model(&model.Item{}).Where("library_id IN ? AND type = ? AND soft_deleted_at IS NULL", visibleIDs, "Series").Count(&seriesCount)
-		h.db.Gorm.Model(&model.Item{}).Where("library_id IN ? AND type = ? AND soft_deleted_at IS NULL", visibleIDs, "Episode").Count(&episodeCount)
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"MovieCount":   movieCount,
-		"SeriesCount":  seriesCount,
-		"EpisodeCount": episodeCount,
+	cacheKey := "counts:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs)
+	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
+		return h.buildCounts(visibleIDs), nil
 	})
 }
 
 func (h *Handler) GetGenres(c *gin.Context) {
 	p := getPrincipal(c)
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
-	var names []string
-	if len(visibleIDs) > 0 {
-		_ = h.db.Gorm.Table("item_genres").
-			Select("DISTINCT item_genres.genre").
-			Joins("JOIN items ON items.id = item_genres.item_id").
-			Where("items.library_id IN ? AND items.soft_deleted_at IS NULL", visibleIDs).
-			Order("item_genres.genre ASC").
-			Pluck("genre", &names).Error
-	}
-	items := make([]map[string]any, 0, len(names))
-	for _, n := range names {
-		items = append(items, map[string]any{
-			"Name":     n,
-			"Id":       "genre-" + n,
-			"ServerId": h.serverID(),
-			"Type":     "Genre",
-		})
-	}
-	c.JSON(http.StatusOK, gin.H{"Items": items, "TotalRecordCount": len(items), "StartIndex": 0})
+	cacheKey := "genres:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs)
+	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
+		var names []string
+		if len(visibleIDs) > 0 {
+			_ = h.db.Read().Table("item_genres").
+				Select("DISTINCT item_genres.genre").
+				Joins("JOIN items ON items.id = item_genres.item_id").
+				Where("items.library_id IN ? AND items.soft_deleted_at IS NULL", visibleIDs).
+				Order("item_genres.genre ASC").
+				Pluck("genre", &names).Error
+		}
+		sid := h.serverID()
+		items := make([]map[string]any, 0, len(names))
+		for _, n := range names {
+			items = append(items, map[string]any{
+				"Name":     n,
+				"Id":       "genre-" + n,
+				"ServerId": sid,
+				"Type":     "Genre",
+			})
+		}
+		return gin.H{"Items": items, "TotalRecordCount": len(items), "StartIndex": 0}, nil
+	})
 }
 
 func (h *Handler) GetTags(c *gin.Context) {
 	p := getPrincipal(c)
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
-	var names []string
-	if len(visibleIDs) > 0 {
-		_ = h.db.Gorm.Table("item_tags").
-			Select("DISTINCT item_tags.tag").
-			Joins("JOIN items ON items.id = item_tags.item_id").
-			Where("items.library_id IN ? AND items.soft_deleted_at IS NULL", visibleIDs).
-			Order("item_tags.tag ASC").
-			Pluck("tag", &names).Error
-	}
-	items := make([]map[string]any, 0, len(names))
-	for _, n := range names {
-		items = append(items, map[string]any{"Name": n, "Id": "tag-" + n, "ServerId": h.serverID(), "Type": "Tag"})
-	}
-	c.JSON(http.StatusOK, gin.H{"Items": items, "TotalRecordCount": len(items), "StartIndex": 0})
+	cacheKey := "tags:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs)
+	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
+		var names []string
+		if len(visibleIDs) > 0 {
+			_ = h.db.Read().Table("item_tags").
+				Select("DISTINCT item_tags.tag").
+				Joins("JOIN items ON items.id = item_tags.item_id").
+				Where("items.library_id IN ? AND items.soft_deleted_at IS NULL", visibleIDs).
+				Order("item_tags.tag ASC").
+				Pluck("tag", &names).Error
+		}
+		sid := h.serverID()
+		items := make([]map[string]any, 0, len(names))
+		for _, n := range names {
+			items = append(items, map[string]any{"Name": n, "Id": "tag-" + n, "ServerId": sid, "Type": "Tag"})
+		}
+		return gin.H{"Items": items, "TotalRecordCount": len(items), "StartIndex": 0}, nil
+	})
 }
 
 func (h *Handler) GetFilters(c *gin.Context) {
 	p := getPrincipal(c)
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
-	var genres []string
-	var years []int
-	if len(visibleIDs) > 0 {
-		_ = h.db.Gorm.Table("item_genres").
-			Select("DISTINCT item_genres.genre").
-			Joins("JOIN items ON items.id = item_genres.item_id").
-			Where("items.library_id IN ? AND items.soft_deleted_at IS NULL", visibleIDs).
-			Order("item_genres.genre ASC").
-			Pluck("genre", &genres).Error
-		_ = h.db.Gorm.Model(&model.Item{}).
-			Select("DISTINCT year").
-			Where("library_id IN ? AND soft_deleted_at IS NULL AND year > 0", visibleIDs).
-			Order("year DESC").
-			Pluck("year", &years).Error
-	}
-	if strings.HasSuffix(strings.ToLower(c.Request.URL.Path), "filters2") {
-		gObjs := make([]map[string]any, 0, len(genres))
-		for _, g := range genres {
-			gObjs = append(gObjs, map[string]any{"Name": g, "Id": "genre-" + g})
+	parentID := queryCI(c, "ParentId")
+	isV2 := strings.HasSuffix(strings.ToLower(c.Request.URL.Path), "filters2")
+	cacheKey := "filters:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.FormatBool(isV2)
+	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
+		var genres []string
+		var years []int
+		if len(visibleIDs) > 0 {
+			gq := h.db.Read().Table("item_genres").
+				Select("DISTINCT item_genres.genre").
+				Joins("JOIN items ON items.id = item_genres.item_id").
+				Where("items.library_id IN ? AND items.soft_deleted_at IS NULL", visibleIDs)
+			yq := h.db.Read().Model(&model.Item{}).
+				Select("DISTINCT year").
+				Where("library_id IN ? AND soft_deleted_at IS NULL AND year > 0", visibleIDs)
+			if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
+				gq = gq.Where("items.library_id = ?", parentID)
+				yq = yq.Where("library_id = ?", parentID)
+			}
+			_ = gq.Order("item_genres.genre ASC").Pluck("genre", &genres).Error
+			_ = yq.Order("year DESC").Pluck("year", &years).Error
 		}
-		c.JSON(http.StatusOK, gin.H{"Genres": gObjs, "Tags": []any{}, "Years": years, "OfficialRatings": []any{}})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"Genres": genres, "Tags": []string{}, "Years": years, "OfficialRatings": []string{}})
+		if genres == nil {
+			genres = []string{}
+		}
+		if years == nil {
+			years = []int{}
+		}
+		if isV2 {
+			gObjs := make([]map[string]any, 0, len(genres))
+			for _, g := range genres {
+				gObjs = append(gObjs, map[string]any{"Name": g, "Id": "genre-" + g})
+			}
+			return gin.H{"Genres": gObjs, "Tags": []any{}, "Years": years, "OfficialRatings": []any{}}, nil
+		}
+		return gin.H{"Genres": genres, "Tags": []string{}, "Years": years, "OfficialRatings": []string{}}, nil
+	})
 }
 
 func (h *Handler) DisplayPreferences(c *gin.Context) {
@@ -1350,6 +1307,7 @@ func (h *Handler) handlePlaybackEvent(c *gin.Context, kind string) {
 		}
 	}
 	_ = h.db.Gorm.Save(&ud).Error
+	h.bumpUserDataRev(c.Request.Context(), p.User.ID)
 	c.Status(http.StatusNoContent)
 }
 
@@ -1417,6 +1375,7 @@ func (h *Handler) UpdateUserData(c *gin.Context) {
 	now := time.Now().UTC()
 	ud.UpdatedAt = now
 	_ = h.db.Gorm.Save(ud).Error
+	h.bumpUserDataRev(c.Request.Context(), p.User.ID)
 	c.JSON(http.StatusOK, userDataResponse(itemID, ud))
 }
 
@@ -1439,6 +1398,7 @@ func (h *Handler) SetPlayed(played bool) gin.HandlerFunc {
 		}
 		ud.UpdatedAt = time.Now().UTC()
 		_ = h.db.Gorm.Save(ud).Error
+		h.bumpUserDataRev(c.Request.Context(), p.User.ID)
 		c.JSON(http.StatusOK, userDataResponse(itemID, ud))
 	}
 }
@@ -1454,6 +1414,7 @@ func (h *Handler) SetFavorite(fav bool) gin.HandlerFunc {
 		ud.IsFavorite = fav
 		ud.UpdatedAt = time.Now().UTC()
 		_ = h.db.Gorm.Save(ud).Error
+		h.bumpUserDataRev(c.Request.Context(), p.User.ID)
 		c.JSON(http.StatusOK, userDataResponse(itemID, ud))
 	}
 }
@@ -1479,6 +1440,7 @@ func (h *Handler) HideFromResume(c *gin.Context) {
 	ud.HideFromResume = hide
 	ud.UpdatedAt = time.Now().UTC()
 	_ = h.db.Gorm.Save(ud).Error
+	h.bumpUserDataRev(c.Request.Context(), p.User.ID)
 	c.JSON(http.StatusOK, userDataResponse(itemID, ud))
 }
 
@@ -1497,6 +1459,7 @@ func (h *Handler) ClearResume(c *gin.Context) {
 			Where("user_id = ?", p.User.ID).
 			Updates(map[string]any{"position_ticks": 0, "hide_from_resume": false}).Error
 	}
+	h.bumpUserDataRev(c.Request.Context(), p.User.ID)
 	c.Status(http.StatusNoContent)
 }
 

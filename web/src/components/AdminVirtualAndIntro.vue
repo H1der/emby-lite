@@ -5,23 +5,23 @@
       <template #header-extra>
         <n-button size="tiny" type="primary" @click="openCreateVLib">+ 新建虚拟库</n-button>
       </template>
-      <div v-if="vlibs.length === 0" class="py-8 text-center text-sm text-slate-400">
+      <div v-if="vlibs.length === 0" class="py-8 text-center text-sm text-ink-muted">
         暂无虚拟库（可按类型、评分、年份、多库组合动态聚合展示，并同步呈现在 Emby 客户端）
       </div>
       <div v-else class="space-y-3">
         <div
           v-for="vl in vlibs"
           :key="vl.id"
-          class="rounded-xl border border-cinema-border bg-cinema-bg p-3 flex flex-wrap items-center justify-between gap-2"
+          class="rounded-2xl neu-inset p-3.5 flex flex-wrap items-center justify-between gap-2"
         >
           <div class="min-w-0">
-            <div class="font-medium text-white">
+            <div class="font-semibold text-ink">
               {{ vl.name }}
               <n-tag size="tiny" :type="vl.enabled ? 'success' : 'default'" class="ml-1.5">
                 {{ vl.enabled ? '启用' : '停用' }}
               </n-tag>
             </div>
-            <div class="text-xs text-slate-400 mt-0.5 truncate">
+            <div class="text-xs text-ink-muted mt-0.5 truncate">
               类型：{{ (vl.rule?.genres || []).join('/') || '不限' }} ·
               最低评分：{{ vl.rule?.min_rating || '不限' }} ·
               年份：{{ vl.rule?.min_year || '*' }}–{{ vl.rule?.max_year || '*' }}
@@ -41,20 +41,20 @@
       <template #header-extra>
         <n-button size="tiny" type="primary" @click="showIntroModal = true">+ 新增标记</n-button>
       </template>
-      <div v-if="markers.length === 0" class="py-8 text-center text-sm text-slate-400">
+      <div v-if="markers.length === 0" class="py-8 text-center text-sm text-ink-muted">
         暂无跳过标记（可按剧集 ID + 季号批量配置，或按单集 ID 精确配置）
       </div>
       <div v-else class="space-y-2.5 max-h-96 overflow-y-auto">
         <div
           v-for="m in markers"
           :key="m.id"
-          class="rounded-xl border border-cinema-border bg-cinema-bg p-3 flex items-center justify-between gap-3"
+          class="rounded-2xl neu-inset p-3.5 flex items-center justify-between gap-3"
         >
           <div class="text-xs space-y-0.5 min-w-0">
-            <div class="text-slate-100 font-medium truncate">
+            <div class="text-ink font-semibold truncate">
               {{ m.item_id ? `单集 ID: ${m.item_id}` : `剧集 ID: ${m.series_id} · 第 ${m.season_num} 季` }}
             </div>
-            <div class="text-slate-400">
+            <div class="text-ink-muted">
               片头：{{ (m.intro_start_ticks / 1e7).toFixed(1) }}s → {{ (m.intro_end_ticks / 1e7).toFixed(1) }}s
               <span v-if="m.credits_start_ticks > 0"> · 片尾：{{ (m.credits_start_ticks / 1e7).toFixed(1) }}s</span>
             </div>

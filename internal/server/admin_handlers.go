@@ -100,7 +100,7 @@ func (a *AdminHandler) Bootstrap(c *gin.Context) {
 		"initialized": initialized,
 		"server_name": a.db.GetSetting("server_name", a.cfg.Server.ServerName),
 		"server_id":   a.db.GetSetting("server_id", ""),
-		"version":     "0.1.0-m1",
+		"version":     "0.2.0",
 	})
 }
 
@@ -182,13 +182,31 @@ func (a *AdminHandler) ExternalPlay(c *gin.Context) {
 // --- Admin Dashboard ---
 
 func (a *AdminHandler) Dashboard(c *gin.Context) {
+	rdb := a.db.Read()
 	var libCount, movieCount, seriesCount, episodeCount, userCount, activeLeases int64
-	a.db.Gorm.Model(&model.Library{}).Count(&libCount)
-	a.db.Gorm.Model(&model.Item{}).Where("type = ? AND soft_deleted_at IS NULL", "Movie").Count(&movieCount)
-	a.db.Gorm.Model(&model.Item{}).Where("type = ? AND soft_deleted_at IS NULL", "Series").Count(&seriesCount)
-	a.db.Gorm.Model(&model.Item{}).Where("type = ? AND soft_deleted_at IS NULL", "Episode").Count(&episodeCount)
-	a.db.Gorm.Model(&model.User{}).Count(&userCount)
-	a.db.Gorm.Model(&model.PlaybackLease{}).Where("expires_at >= ?", time.Now().UTC()).Count(&activeLeases)
+	rdb.Model(&model.Library{}).Count(&libCount)
+	type typeCnt struct {
+		Type string
+		Cnt  int64
+	}
+	var itemCounts []typeCnt
+	rdb.Table("items").
+		Select("type, COUNT(*) AS cnt").
+		Where("soft_deleted_at IS NULL AND type IN ?", []string{"Movie", "Series", "Episode"}).
+		Group("type").
+		Scan(&itemCounts)
+	for _, tc := range itemCounts {
+		switch tc.Type {
+		case "Movie":
+			movieCount = tc.Cnt
+		case "Series":
+			seriesCount = tc.Cnt
+		case "Episode":
+			episodeCount = tc.Cnt
+		}
+	}
+	rdb.Model(&model.User{}).Count(&userCount)
+	rdb.Model(&model.PlaybackLease{}).Where("expires_at >= ?", time.Now().UTC()).Count(&activeLeases)
 
 	var imgStats imgpipe.CacheStats
 	if a.images != nil {
@@ -203,6 +221,7 @@ func (a *AdminHandler) Dashboard(c *gin.Context) {
 		"has_trgm":          a.db.HasTrgm,
 		"cache":             a.cache.BackendName(),
 		"ffprobe_available": a.scanner.Prober().HasFFprobe(),
+		"scan_concurrency":  a.scanner.Concurrency(),
 		"image_cache_files": imgStats.FileCount,
 		"image_cache_bytes": imgStats.TotalBytes,
 		"scanning":          a.scanner.IsScanning() || (a.tasks != nil && a.tasks.HasActive("scan")),

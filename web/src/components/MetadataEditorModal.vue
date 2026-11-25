@@ -6,9 +6,9 @@
     class="max-w-2xl w-full"
     @update:show="emit('update:show', $event)"
   >
-    <div v-if="loading" class="py-10 text-center text-slate-400">正在加载元数据...</div>
+    <div v-if="loading" class="py-10 text-center text-ink-muted">正在加载元数据...</div>
     <n-form v-else label-placement="top" size="small" @submit.prevent="save">
-      <div class="text-xs text-slate-400 mb-4">
+      <div class="text-xs text-ink-muted mb-4">
         勾选字段右侧的 <strong>🔒 锁定</strong> 后，后续重新扫描 NFO 或 TMDB 刮削将不会覆盖该字段。
       </div>
 

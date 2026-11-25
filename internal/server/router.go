@@ -53,6 +53,9 @@ func New(cfg *config.Config, db *database.DB, cacheStore cache.Store) *Server {
 	imgPipeline := imgpipe.NewPipeline(cfg.Storage.CacheDir)
 	authSvc := auth.NewService(db, cacheStore, cfg)
 	scanSvc := scanner.NewService(db, prober)
+	if cfg.Scanner.Concurrency > 0 {
+		scanSvc.SetConcurrency(cfg.Scanner.Concurrency)
+	}
 	pbSvc := playback.NewService(db, authSvc, cfg)
 	scraperSvc := scraper.NewService(db)
 	fileMgr := files.NewManager(db, cfg)
@@ -107,6 +110,7 @@ func New(cfg *config.Config, db *database.DB, cacheStore cache.Store) *Server {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(corsMiddleware())
+	r.Use(gzipMiddleware())
 
 	// Public health check
 	r.GET("/health", embyHandler.Health)
@@ -119,6 +123,7 @@ func New(cfg *config.Config, db *database.DB, cacheStore cache.Store) *Server {
 	{
 		webAPI.GET("/bootstrap", adminHandler.Bootstrap)
 		webAPI.POST("/setup", adminHandler.Setup)
+		webAPI.GET("/home", embyHandler.RequireAuth(), embyHandler.WebHome)
 		webAPI.GET("/external-play/:itemId", adminHandler.ExternalPlay)
 		webAPI.GET("/intro/:itemId", adminHandler.GetItemIntroWeb)
 	}
@@ -429,6 +434,11 @@ func attachSPA(r *gin.Engine) {
 		if p != "" {
 			if f, err := distFS.Open(p); err == nil {
 				_ = f.Close()
+				if strings.HasPrefix(p, "assets/") {
+					c.Header("Cache-Control", "public, max-age=31536000, immutable")
+				} else {
+					c.Header("Cache-Control", "public, max-age=3600")
+				}
 				fileServer.ServeHTTP(c.Writer, c.Request)
 				return
 			}
@@ -445,6 +455,7 @@ func attachSPA(r *gin.Engine) {
 			c.Status(http.StatusInternalServerError)
 			return
 		}
+		c.Header("Cache-Control", "no-cache")
 		c.Data(http.StatusOK, "text/html; charset=utf-8", data)
 	})
 }
