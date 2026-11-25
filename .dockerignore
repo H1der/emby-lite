@@ -1,5 +1,5 @@
 # Binaries & build outputs
-bin/
+/bin/
 *.exe
 *.test
 coverage.out
@@ -9,9 +9,9 @@ web/node_modules
 web/dist
 
 # Runtime data (mounted as volumes)
-data/
-cache/
-backups/
+/data/
+/cache/
+/backups/
 *.db
 *.db-wal
 *.db-shm
