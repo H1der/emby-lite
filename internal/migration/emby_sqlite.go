@@ -144,6 +144,7 @@ type embyWatchRow struct {
 	UserID        string
 	Username      string
 	UserDataKey   string
+	ItemEmbyID    string
 	ItemName      string
 	ItemPath      string
 	Played        bool
@@ -259,6 +260,7 @@ func (s *Service) Preview(req EmbyMigrationRequest) (*PreviewReport, error) {
 	}
 
 	itemKeys := map[string]bool{}
+	itemEmbyIDs := map[string]bool{}
 	itemNames := map[string]bool{}
 	itemBaseNames := map[string]bool{}
 	for _, it := range items {
@@ -271,6 +273,9 @@ func (s *Service) Preview(req EmbyMigrationRequest) (*PreviewReport, error) {
 			report.SeasonsFound++
 		case "Episode":
 			report.EpisodesFound++
+		}
+		if it.EmbyID != "" {
+			itemEmbyIDs[it.EmbyID] = true
 		}
 		if it.UserDataKey != "" {
 			itemKeys[it.UserDataKey] = true
@@ -301,7 +306,8 @@ func (s *Service) Preview(req EmbyMigrationRequest) (*PreviewReport, error) {
 			continue
 		}
 		if importItems {
-			if (w.UserDataKey != "" && itemKeys[w.UserDataKey]) ||
+			if (w.ItemEmbyID != "" && itemEmbyIDs[w.ItemEmbyID]) ||
+				(w.UserDataKey != "" && itemKeys[w.UserDataKey]) ||
 				(w.ItemPath != "" && itemBaseNames[strings.ToLower(baseFileName(w.ItemPath))]) ||
 				(w.ItemName != "" && itemNames[strings.ToLower(strings.TrimSpace(w.ItemName))]) {
 				report.MatchedWatchRecords++
@@ -443,6 +449,10 @@ func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
 
 		order := []string{"Series", "Season", "Movie", "Episode"}
 		now := time.Now().UTC()
+		itemKinds := make(map[string]string, len(items))
+		for _, it := range items {
+			itemKinds[it.EmbyID] = it.ItemType
+		}
 		for _, wantType := range order {
 			for _, it := range items {
 				if it.ItemType != wantType {
@@ -474,7 +484,11 @@ func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
 						seasonID = ssn
 						parentID = ssn
 					} else if pid := embyItemToLocal[it.ParentID]; pid != "" {
-						seasonID = pid
+						// Emby 4.9+ often hangs episodes straight off the series when no
+						// season folder exists; only treat the parent as a season when it is one.
+						if itemKinds[it.ParentID] == "Season" {
+							seasonID = pid
+						}
 						parentID = pid
 					} else if seriesID != "" {
 						parentID = seriesID
@@ -485,8 +499,9 @@ func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
 				localID := scanner.StableID("item", scanKey)
 
 				var existing model.Item
-				err := s.db.Gorm.Where("scan_key = ?", scanKey).First(&existing).Error
-				if err == nil {
+				lookupErr := s.db.Gorm.Where("scan_key = ?", scanKey).First(&existing).Error
+				existingItem := lookupErr == nil
+				if existingItem {
 					localID = existing.ID
 					if !req.Overwrite {
 						embyItemToLocal[it.EmbyID] = localID
@@ -553,7 +568,12 @@ func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
 					continue
 				}
 				if s.db.HasFTS5 {
-					_ = s.db.Gorm.Exec("DELETE FROM items_fts WHERE item_id = ?", rec.ID).Error
+					// items_fts keeps item_id UNINDEXED, so deleting by it scans the whole
+					// index: doing that for every freshly inserted item makes a full
+					// migration quadratic. New rows have no stale FTS entry to remove.
+					if existingItem {
+						_ = s.db.Gorm.Exec("DELETE FROM items_fts WHERE item_id = ?", rec.ID).Error
+					}
 					_ = s.db.Gorm.Exec("INSERT INTO items_fts(item_id, name, original_name, pinyin_initials) VALUES (?, ?, ?, ?)",
 						rec.ID, rec.Name, rec.OriginalName, rec.PinyinInitials).Error
 				}
@@ -687,7 +707,10 @@ func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
 				continue
 			}
 			localItemID := ""
-			if w.UserDataKey != "" {
+			if w.ItemEmbyID != "" {
+				localItemID = embyItemToLocal[w.ItemEmbyID]
+			}
+			if localItemID == "" && w.UserDataKey != "" {
 				localItemID = userDataKeyToLocal[w.UserDataKey]
 			}
 			if localItemID == "" {
@@ -790,6 +813,9 @@ func (s *Service) readAllEmbyData(resolved ResolvedSources, mappings []PathMappi
 	}
 
 	// 2. Read users.db
+	// Emby 4.8 stores users in LocalUsersv2(Id, Name). Newer Emby keeps the whole
+	// profile (including Name) serialized inside LocalUsersv2.data and only exposes
+	// Id/guid columns, so parse the JSON payload when the Name column is absent.
 	usersByID := map[string]string{}
 	if resolved.UsersDBPath != "" {
 		sqlDB, err := openReadOnlySQLite(resolved.UsersDBPath)
@@ -814,14 +840,48 @@ func (s *Service) readAllEmbyData(resolved ResolvedSources, mappings []PathMappi
 				if rows.Scan(&id, &name) == nil && strings.TrimSpace(name) != "" {
 					users = append(users, embyUserRow{ID: id, Username: name})
 					usersByID[id] = name
+					usersByID[strings.ToLower(strings.TrimSpace(id))] = name
 				}
 			}
 			_ = rows.Close()
 			loaded = true
 			break
 		}
+		if !loaded && len(tableColumns(sqlDB, "LocalUsersv2")) > 0 {
+			// Newer Emby: user profile lives in a JSON blob stored in the data column.
+			rows, qErr := sqlDB.Query("SELECT CAST(Id AS TEXT), data FROM LocalUsersv2")
+			if qErr == nil {
+				for rows.Next() {
+					var id string
+					var payload []byte
+					if rows.Scan(&id, &payload) != nil {
+						continue
+					}
+					var profile struct {
+						Name     string `json:"Name"`
+						IdString string `json:"IdString"`
+					}
+					if json.Unmarshal(payload, &profile) != nil || strings.TrimSpace(profile.Name) == "" {
+						continue
+					}
+					id = strings.TrimSpace(id)
+					users = append(users, embyUserRow{ID: id, Username: profile.Name})
+					usersByID[id] = profile.Name
+					usersByID[strings.ToLower(id)] = profile.Name
+					if profile.IdString != "" {
+						usersByID[profile.IdString] = profile.Name
+						usersByID[strings.ToLower(profile.IdString)] = profile.Name
+					}
+				}
+				_ = rows.Close()
+				loaded = len(users) > 0
+			}
+		}
 		if !loaded {
 			warnings = append(warnings, "users.db 中未识别到 LocalUsersv2 或 Users 表")
+		}
+		if len(users) > 0 {
+			warnings = append(warnings, fmt.Sprintf("已读取 %d 个 Emby 用户；Emby 密码为加密存储无法迁移，导入后统一使用默认密码", len(users)))
 		}
 	}
 
@@ -940,6 +1000,9 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 	if table == "" {
 		return nil, nil, []string{"library.db 中未找到 MediaItems 或 TypedBaseItems 表"}
 	}
+	// Emby 4.9+ (MediaItems) stores a numeric BaseItemKind enum; the classic
+	// TypedBaseItems schema stores .NET/DTO type names (or an older enum).
+	enumKind := table == "MediaItems"
 
 	colOrEmpty := func(name string) string {
 		if cols[strings.ToLower(name)] {
@@ -963,11 +1026,53 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 		udKeyCol = "UserDataKey"
 	}
 
+	// Emby 4.9+ keeps genres/studios and library folder paths in ItemLinks2:
+	// Type 2 -> Genre, Type 3 -> Studio, Type 8 -> physical folder behind a library path.
+	libPaths := map[string][]string{}
+	linkGenres := map[string][]string{}
+	linkStudios := map[string][]string{}
+	if len(tableColumns(sqlDB, "ItemLinks2")) > 0 {
+		loadLinkedNames := func(linkType int, dst map[string][]string) {
+			q := fmt.Sprintf(`SELECT CAST(l.ItemId AS TEXT), COALESCE(x.Name, '')
+				FROM ItemLinks2 l JOIN %s x ON x.Id = l.LinkedId
+				WHERE l.Type = ? ORDER BY l.ItemId, l.LinkOrder`, table)
+			lrows, lErr := sqlDB.Query(q, linkType)
+			if lErr != nil {
+				return
+			}
+			for lrows.Next() {
+				var itemID, linkedName string
+				if lrows.Scan(&itemID, &linkedName) == nil && strings.TrimSpace(linkedName) != "" {
+					dst[itemID] = append(dst[itemID], strings.TrimSpace(linkedName))
+				}
+			}
+			_ = lrows.Close()
+		}
+		loadLinkedNames(2, linkGenres)
+		loadLinkedNames(3, linkStudios)
+
+		q := fmt.Sprintf(`SELECT CAST(l.ItemId AS TEXT), COALESCE(f.Path, '')
+			FROM ItemLinks2 l JOIN %s f ON f.Id = l.LinkedId
+			WHERE l.Type = 8 ORDER BY l.ItemId, l.LinkOrder`, table)
+		lrows, lErr := sqlDB.Query(q)
+		if lErr == nil {
+			for lrows.Next() {
+				var itemID, path string
+				if lrows.Scan(&itemID, &path) == nil {
+					if mapped := applyPathMappings(path, mappings); mapped != "" {
+						libPaths[itemID] = append(libPaths[itemID], mapped)
+					}
+				}
+			}
+			_ = lrows.Close()
+		}
+	}
+
 	q := fmt.Sprintf(`SELECT
 		%s, %s, %s, %s, %s, %s, %s,
 		%s, %s, %s, %s, %s, %s, %s,
 		%s, %s, %s, %s, %s, %s, %s, %s, %s
-	FROM %s`,
+		FROM %s`,
 		colOrEmpty(idCol), colOrEmpty("ParentId"), colOrEmpty("TopParentId"),
 		colOrEmpty("SeriesId"), colOrEmpty("SeasonId"), colOrEmpty(udKeyCol), colOrEmpty("type"),
 		colOrEmpty("Name"), colOrEmpty("OriginalTitle"), colOrEmpty("SortName"),
@@ -986,6 +1091,8 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 
 	var libs []embyLibraryDef
 	var items []embyItemRow
+	kindsByID := map[string]string{}
+	parentsByID := map[string]string{}
 	for rows.Next() {
 		var id, parentID, topParentID, seriesID, seasonID, udKey, rawType string
 		var name, origTitle, sortName, overview, tagline, premiere, officialRating, rawPath, rawPids, rawGenres, rawStudios string
@@ -1003,11 +1110,23 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 		}
 
 		mappedPath := applyPathMappings(rawPath, mappings)
-		kind := classifyEmbyType(rawType)
+		kind := classifyEmbyType(rawType, enumKind)
 		if kind == "CollectionFolder" {
 			var paths []string
 			if mappedPath != "" {
-				paths = []string{mappedPath}
+				paths = append(paths, mappedPath)
+			}
+			for _, p := range libPaths[id] {
+				dup := false
+				for _, existing := range paths {
+					if strings.EqualFold(existing, p) {
+						dup = true
+						break
+					}
+				}
+				if !dup {
+					paths = append(paths, p)
+				}
 			}
 			libs = append(libs, embyLibraryDef{
 				EmbyID: id,
@@ -1021,9 +1140,21 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 			continue
 		}
 
-		if len(premiere) > 10 {
-			premiere = premiere[:10]
+		genres := linkGenres[id]
+		if len(genres) == 0 {
+			genres = splitPipe(rawGenres)
 		}
+		studios := linkStudios[id]
+		if len(studios) == 0 {
+			studios = splitPipe(rawStudios)
+		}
+		premiereDate := normalizeEmbyPremiereDate(premiere)
+		if year <= 0 && len(premiereDate) >= 4 {
+			if parsedYear, convErr := strconv.Atoi(premiereDate[:4]); convErr == nil && parsedYear > 1800 {
+				year = parsedYear
+			}
+		}
+
 		items = append(items, embyItemRow{
 			EmbyID:            id,
 			ParentID:          parentID,
@@ -1038,7 +1169,7 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 			Overview:          strings.TrimSpace(overview),
 			Tagline:           strings.TrimSpace(tagline),
 			Year:              year,
-			PremiereDate:      premiere,
+			PremiereDate:      premiereDate,
 			CommunityRating:   rating,
 			OfficialRating:    strings.TrimSpace(officialRating),
 			RunTimeTicks:      runtimeTicks,
@@ -1046,57 +1177,326 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 			ParentIndexNumber: parentIdxNum,
 			Path:              mappedPath,
 			ProviderIDs:       parseEmbyProviderIDs(rawPids),
-			Genres:            splitPipe(rawGenres),
-			Studios:           splitPipe(rawStudios),
+			Genres:            genres,
+			Studios:           studios,
+		})
+		kindsByID[id] = kind
+		parentsByID[id] = parentID
+	}
+
+	// Emby 4.9+ no longer stores SeriesId/SeasonId columns; derive them from the
+	// parent chain (Episode -> Season -> Series -> top level folder).
+	ancestorOf := func(id, want string) string {
+		cur := parentsByID[id]
+		for depth := 0; cur != "" && depth < 32; depth++ {
+			if kindsByID[cur] == want {
+				return cur
+			}
+			next := parentsByID[cur]
+			if next == cur {
+				break
+			}
+			cur = next
+		}
+		return ""
+	}
+	for i := range items {
+		it := &items[i]
+		switch it.ItemType {
+		case "Season":
+			if it.SeriesID == "" {
+				it.SeriesID = ancestorOf(it.EmbyID, "Series")
+			}
+			if it.ParentID == "" && it.SeriesID != "" {
+				it.ParentID = it.SeriesID
+			}
+		case "Episode":
+			if it.SeasonID == "" {
+				it.SeasonID = ancestorOf(it.EmbyID, "Season")
+			}
+			if it.SeriesID == "" {
+				if it.SeasonID != "" {
+					it.SeriesID = ancestorOf(it.SeasonID, "Series")
+				}
+				if it.SeriesID == "" {
+					it.SeriesID = ancestorOf(it.EmbyID, "Series")
+				}
+			}
+		}
+	}
+
+	// Newer Emby keeps libraries in a separate CollectionFolder tree, so items
+	// carry no TopParentId. Resolve the owning library by the longest matching
+	// library path prefix instead.
+	if len(libPaths) > 0 {
+		type libPrefix struct {
+			path   string
+			embyID string
+		}
+		var prefixes []libPrefix
+		for _, l := range libs {
+			if l.EmbyID == "" {
+				continue
+			}
+			for _, p := range l.Paths {
+				if np := normalizeSlashLower(p); np != "" {
+					prefixes = append(prefixes, libPrefix{path: np, embyID: l.EmbyID})
+				}
+			}
+		}
+		for i := range items {
+			it := &items[i]
+			if it.TopParentID != "" || it.Path == "" || it.EmbyID == "" {
+				continue
+			}
+			norm := normalizeSlashLower(it.Path)
+			bestID, bestLen := "", 0
+			for _, p := range prefixes {
+				if len(p.path) <= bestLen {
+					continue
+				}
+				if norm == p.path || strings.HasPrefix(norm, p.path+"/") {
+					bestID, bestLen = p.embyID, len(p.path)
+				}
+			}
+			it.TopParentID = bestID
+		}
+	}
+
+	// Items without their own path (seasons usually) inherit the library of the
+	// nearest ancestor that resolved one, so they do not fall back to a random
+	// library during import.
+	topByID := make(map[string]string, len(items))
+	for _, it := range items {
+		topByID[it.EmbyID] = it.TopParentID
+	}
+	for _, r := range []int{0, 1, 2} {
+		_ = r
+		changed := false
+		for i := range items {
+			it := &items[i]
+			if it.TopParentID != "" || it.ParentID == "" {
+				continue
+			}
+			cur := it.ParentID
+			for depth := 0; cur != "" && depth < 32; depth++ {
+				if top := topByID[cur]; top != "" {
+					it.TopParentID = top
+					topByID[it.EmbyID] = top
+					changed = true
+					break
+				}
+				next := parentsByID[cur]
+				if next == cur {
+					break
+				}
+				cur = next
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	// Emby can store episodes directly under a series without any season row
+	// (single-season shows). emby-lite always browses through a season, so
+	// synthesise the matching season to keep those episodes reachable.
+	seriesTop := map[string]string{}
+	seriesPath := map[string]string{}
+	seriesYear := map[string]int{}
+	for _, it := range items {
+		if it.ItemType == "Series" {
+			seriesTop[it.EmbyID] = it.TopParentID
+			seriesPath[it.EmbyID] = it.Path
+			seriesYear[it.EmbyID] = it.Year
+		}
+	}
+	realSeason := map[string]string{} // "<seriesEmbyID>|<seasonNum>" -> season EmbyID
+	for _, it := range items {
+		if it.ItemType == "Season" && it.SeriesID != "" {
+			realSeason[fmt.Sprintf("%s|%d", it.SeriesID, it.IndexNumber)] = it.EmbyID
+		}
+	}
+	createdSeasons := map[string]bool{}
+	var syntheticSeasons []embyItemRow
+	for i := range items {
+		it := &items[i]
+		if it.ItemType != "Episode" || it.SeasonID != "" || it.SeriesID == "" {
+			continue
+		}
+		if existing, ok := realSeason[fmt.Sprintf("%s|%d", it.SeriesID, it.ParentIndexNumber)]; ok {
+			it.SeasonID = existing
+			continue
+		}
+		seasonNum := it.ParentIndexNumber
+		if seasonNum < 1 {
+			seasonNum = 1
+		}
+		syntheticID := fmt.Sprintf("synthetic-season:%s:%d", it.SeriesID, seasonNum)
+		it.SeasonID = syntheticID
+		if createdSeasons[syntheticID] {
+			continue
+		}
+		createdSeasons[syntheticID] = true
+		syntheticSeasons = append(syntheticSeasons, embyItemRow{
+			EmbyID:      syntheticID,
+			ParentID:    it.SeriesID,
+			TopParentID: seriesTop[it.SeriesID],
+			SeriesID:    it.SeriesID,
+			ItemType:    "Season",
+			Name:        fmt.Sprintf("第 %d 季", seasonNum),
+			IndexNumber: seasonNum,
+			Year:        seriesYear[it.SeriesID],
+			Path:        seriesPath[it.SeriesID],
 		})
 	}
+	items = append(items, syntheticSeasons...)
+
 	return libs, items, nil
 }
 
 func readEmbyWatchData(sqlDB *sql.DB, usersByID map[string]string, mappings []PathMapping) ([]embyWatchRow, []string) {
-	queries := []string{
-		`SELECT CAST(u.userId AS TEXT), CAST(u.UserDataKeyId AS TEXT), COALESCE(m.Name,''), COALESCE(m.Path,''), COALESCE(u.played,0), COALESCE(u.playbackPositionTicks,0), COALESCE(u.playCount,0), COALESCE(u.isFavorite,0)
-		 FROM UserDatas u JOIN MediaItems m ON m.UserDataKeyId = u.UserDataKeyId`,
-		`SELECT CAST(u.userId AS TEXT), CAST(u.key AS TEXT), COALESCE(m.Name,''), COALESCE(m.Path,''), COALESCE(u.played,0), COALESCE(u.playbackPositionTicks,0), COALESCE(u.playCount,0), COALESCE(u.isFavorite,0)
-		 FROM UserDatas u JOIN TypedBaseItems m ON m.UserDataKey = u.key`,
+	udCols := tableColumns(sqlDB, "UserDatas")
+	if len(udCols) == 0 {
+		return nil, []string{"library.db 中未识别到兼容的 UserDatas 表结构"}
 	}
+
+	// Emby 4.9+ links play state through a numeric UserDataKeyId that resolves via
+	// UserDataKeys2, while the older TypedBaseItems schema stored the key text
+	// inline. Pick whichever column pair actually exists on both sides.
+	type keyJoin struct{ table, userKey, itemKey string }
+	var joins []keyJoin
+	for _, candidate := range []keyJoin{
+		{table: "MediaItems", userKey: "UserDataKeyId", itemKey: "UserDataKeyId"},
+		{table: "TypedBaseItems", userKey: "key", itemKey: "UserDataKey"},
+	} {
+		cols := tableColumns(sqlDB, candidate.table)
+		if len(cols) == 0 || !udCols[strings.ToLower(candidate.userKey)] || !cols[strings.ToLower(candidate.itemKey)] {
+			continue
+		}
+		joins = append(joins, candidate)
+	}
+	if len(joins) == 0 {
+		return nil, []string{"library.db 中未识别到兼容的 UserDatas 表结构"}
+	}
+
+	lastPlayedExpr := "COALESCE(CAST(u.LastPlayedDateInt AS TEXT), '')"
+	if !udCols["lastplayeddateint"] {
+		if udCols["lastplayeddate"] {
+			lastPlayedExpr = "COALESCE(CAST(u.LastPlayedDate AS TEXT), '')"
+		} else {
+			lastPlayedExpr = "''"
+		}
+	}
+
 	var watches []embyWatchRow
-	for _, q := range queries {
+	var lastErr error
+	for _, j := range joins {
+		idCol := "Id"
+		if cols := tableColumns(sqlDB, j.table); !cols["id"] && cols["guid"] {
+			idCol = "guid"
+		}
+		q := `SELECT CAST(u.userId AS TEXT), CAST(u.` + j.userKey + ` AS TEXT), CAST(m.` + idCol + ` AS TEXT),
+			COALESCE(m.Name,''), COALESCE(m.Path,''), COALESCE(u.played,0),
+			COALESCE(u.playbackPositionTicks,0), COALESCE(u.playCount,0), COALESCE(u.isFavorite,0),
+			` + lastPlayedExpr + `
+			FROM UserDatas u JOIN ` + j.table + ` m ON m.` + j.itemKey + ` = u.` + j.userKey
 		rows, qErr := sqlDB.Query(q)
 		if qErr != nil {
+			lastErr = qErr
 			continue
 		}
 		for rows.Next() {
-			var uid, udKey, name, path string
+			var uid, udKey, itemEmbyID, name, path, playedOn string
 			var played, fav, playCount int
 			var pos int64
-			if rows.Scan(&uid, &udKey, &name, &path, &played, &pos, &playCount, &fav) == nil {
+			if rows.Scan(&uid, &udKey, &itemEmbyID, &name, &path, &played, &pos, &playCount, &fav, &playedOn) == nil {
 				watches = append(watches, embyWatchRow{
 					UserID:        uid,
 					Username:      usersByID[uid],
 					UserDataKey:   udKey,
+					ItemEmbyID:    itemEmbyID,
 					ItemName:      name,
 					ItemPath:      applyPathMappings(path, mappings),
 					Played:        played != 0,
 					PositionTicks: pos,
 					PlayCount:     playCount,
 					IsFavorite:    fav != 0,
+					LastPlayed:    parseEmbyTimestamp(playedOn),
 				})
 			}
 		}
 		_ = rows.Close()
 		return watches, nil
 	}
+	if lastErr != nil {
+		return nil, []string{"读取观看记录失败: " + lastErr.Error()}
+	}
 	return nil, []string{"library.db 中未识别到兼容的 UserDatas 表结构"}
 }
 
-func classifyEmbyType(raw string) string {
+// parseEmbyTimestamp accepts either a unix epoch (seconds or ticks) or an ISO
+// timestamp, which is how Emby versions store LastPlayedDate differently.
+func parseEmbyTimestamp(raw string) *time.Time {
 	s := strings.TrimSpace(raw)
-	// Emby 4.x integer type enum in MediaItems
+	if s == "" {
+		return nil
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if n <= 0 {
+			return nil
+		}
+		switch {
+		case n > 1e15: // .NET ticks (100ns since 0001-01-01)
+			t := time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(n) * 100 * time.Nanosecond)
+			return &t
+		case n > 1e12: // milliseconds
+			t := time.Unix(n/1000, 0).UTC()
+			return &t
+		default:
+			t := time.Unix(n, 0).UTC()
+			return &t
+		}
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"} {
+		if t, err := time.Parse(layout, s); err == nil {
+			t = t.UTC()
+			return &t
+		}
+	}
+	return nil
+}
+
+// normalizeEmbyPremiereDate converts stored epoch seconds into the YYYY-MM-DD
+// format the importer expects, leaving already-formatted values untouched.
+func normalizeEmbyPremiereDate(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		if n <= 0 {
+			return ""
+		}
+		return time.Unix(n, 0).UTC().Format("2006-01-02")
+	}
+	if len(s) > 10 {
+		return s[:10]
+	}
+	return s
+}
+
+// classifyEmbyType maps an Emby item type to an emby-lite media kind.
+// enumKind selects the numeric enum flavour: Emby 4.9+ MediaItems rows use
+// BaseItemKind (4 = CollectionFolder), older rows used a different numbering
+// where 1 and 2 meant CollectionFolder. Non-numeric schemas store type names.
+func classifyEmbyType(raw string, enumKind bool) string {
+	s := strings.TrimSpace(raw)
 	if n, err := strconv.Atoi(s); err == nil {
 		switch n {
-		case 1, 2:
-			return "CollectionFolder"
+		case 4:
+			if enumKind {
+				return "CollectionFolder"
+			}
 		case 5:
 			return "Movie"
 		case 6:
@@ -1105,9 +1505,12 @@ func classifyEmbyType(raw string) string {
 			return "Season"
 		case 8:
 			return "Episode"
-		default:
-			return ""
+		case 1, 2:
+			if !enumKind {
+				return "CollectionFolder"
+			}
 		}
+		return ""
 	}
 	lower := strings.ToLower(s)
 	switch {

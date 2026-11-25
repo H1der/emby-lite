@@ -9,7 +9,7 @@
 - **增量扫描 v2 与原生探测**：零改名接管 Emby 目录、文件指纹移动识别（移目录保留条目 ID 与观看进度/收藏）；自研纯 Go `nativeprobe` 容器头解析（MP4/MKV/HDR/音轨/字幕 + `.strm` 有界 HTTP Range），检测到 `ffprobe` 时自动兜底。
 - **TMDB 刮削与人工干预**：AES-GCM 加密凭据（只写不回显 + 连接测试 + 镜像/代理支持）、`provider_cache` 持久化缓存（重刮零 API 调用）、自动打分匹配 + 低分人工匹配队列（并列对比候选海报/手工搜 TMDB）、元数据手工编辑 + 字段级锁定（扫描与重刮均不覆盖锁定字段）与可选 NFO 回写。
 - **多用户权限、虚拟库、拼贴封面与片头跳过**：权限组模板与库级白名单、用户独立权限编辑、历史设备封禁/踢下线与活跃播放会话终止；虚拟库/组合库动态规则聚合（同步呈现在 Emby Views 且严守用户库隔离）；纯 Go 媒体库 16:9 拼贴封面自动生成与自定义上传；片头/片尾跳过标记（Emby 客户端 `Chapters` 原生兼容 + Web 播放器悬浮「跳过片头」按钮）。
-- **运维、迁移与文件管理**：受限 Web 文件管理器（`/api/files/*`，防路径越界与符号链接逃逸）、Emby 旧配置完整只读迁移向导（纯 Go 无 CGO，自动识别 `root/default` 媒体库 `options.xml`/`.mblink`、`library.db` 影视元数据与层级、`users.db` 用户与观看进度/收藏，支持路径前缀映射、可视化目录选择与预检报告）、可移植 ZIP 跨库备份恢复（支持 SQLite ↔ PostgreSQL）与 SQLite 在线快照、API Key 管理（最小权限隔离 `/api/admin/*`）与管理员操作审计日志。
+- **运维、迁移与文件管理**：受限 Web 文件管理器（`/api/files/*`，防路径越界与符号链接逃逸）、Emby 旧配置完整只读迁移向导（纯 Go 无 CGO，自动识别 `root/default` 媒体库 `options.xml`/`.mblink`、`library.db` 影视元数据与层级、`users.db` 用户与观看进度/收藏，兼容 Emby 4.8 `TypedBaseItems` 与 4.9+ `MediaItems`/`ItemLinks2` 两代库结构，支持路径前缀映射、可视化目录选择与预检报告）、可移植 ZIP 跨库备份恢复（支持 SQLite ↔ PostgreSQL）与 SQLite 在线快照、API Key 管理（最小权限隔离 `/api/admin/*`）与管理员操作审计日志。
 - **图片管线与后台任务**：纯 Go 按需缩放（`maxWidth`/`maxHeight`）+ 本地/远程图回源内容寻址磁盘缓存 + ETag/304 + 一键清理；DB 持久化任务队列（去重/取消/重启恢复）+ SSE 实时进度推送。
 - **Emby API 兼容**：支持 `/` 与 `/emby` 双前缀及大小写宽容路由、全套 Emby 鉴权头、签名游标分页（`Cursor` / `NextCursor` / `X-Next-Cursor`）、Items 浏览/FTS5/pg_trgm/拼音搜索、剧集季/集/NextUp、人物列表/详情/头像、图片与外挂字幕流、PlaybackInfo、本地 HTTP Range(206) 直出、`.strm` 302 重定向、按用户可控下载开关（默认关闭）、播放进度与收藏/已看状态。
 

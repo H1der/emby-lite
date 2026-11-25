@@ -229,6 +229,7 @@ emby-lite/
    - 支持为物理库与虚拟库自动选取代表海报合成拼贴封面，或管理员上传自定义封面，带版本 `revision` 避免客户端旧图缓存不刷新。
 6. **Emby 旧库迁移与双库备份**：
    - 迁移模块用纯 Go SQLite 驱动只读打开旧 Emby `users.db` / `library.db`（或兼容数据库），提供「预检报告（匹配到的用户/媒体/观看记录数量）→ 确认导入」两步流程，不修改源文件。
+   - 同时兼容两代库结构：Emby 4.8 及更早的 `TypedBaseItems`（文本类型名 + `TopParentId`/`SeriesId`/`SeasonId` 列），与 Emby 4.9+ 的 `MediaItems`（数字 `type` 枚举，媒体库是 `type=4` 的 CollectionFolder、目录与分类/工作室全部走 `ItemLinks2`，无父级/剧集列）。后者按 `ItemLinks2` Type 8 还原库路径、Type 2/3 还原分类与工作室，父级链推导剧集/季层级并按最长库路径前缀（缺失路径的季继承上级）归属媒体库，`LocalUsersv2.data` JSON 读取用户名、`UserDataKeys2` 关联 `UserDatas` 还原观看进度；Emby 密码为加密存储无法迁移，导入后统一使用默认密码并在预检报告中提示。
    - 备份支持 SQLite 在线备份（`.db`）、PostgreSQL `pg_dump`（有客户端时）或**通用可移植 JSON/ZIP 归档**（支持 SQLite ↔ PostgreSQL 跨库迁移）。
 
 ---
