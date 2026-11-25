@@ -122,11 +122,17 @@ func New(cfg *config.Config, db *database.DB, cacheStore cache.Store) *Server {
 		}
 		// Leave the final counts on the task row: the wizard and the 后台任务 tab both
 		// render task.message when the run completes.
-		report(lastProgress, lastTotal, fmt.Sprintf(
+		summary := fmt.Sprintf(
 			"迁移完成：媒体库 +%d（已存在 %d），条目 +%d（跳过 %d），用户 +%d（已存在 %d），观看记录 +%d（跳过 %d）",
 			rep.LibrariesCreated, rep.LibrariesExisting, rep.ItemsImported, rep.ItemsSkipped,
 			rep.UsersCreated, rep.UsersExisting, rep.WatchImported, rep.WatchSkipped,
-		))
+		)
+		if rep.ItemsFailed > 0 || rep.WatchFailed > 0 {
+			// Batched writes report how many rows had to be dropped; surfacing them keeps a
+			// silently lossy migration from looking like a clean one.
+			summary += fmt.Sprintf("，写入失败：条目 %d 条、观看记录 %d 条", rep.ItemsFailed, rep.WatchFailed)
+		}
+		report(lastProgress, lastTotal, summary)
 		if len(rep.Warnings) > 0 {
 			slog.Warn("emby migration finished with warnings", "task", "migrate_emby", "warnings", rep.Warnings)
 		}

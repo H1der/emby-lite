@@ -231,6 +231,7 @@ emby-lite/
 6. **Emby 旧库迁移与双库备份**：
    - 迁移模块用纯 Go SQLite 驱动只读打开旧 Emby `users.db` / `library.db`（或兼容数据库），提供「预检报告（匹配到的用户/媒体/观看记录数量）→ 确认导入」两步流程，不修改源文件。
    - 确认导入不会在 HTTP 请求里执行：`POST /api/admin/migration/emby/import` 只做入队并返回 `202 + task_id`，真正的导入由 `internal/task` 的 `migrate_emby` worker 执行（与大库扫描同一条 DB 持久化队列），因此关闭或刷新浏览器不会中断迁移，服务重启后未完成的任务也会被恢复。进度按「已读取 → 媒体库 → 影视条目 → 用户 → 观看进度」阶段回调（限流 400ms 落库一次，避免数万条 UPDATE），前端用 `GET /api/admin/tasks/:id` 轮询或经 SSE 显示条目级进度，`POST /api/admin/tasks/:id/cancel` 在当前阶段结束时（条目/用户/观看记录的循环内）响应取消。
+   - 写入策略按批事务 + upsert：条目在内存里攒满 500 条后在一个事务里完成「items 批量 upsert（`ON CONFLICT(scan_key) DO UPDATE`）→ 只为命中已有行时清理 `items_fts` 再批量插入 → 分类整体删除后 `CreateInBatches` → 媒体源/图片 upsert」；存在性判断由一次性装载 `items(id, scan_key)` 建 map 取代逐条 `First`，写入失败时整批回退成逐行重试并计入 `items_failed`/`watch_failed`（完成消息会提示，不再静默丢行）。视频与图片探测走 `mediaProbeCache`：同一目录的 `ReadDir` 结果与文件 `Stat` 结果在 5 分钟 TTL 内复用，避免几百集同目录剧集重复列目录。实测 58313 条目库由 2 分 30 秒降至约 35 秒，逐行比对迁移产物的 items/媒体源/分类/观看记录/FTS 内容与旧实现完全一致。
    - 同时兼容两代库结构：Emby 4.8 及更早的 `TypedBaseItems`（文本类型名 + `TopParentId`/`SeriesId`/`SeasonId` 列），与 Emby 4.9+ 的 `MediaItems`（数字 `type` 枚举，媒体库是 `type=4` 的 CollectionFolder、目录与分类/工作室全部走 `ItemLinks2`，无父级/剧集列）。后者按 `ItemLinks2` Type 8 还原库路径、Type 2/3 还原分类与工作室，父级链推导剧集/季层级并按最长库路径前缀（缺失路径的季继承上级）归属媒体库，`LocalUsersv2.data` JSON 读取用户名、`UserDataKeys2` 关联 `UserDatas` 还原观看进度；Emby 密码为加密存储无法迁移，导入后统一使用默认密码并在预检报告中提示。
    - 备份支持 SQLite 在线备份（`.db`）、PostgreSQL `pg_dump`（有客户端时）或**通用可移植 JSON/ZIP 归档**（支持 SQLite ↔ PostgreSQL 跨库迁移）。
 

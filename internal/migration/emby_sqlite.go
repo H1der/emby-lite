@@ -88,10 +88,12 @@ type ImportReport struct {
 	LibrariesExisting int      `json:"libraries_existing"`
 	ItemsImported     int      `json:"items_imported"`
 	ItemsSkipped      int      `json:"items_skipped"`
+	ItemsFailed       int      `json:"items_failed"`
 	UsersCreated      int      `json:"users_created"`
 	UsersExisting     int      `json:"users_existing"`
 	WatchImported     int      `json:"watch_imported"`
 	WatchSkipped      int      `json:"watch_skipped"`
+	WatchFailed       int      `json:"watch_failed"`
 	Warnings          []string `json:"warnings,omitempty"`
 }
 
@@ -512,6 +514,14 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 		for _, it := range items {
 			itemKinds[it.EmbyID] = it.ItemType
 		}
+		// Which items already exist is answered from one query instead of a lookup per item,
+		// and every write below goes through one batched transaction at a time.
+		existingIDs, err := s.existingScanKeys()
+		if err != nil {
+			return nil, err
+		}
+		images := newMediaProbeCache()
+		writer := newItemWriter(s.db.Gorm, s.db.HasFTS5, func(failed int) { report.ItemsFailed += failed })
 		for _, wantType := range order {
 			for _, it := range items {
 				if it.ItemType != wantType {
@@ -561,11 +571,10 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 				scanKey := buildMigratedScanKey(wantType, libID, seriesID, it)
 				localID := scanner.StableID("item", scanKey)
 
-				var existing model.Item
-				lookupErr := s.db.Gorm.Where("scan_key = ?", scanKey).First(&existing).Error
-				existingItem := lookupErr == nil
-				if existingItem {
-					localID = existing.ID
+				existingItem := false
+				if existingLocalID, ok := existingIDs[scanKey]; ok {
+					existingItem = true
+					localID = existingLocalID
 					if !req.Overwrite {
 						embyItemToLocal[it.EmbyID] = localID
 						if it.UserDataKey != "" {
@@ -575,7 +584,6 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 						continue
 					}
 				}
-
 				sortName := it.SortName
 				if sortName == "" {
 					sortName = scanner.BuildSortName(it.Name)
@@ -626,26 +634,11 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 					AddedAt:         now,
 					CreatedAt:       now,
 				}
-				if err := s.db.Gorm.Save(&rec).Error; err != nil {
-					report.ItemsSkipped++
-					continue
-				}
-				if s.db.HasFTS5 {
-					// items_fts keeps item_id UNINDEXED, so deleting by it scans the whole
-					// index: doing that for every freshly inserted item makes a full
-					// migration quadratic. New rows have no stale FTS entry to remove.
-					if existingItem {
-						_ = s.db.Gorm.Exec("DELETE FROM items_fts WHERE item_id = ?", rec.ID).Error
-					}
-					_ = s.db.Gorm.Exec("INSERT INTO items_fts(item_id, name, original_name, pinyin_initials) VALUES (?, ?, ?, ?)",
-						rec.ID, rec.Name, rec.OriginalName, rec.PinyinInitials).Error
-				}
-				if len(it.Genres) > 0 {
-					_ = s.db.Gorm.Where("item_id = ?", rec.ID).Delete(&model.ItemGenre{}).Error
-					for _, g := range it.Genres {
-						if gn := strings.TrimSpace(g); gn != "" {
-							_ = s.db.Gorm.Create(&model.ItemGenre{ItemID: rec.ID, Genre: gn}).Error
-						}
+				row := itemBatchRow{item: rec, existed: existingItem}
+
+				for _, g := range it.Genres {
+					if gn := strings.TrimSpace(g); gn != "" {
+						row.genres = append(row.genres, model.ItemGenre{ItemID: rec.ID, Genre: gn})
 					}
 				}
 
@@ -657,12 +650,11 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 						srcType = "strm"
 						strmURL = scanner.ReadSTRMTarget(it.Path)
 					}
-					var fileSize, fileMtime int64
-					if fi, statErr := os.Stat(it.Path); statErr == nil && !fi.IsDir() {
-						fileSize = fi.Size()
-						fileMtime = fi.ModTime().Unix()
+					fileSize, fileMtime, _, fileOK := images.statFile(it.Path)
+					if !fileOK {
+						fileSize, fileMtime = 0, 0
 					}
-					_ = s.db.Gorm.Save(&model.MediaSource{
+					row.source = &model.MediaSource{
 						ID:           scanner.StableID("src", it.Path),
 						ItemID:       rec.ID,
 						SourceType:   srcType,
@@ -673,32 +665,37 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 						Fingerprint:  scanner.Fingerprint(it.Path, fileSize),
 						Container:    scanner.ContainerFromPath(it.Path, strmURL),
 						DurationSecs: float64(it.RunTimeTicks) / 1e7,
-					}).Error
+					}
 				}
 
-				// Discover local posters immediately if remapped path is accessible on disk!
+				// Discover local posters immediately if the path is accessible on disk. The
+				// directory listing and stat results are cached: without it a season folder is
+				// read once per episode and every candidate stat'ed again for each item.
 				if dirPath != "" {
 					stem := ""
 					if wantType == "Movie" || wantType == "Episode" {
 						stem = strings.TrimSuffix(filepath.Base(it.Path), filepath.Ext(it.Path))
 					}
-					for kind, imgPath := range scanner.DiscoverLocalImages(dirPath, stem) {
-						if fi, statErr := os.Stat(imgPath); statErr == nil {
-							tag := scanner.StableID("imgtag", fmt.Sprintf("%s|%d|%d", imgPath, fi.Size(), fi.ModTime().Unix()))[:16]
-							_ = s.db.Gorm.Save(&model.ItemImage{
-								ID:         scanner.StableID("img", rec.ID+"|"+kind+"|0"),
-								ItemID:     rec.ID,
-								Kind:       kind,
-								IndexNum:   0,
-								SourceType: "local",
-								SourceRef:  imgPath,
-								Tag:        tag,
-								UpdatedAt:  now,
-							}).Error
+					for kind, imgPath := range images.discoverImages(dirPath, stem) {
+						size, mtime, _, ok := images.statFile(imgPath)
+						if !ok {
+							continue
 						}
+						tag := scanner.StableID("imgtag", fmt.Sprintf("%s|%d|%d", imgPath, size, mtime))[:16]
+						row.images = append(row.images, model.ItemImage{
+							ID:         scanner.StableID("img", rec.ID+"|"+kind+"|0"),
+							ItemID:     rec.ID,
+							Kind:       kind,
+							IndexNum:   0,
+							SourceType: "local",
+							SourceRef:  imgPath,
+							Tag:        tag,
+							UpdatedAt:  now,
+						})
 					}
 				}
 
+				writer.add(row)
 				embyItemToLocal[it.EmbyID] = rec.ID
 				if it.UserDataKey != "" {
 					userDataKeyToLocal[it.UserDataKey] = rec.ID
@@ -706,6 +703,9 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 				report.ItemsImported++
 			}
 		}
+
+		// Write whatever is still buffered before counting.
+		writer.flush()
 
 		// Update library item counts.
 		for _, ex := range existingLibs {
@@ -767,6 +767,15 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 	if wantWatch {
 		itemMatcher := s.buildLocalItemMatcher()
 		now := time.Now().UTC()
+		userIDs := make([]string, 0, len(embyIDToLocalUserID))
+		for _, id := range embyIDToLocalUserID {
+			userIDs = append(userIDs, id)
+		}
+		userDataLookup, err := s.loadUserDataMap(userIDs, nil)
+		if err != nil {
+			return nil, err
+		}
+		writer := newUserDataBatch(s.db.Gorm)
 		for _, w := range watches {
 			if err := checkCancel(); err != nil {
 				return nil, err
@@ -795,21 +804,25 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 				continue
 			}
 
-			var existingUD model.UserData
-			err := s.db.Gorm.Where("user_id = ? AND item_id = ?", localUserID, localItemID).First(&existingUD).Error
-			if err == nil && !req.Overwrite {
-				existingUD.Played = existingUD.Played || w.Played
-				existingUD.IsFavorite = existingUD.IsFavorite || w.IsFavorite
-				if w.PositionTicks > existingUD.PositionTicks {
-					existingUD.PositionTicks = w.PositionTicks
+			key := userDataKey(localUserID, localItemID)
+			if prev, ok := userDataLookup[key]; ok && !req.Overwrite {
+				prev.Played = prev.Played || w.Played
+				prev.IsFavorite = prev.IsFavorite || w.IsFavorite
+				if w.PositionTicks > prev.PositionTicks {
+					prev.PositionTicks = w.PositionTicks
 				}
-				if w.PlayCount > existingUD.PlayCount {
-					existingUD.PlayCount = w.PlayCount
+				if w.PlayCount > prev.PlayCount {
+					prev.PlayCount = w.PlayCount
 				}
-				existingUD.UpdatedAt = now
-				_ = s.db.Gorm.Save(&existingUD).Error
+				if w.LastPlayed != nil {
+					prev.LastPlayedAt = w.LastPlayed
+				}
+				prev.UpdatedAt = now
+				userDataLookup[key] = prev
+				writer.add(prev)
 			} else {
-				_ = s.db.Gorm.Save(&model.UserData{
+				// Nothing to merge into (or Overwrite was requested): the source row wins.
+				row := model.UserData{
 					UserID:        localUserID,
 					ItemID:        localItemID,
 					Played:        w.Played,
@@ -818,10 +831,13 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 					IsFavorite:    w.IsFavorite,
 					LastPlayedAt:  w.LastPlayed,
 					UpdatedAt:     now,
-				}).Error
+				}
+				userDataLookup[key] = row
+				writer.add(row)
 			}
 			report.WatchImported++
 		}
+		report.WatchFailed += writer.flush()
 	}
 	if onProgress != nil {
 		onProgress(totalWork, totalWork, "迁移完成，正在刷新媒体库…")
