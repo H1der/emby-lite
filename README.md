@@ -38,6 +38,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/emby-lite ./cmd/emby-li
 - 单容器 SQLite：`docker compose -f deploy/docker-compose.sqlite.yml up -d`
 - PostgreSQL 档：`docker compose -f deploy/docker-compose.pg.yml up -d`
 - PostgreSQL + Redis 档：`docker compose -f deploy/docker-compose.redis.yml up -d`
+  - Redis 默认启用 `requirepass` 认证，启动前先 `export REDIS_PASSWORD=你的密码`（未设置时回退到 `embylite_change_me`，仅供本地试用，务必替换）
 
 ## 常用环境变量
 
@@ -52,6 +53,8 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/emby-lite ./cmd/emby-li
 | `SQLITE_PATH` | 显式指定 SQLite 数据库文件路径 | `./data/emby-lite.db` |
 | `DATA_DIR` / `CACHE_DIR` / `BACKUP_DIR` | 数据、图片缓存、备份归档目录 | `./data` / `./cache` / `./backups`（容器内 `/data` 等） |
 | `REDIS_URL` | 可选 Redis 地址（如 `redis://redis:6379/0`） | 空（内存缓存） |
+| `REDIS_PASSWORD` | 可选 Redis 密码（`REDIS_URL` 中已含密码时以 URL 为准） | 空 |
+| `REDIS_DB` / `REDIS_PREFIX` | 可选 Redis 库号与 key 前缀（多实例共用同一 Redis 时靠前缀隔离） | `0` / `embylite:` |
 | `EMBY_METADATA_DIR` | 可选：挂载原 Emby 的 `metadata` 或 `metadata/people` 目录以零拷贝共享演员头像 | 空 |
 | `EMBY_METADATA_WRITEBACK` | 目录可写时是否将 TMDB 新获取的演员头像按 Emby 规范补写落盘（只补缺、不覆盖） | `true` |
 | `PUID` / `PGID` | Docker 容器运行用户 UID/GID（设 `0` 则以 root 运行） | `65532` / `65532` |

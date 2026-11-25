@@ -19,11 +19,22 @@ services:
     image: redis:7-alpine
     container_name: emby-lite-redis
     restart: unless-stopped
-    command: redis-server --appendonly yes
+    # 启用密码认证：requirepass 只作用于 default 用户（如需 ACL 多用户请改挂 redis.conf）；
+    # 用列表形式传参，避免口令含空格/特殊字符时被 compose 拆词
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:-embylite_change_me}
+    environment:
+      # 供 healthcheck 里的 redis-cli 自动取用，无需 -a 参数，免去引号/特殊字符转义问题
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-embylite_change_me}
     volumes:
       - ./redis:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # 开启认证后匿名 ping 只会返回 NOAUTH，必须借助 REDISCLI_AUTH 才能真正探测到 PONG
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -50,7 +61,9 @@ services:
       BACKUP_DIR: /backups
       DB_TYPE: postgres
       DSN: postgres://embylite:${POSTGRES_PASSWORD:-embylite_change_me}@postgres:5432/embylite?sslmode=disable
+      # 密码走独立变量（URL 里已带密码时以 URL 为准），避免特殊字符需 percent-encoding
       REDIS_URL: redis://redis:6379/0
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-embylite_change_me}
       SERVER_NAME: ${SERVER_NAME:-Emby-Lite}
       # 可选：共享原 Emby 的 metadata 目录（复用并补全 people 演员头像；支持 :rw 或 :ro）
       # EMBY_METADATA_DIR: /emby-metadata
