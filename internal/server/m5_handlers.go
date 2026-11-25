@@ -281,18 +281,39 @@ func (a *AdminHandler) ImportEmbyMigration(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	rep, err := a.migration.Import(body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	// Importing a full Emby library takes minutes, so it is queued as a background task.
+	// The HTTP call returns immediately and the wizard polls GET /api/admin/tasks/:id,
+	// which keeps the run alive when the browser tab is closed or the page reloads.
+	// Two migrations would interleave writes into the same libraries/items, so refuse a
+	// second one even when the payload differs instead of relying on payload dedup alone.
+	if a.tasks.HasActive("migrate_emby") {
+		c.JSON(http.StatusConflict, gin.H{"error": "已有迁移任务在执行，请等待完成或先取消它"})
 		return
 	}
-	a.recordAudit(c, "migration.emby_import", "migration", "emby", map[string]any{
-		"libraries_created": rep.LibrariesCreated,
-		"items_imported":    rep.ItemsImported,
-		"users_created":     rep.UsersCreated,
-		"watch_imported":    rep.WatchImported,
+	t, created, err := a.tasks.Enqueue("migrate_emby", 20, body, "等待从旧 Emby 迁移")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	a.recordAudit(c, "migration.emby_import", "migration", t.ID, map[string]any{
+		"queued":  created,
+		"task_id": t.ID,
 	})
-	c.JSON(http.StatusOK, rep)
+	c.JSON(http.StatusAccepted, gin.H{
+		"task_id": t.ID,
+		"queued":  created,
+		"task":    t,
+	})
+}
+
+// GetTask returns one background task so the UI can poll a long-running job.
+func (a *AdminHandler) GetTask(c *gin.Context) {
+	t, err := a.tasks.Get(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "任务不存在"})
+		return
+	}
+	c.JSON(http.StatusOK, t)
 }
 
 // --- API Keys & Audit Logs ---

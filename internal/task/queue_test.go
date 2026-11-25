@@ -72,3 +72,46 @@ func TestTaskQueueExecutionDedupeAndSSE(t *testing.T) {
 		}
 	}
 }
+
+func TestTaskQueueGetAndHasActive(t *testing.T) {
+	cfg := config.Default()
+	cfg.Database.Type = "sqlite"
+	cfg.Database.SQLitePath = filepath.Join(t.TempDir(), "task-get.db")
+
+	db, err := database.Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	q := NewQueue(db)
+	q.Register("slow", func(ctx context.Context, _ []byte, report ProgressReporter) error {
+		report(1, 10, "working")
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	t1, _, err := q.Enqueue("slow", 10, map[string]string{"n": "1"}, "queued")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// HasActive must gate a second run of the same type even with a different payload.
+	if !q.HasActive("slow") {
+		t.Fatal("expected HasActive to report the pending task")
+	}
+	if q.HasActive("other") {
+		t.Fatal("HasActive must not report an unrelated task type")
+	}
+
+	got, err := q.Get(t1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != t1.ID || got.Status != StatusPending {
+		t.Fatalf("unexpected task: id=%s status=%s", got.ID, got.Status)
+	}
+	if _, err := q.Get("missing-id"); err == nil {
+		t.Fatal("expected error for unknown task id")
+	}
+}

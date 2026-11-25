@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -102,6 +104,34 @@ func New(cfg *config.Config, db *database.DB, cacheStore cache.Store) *Server {
 		})
 		return err
 	})
+	taskQueue.Register("migrate_emby", func(ctx context.Context, payload []byte, report task.ProgressReporter) error {
+		var req migration.EmbyMigrationRequest
+		if err := json.Unmarshal(payload, &req); err != nil {
+			return err
+		}
+		// The wizard can take many minutes on a real library, so it always runs here
+		// instead of inside the HTTP request: closing the browser tab cannot abort it,
+		// and the admin page can reattach to the live progress at any time.
+		lastProgress, lastTotal := 0, 0
+		rep, err := migSvc.ImportWithProgress(ctx, req, func(progress, total int, msg string) {
+			lastProgress, lastTotal = progress, total
+			report(progress, total, msg)
+		})
+		if err != nil {
+			return err
+		}
+		// Leave the final counts on the task row: the wizard and the 后台任务 tab both
+		// render task.message when the run completes.
+		report(lastProgress, lastTotal, fmt.Sprintf(
+			"迁移完成：媒体库 +%d（已存在 %d），条目 +%d（跳过 %d），用户 +%d（已存在 %d），观看记录 +%d（跳过 %d）",
+			rep.LibrariesCreated, rep.LibrariesExisting, rep.ItemsImported, rep.ItemsSkipped,
+			rep.UsersCreated, rep.UsersExisting, rep.WatchImported, rep.WatchSkipped,
+		))
+		if len(rep.Warnings) > 0 {
+			slog.Warn("emby migration finished with warnings", "task", "migrate_emby", "warnings", rep.Warnings)
+		}
+		return nil
+	})
 	taskQueue.Start(2)
 
 	embyHandler := emby.NewHandler(db, cacheStore, cfg, authSvc, scanSvc, pbSvc, imgPipeline, scraperSvc)
@@ -173,8 +203,9 @@ func New(cfg *config.Config, db *database.DB, cacheStore cache.Store) *Server {
 		adminAPI.PUT("/metadata/:itemId", adminHandler.UpdateItemMetadata)
 
 		adminAPI.GET("/tasks", adminHandler.ListTasks)
-		adminAPI.POST("/tasks/:id/cancel", adminHandler.CancelTask)
 		adminAPI.GET("/tasks/events", adminHandler.TaskEventsSSE)
+		adminAPI.GET("/tasks/:id", adminHandler.GetTask)
+		adminAPI.POST("/tasks/:id/cancel", adminHandler.CancelTask)
 
 		adminAPI.GET("/cache/stats", adminHandler.CacheStats)
 		adminAPI.POST("/cache/clear", adminHandler.ClearCache)

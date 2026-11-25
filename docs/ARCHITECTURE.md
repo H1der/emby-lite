@@ -130,7 +130,7 @@ emby-lite/
 | | `playback_leases` | `play_session_id`, `user_id`, `device_id`, `item_id`, `media_source_id`, `position_ticks`, `is_paused`, `expires_at`（无 Redis 时落库，有 Redis 时主写 Redis） |
 | | `intro_markers` | `id`, `series_id`, `season_num`, `item_id`, `intro_start_ticks`, `intro_end_ticks`, `credits_start_ticks`, `source`（manual/nfo/imported）, `confidence`, `updated_at` |
 | **扫描、任务与运维** | `scan_files` | `library_id`, `path`, `dir_path`, `size`, `mtime`, `fingerprint`, `dep_hash`（同目录 NFO/图片/字幕变更感知）, `item_id`, `last_scan_run` |
-| | `background_tasks` | `id`, `type`（scan/scrape/probe/cover/backup/migrate）, `status`, `priority`, `payload_json`, `progress`, `total`, `message`, `error`, `created_at`, `started_at`, `finished_at` |
+| | `background_tasks` | `id`, `type`（scan/scrape/probe/cover/backup/migrate_emby）, `status`, `priority`, `payload_json`, `progress`, `total`, `message`, `error`, `created_at`, `started_at`, `finished_at` |
 | | `settings` | `key`, `value`, `encrypted`（bool）, `updated_at` |
 | | `audit_logs` | `id`, `user_id`, `action`, `target_type`, `target_id`, `detail_json`, `ip`, `created_at` |
 
@@ -175,6 +175,7 @@ emby-lite/
 ### 5.2 DB 持久化任务队列 + SSE 事件流
 
 - 所有耗时作业（全量/增量扫库、定向刷新、TMDB 批量刮削、媒体探测、封面拼贴、备份/迁移）统一写入 `background_tasks` 表，支持**任务去重、优先级、取消、重启恢复**。
+- HTTP 入口只负责入队（例如 Emby 迁移返回 `202 + task_id`），长任务不在请求生命周期内执行，因此浏览器关闭、页面刷新或反向代理超时都不会打断作业；`GET /api/admin/tasks/:id`、`GET /api/admin/tasks` 与 `/api/admin/tasks/events`（SSE）三种读法都指向同一行任务记录。
 - 进程内多分组 Worker 池按任务类型限制并发（例如扫描串行/按库互斥，TMDB 刮削受速率限制，探测并发可控），不因 Redis 是否开启而改变持久化语义。
 - 任务进度与系统日志通过 `/api/admin/tasks/events`（SSE）实时推送到 Vue 3 前端。
 
@@ -229,6 +230,7 @@ emby-lite/
    - 支持为物理库与虚拟库自动选取代表海报合成拼贴封面，或管理员上传自定义封面，带版本 `revision` 避免客户端旧图缓存不刷新。
 6. **Emby 旧库迁移与双库备份**：
    - 迁移模块用纯 Go SQLite 驱动只读打开旧 Emby `users.db` / `library.db`（或兼容数据库），提供「预检报告（匹配到的用户/媒体/观看记录数量）→ 确认导入」两步流程，不修改源文件。
+   - 确认导入不会在 HTTP 请求里执行：`POST /api/admin/migration/emby/import` 只做入队并返回 `202 + task_id`，真正的导入由 `internal/task` 的 `migrate_emby` worker 执行（与大库扫描同一条 DB 持久化队列），因此关闭或刷新浏览器不会中断迁移，服务重启后未完成的任务也会被恢复。进度按「已读取 → 媒体库 → 影视条目 → 用户 → 观看进度」阶段回调（限流 400ms 落库一次，避免数万条 UPDATE），前端用 `GET /api/admin/tasks/:id` 轮询或经 SSE 显示条目级进度，`POST /api/admin/tasks/:id/cancel` 在当前阶段结束时（条目/用户/观看记录的循环内）响应取消。
    - 同时兼容两代库结构：Emby 4.8 及更早的 `TypedBaseItems`（文本类型名 + `TopParentId`/`SeriesId`/`SeasonId` 列），与 Emby 4.9+ 的 `MediaItems`（数字 `type` 枚举，媒体库是 `type=4` 的 CollectionFolder、目录与分类/工作室全部走 `ItemLinks2`，无父级/剧集列）。后者按 `ItemLinks2` Type 8 还原库路径、Type 2/3 还原分类与工作室，父级链推导剧集/季层级并按最长库路径前缀（缺失路径的季继承上级）归属媒体库，`LocalUsersv2.data` JSON 读取用户名、`UserDataKeys2` 关联 `UserDatas` 还原观看进度；Emby 密码为加密存储无法迁移，导入后统一使用默认密码并在预检报告中提示。
    - 备份支持 SQLite 在线备份（`.db`）、PostgreSQL `pg_dump`（有客户端时）或**通用可移植 JSON/ZIP 归档**（支持 SQLite ↔ PostgreSQL 跨库迁移）。
 
@@ -255,7 +257,7 @@ emby-lite/
 | | `/admin/metadata/:id` | 元数据精细编辑、**字段级锁定开关**、图片上传/切换、片头片尾时间点编辑 |
 | | `/admin/users` | 用户管理、**权限组模板**、库级可见性矩阵、下载开关、历史设备与踢下线 |
 | | `/admin/files` | 受限 Web 文件管理器（目录树、重命名、移动、新建目录、上传/下载） |
-| | `/admin/migration` | Emby 旧 SQLite 迁移向导（上传/指定路径 → 预检 → 导入）与数据备份/恢复 |
+| | `/admin/migration` | Emby 旧 SQLite 迁移向导（指定路径 → 预检 → 入队执行，向导内轮询显示条目级进度并可取消）与数据备份/恢复 |
 | | `/admin/settings` | 服务名称/端口/代理、API Key 管理、图片与探测策略、缓存状态（Redis/内存）、审计日志与实时应用日志 |
 
 ---
@@ -281,4 +283,4 @@ emby-lite/
 | **M2：增量扫描 v2、原生探测与图片管线（已完成）** | 补齐生产级扫描体验与媒体元信息 | `scan_v2` 增量与移动识别（保留 ItemID 与观看进度）、`internal/nativeprobe`（MP4/MKV + STRM 有界 HTTP Range + 可选 `ffprobe` 兜底）、纯 Go 图片按需缩放 + 内容寻址磁盘缓存 + 清理接口、DB 持久化任务队列 + SSE 实时进度推送、SQLite FTS5 / PG `pg_trgm` 搜索与 HMAC 签名游标分页、可视化目录选择器与 Vue 3 任务/缓存面板；**已验收**：6 个测试包全通过，`CGO_ENABLED=0` 静态单二进制编译通过 |
 | **M3：TMDB 刮削、人工干预与元数据体系（已完成）** | 完善的刮削与人工修图/纠偏体验 | TMDB v3/v4 客户端（AES-GCM 加密凭据、镜像/代理支持、`provider_cache` 持久化缓存）、双语二元组匹配打分器 + 低分人工匹配队列（候选海报对比 + 手工搜索 TMDB）、元数据手工编辑 + 字段级锁定（扫描与重刮均严格遵守）+ 可选 NFO 回写、远程图片按需回源缓存、Emby `/Persons` 列表/详情/头像、Vue 3 刮削管理与元数据编辑弹窗；**已验收**：7 个测试包全通过，`CGO_ENABLED=0` 静态单二进制编译通过 |
 | **M4：多用户权限、虚拟库、封面与片头跳过（已完成）** | 完整的多用户共享与客户端增强体验 | 权限组 CRUD 与库级白名单、用户权限编辑、设备历史封禁/踢下线与活跃会话终止、虚拟库/组合库（同步接入 Emby Views/Items 并遵守库隔离）、纯 Go 媒体库 16:9 拼贴封面自动生成与自定义封面上传、片头/片尾跳过标记（Emby `Chapters` 兼容 + Web 播放器悬浮跳过按钮）；**已验收**：7 个测试包全通过，`CGO_ENABLED=0` 静态单二进制编译通过 |
-| **M5：文件管理、迁移、备份与发布打磨（已完成）** | 完整运维闭环与生产可交付物 | 受限 Web 文件管理（`/api/files/*`，防路径越界/符号链接逃逸）、纯 Go Emby 旧 SQLite 只读迁移向导（预检+导入）、SQLite 在线快照 + 跨库可移植 ZIP 备份恢复（SQLite ↔ PostgreSQL）、API Key 最小权限管理与管理员操作审计日志、多架构 `Dockerfile` + 三档 `docker-compose` 与 Vue 3 文件/运维界面；**已验收**：10 个测试包全通过，`CGO_ENABLED=0` 静态单二进制编译通过 |
+| **M5：文件管理、迁移、备份与发布打磨（已完成）** | 完整运维闭环与生产可交付物 | 受限 Web 文件管理（`/api/files/*`，防路径越界/符号链接逃逸）、纯 Go Emby 旧 SQLite 只读迁移向导（预检 + 后台任务异步导入：`202 + task_id` 入队，关闭页面不中断，条目级进度与取消）、SQLite 在线快照 + 跨库可移植 ZIP 备份恢复（SQLite ↔ PostgreSQL）、API Key 最小权限管理与管理员操作审计日志、多架构 `Dockerfile` + 三档 `docker-compose` 与 Vue 3 文件/运维界面；**已验收**：10 个测试包全通过，`CGO_ENABLED=0` 静态单二进制编译通过 |

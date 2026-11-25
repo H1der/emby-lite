@@ -1,6 +1,7 @@
 package migration
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"encoding/xml"
@@ -317,15 +318,36 @@ func (s *Service) Preview(req EmbyMigrationRequest) (*PreviewReport, error) {
 	return report, nil
 }
 
+// ImportProgress 是迁移过程中的阶段与计数回调，供后台任务上报给前端。
+type ImportProgress func(progress, total int, message string)
+
 // Import migrates Emby libraries, media metadata, users, and watch progress/favorites into emby-lite.
+// It runs to completion without reporting progress; callers that need live progress or
+// cancellation should use ImportWithProgress.
 func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
+	return s.ImportWithProgress(context.Background(), req, nil)
+}
+
+// ImportWithProgress is Import with a cancellable context and a progress callback.
+//
+// Importing a real Emby library (tens of thousands of items) takes minutes, so the admin
+// API runs it as a background task: the browser only enqueues and then polls. Cancelling
+// ctx stops the run at the current phase and returns ctx.Err() so the task queue can mark
+// the task cancelled instead of failed.
+func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationRequest, onProgress ImportProgress) (*ImportReport, error) {
 	resolved := resolveSources(req)
 	if resolved.UsersDBPath == "" && resolved.LibraryDBPath == "" && resolved.RootDefaultDir == "" {
 		return nil, errors.New("请指定 Emby 配置目录，或至少填写 root/default、users.db、library.db 中的一项")
 	}
 
+	if onProgress != nil {
+		onProgress(0, 0, "正在读取旧 Emby 数据库…")
+	}
 	libs, items, users, watches, warnings, err := s.readAllEmbyData(resolved, req.PathMappings)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -336,6 +358,37 @@ func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
 
 	report := &ImportReport{Warnings: warnings}
 
+	// Count the work up front so the UI can show a real percentage. The item loop is by
+	// far the largest phase, so it dominates the total.
+	totalWork := len(items)
+	if wantUsers {
+		totalWork += len(users)
+	}
+	if wantWatch {
+		totalWork += len(watches)
+	}
+	done := 0
+	lastReport := time.Time{}
+	// advance throttles progress callbacks: the task queue persists every report, and a
+	// callback per item would mean tens of thousands of extra UPDATEs.
+	advance := func(n int, phase string) {
+		done += n
+		if onProgress == nil {
+			return
+		}
+		now := time.Now()
+		if n > 0 && now.Sub(lastReport) < 400*time.Millisecond {
+			return
+		}
+		lastReport = now
+		onProgress(done, totalWork, phase)
+	}
+	checkCancel := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return nil
+	}
 	// 1. Migrate Libraries
 	existingLibs := s.loadExistingLibraryMap()
 	embyLibIDToLocal := map[string]string{}
@@ -347,7 +400,13 @@ func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
 	var fallbackLibID string
 
 	if wantLibraries {
+		if onProgress != nil {
+			onProgress(done, totalWork, "正在迁移媒体库…")
+		}
 		for idx, l := range libs {
+			if err := checkCancel(); err != nil {
+				return nil, err
+			}
 			lowerName := strings.ToLower(strings.TrimSpace(l.Name))
 			if lowerName == "" {
 				continue
@@ -458,6 +517,10 @@ func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
 				if it.ItemType != wantType {
 					continue
 				}
+				if err := checkCancel(); err != nil {
+					return nil, err
+				}
+				advance(1, "正在迁移影视条目…")
 				libID := resolveItemLibrary(it)
 				if libID == "" {
 					report.ItemsSkipped++
@@ -668,7 +731,14 @@ func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
 	embyIDToLocalUserID := map[string]string{}
 
 	if wantUsers {
+		if onProgress != nil {
+			onProgress(done, totalWork, "正在迁移用户…")
+		}
 		for _, u := range users {
+			if err := checkCancel(); err != nil {
+				return nil, err
+			}
+			advance(1, "正在迁移用户…")
 			lower := strings.ToLower(strings.TrimSpace(u.Username))
 			if lower == "" {
 				continue
@@ -698,6 +768,10 @@ func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
 		itemMatcher := s.buildLocalItemMatcher()
 		now := time.Now().UTC()
 		for _, w := range watches {
+			if err := checkCancel(); err != nil {
+				return nil, err
+			}
+			advance(1, "正在迁移观看进度与收藏…")
 			localUserID := embyIDToLocalUserID[w.UserID]
 			if localUserID == "" && w.Username != "" {
 				localUserID = existingUsers[strings.ToLower(strings.TrimSpace(w.Username))]
@@ -749,7 +823,9 @@ func (s *Service) Import(req EmbyMigrationRequest) (*ImportReport, error) {
 			report.WatchImported++
 		}
 	}
-
+	if onProgress != nil {
+		onProgress(totalWork, totalWork, "迁移完成，正在刷新媒体库…")
+	}
 	s.db.BumpLibraryRevision()
 	return report, nil
 }

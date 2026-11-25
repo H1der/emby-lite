@@ -607,6 +607,7 @@ function taskTypeLabel(tp: string): string {
   if (tp === 'scan') return '媒体库扫描'
   if (tp === 'probe') return '媒体信息探测'
   if (tp === 'scrape') return 'TMDB 刮削'
+  if (tp === 'migrate_emby') return '从旧 Emby 迁移'
   return tp
 }
 

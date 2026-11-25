@@ -168,6 +168,15 @@ func (q *Queue) Cancel(taskID string) error {
 	return nil
 }
 
+// Get returns a single background task by id.
+func (q *Queue) Get(taskID string) (*model.BackgroundTask, error) {
+	var t model.BackgroundTask
+	if err := q.db.Gorm.Where("id = ?", taskID).First(&t).Error; err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
 // List returns the most recent background tasks.
 func (q *Queue) List(limit int) ([]model.BackgroundTask, error) {
 	if limit <= 0 || limit > 200 {

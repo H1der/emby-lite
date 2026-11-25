@@ -121,7 +121,44 @@
             <n-button secondary :loading="migLoading" @click="previewMigration">1. 预检迁移内容</n-button>
             <n-button type="primary" :loading="migLoading" @click="runMigration">2. 确认执行迁移</n-button>
           </div>
+          <div class="text-[11px] text-ink-muted pt-1">
+            迁移在服务端后台任务中执行，提交后可以关闭页面；进度可在本页或「后台任务」页随时查看。
+          </div>
         </n-form>
+
+        <!-- Background migration task progress -->
+        <div v-if="migTask" class="mt-3 p-3.5 rounded-2xl neu-inset text-xs text-ink-secondary space-y-2">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2">
+              <span class="font-semibold text-sky-600 dark:text-sky-400">迁移任务</span>
+              <n-tag size="tiny" :type="migTaskTagType">{{ migTaskTagLabel }}</n-tag>
+              <span class="text-[11px] text-ink-muted font-mono">{{ migTask.id.slice(0, 8) }}</span>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <n-button v-if="migTaskRunning" size="tiny" secondary @click="resumeMigrationTask(migTask.id)">
+                重新载入进度
+              </n-button>
+              <n-button v-if="migTaskRunning" size="tiny" type="error" secondary @click="cancelMigrationTask">
+                取消迁移
+              </n-button>
+            </div>
+          </div>
+          <n-progress
+            v-if="migTask.total > 0"
+            type="line"
+            :percentage="migTaskPercent"
+            :status="migTask.status === 'failed' ? 'error' : migTask.status === 'completed' ? 'success' : 'default'"
+            :height="8"
+          />
+          <div class="text-[11px]">
+            {{ migTask.message || '等待执行…' }}
+            <span v-if="migTask.total > 0" class="text-ink-muted">（{{ migTask.progress }} / {{ migTask.total }}）</span>
+          </div>
+          <div v-if="migTask.error" class="text-rose-500 break-all">错误：{{ migTask.error }}</div>
+          <div v-if="migTask.status === 'completed'" class="text-[11px] text-emerald-600 dark:text-emerald-400">
+            迁移完成，可返回「后台任务」查看完整记录。
+          </div>
+        </div>
 
         <!-- Preview Report -->
         <div
@@ -247,8 +284,8 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
-import { NButton, NCard, NCheckbox, NForm, NFormItem, NInput, useMessage } from 'naive-ui'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { NButton, NCard, NCheckbox, NForm, NFormItem, NInput, NProgress, NTag, useMessage } from 'naive-ui'
 import { apiFetch, getToken } from '../api/client'
 import DirectoryPicker from './DirectoryPicker.vue'
 
@@ -278,6 +315,44 @@ const migForm = reactive({
 })
 const migPreview = ref<any>(null)
 const migLoading = ref(false)
+
+// Background migration task state. The import runs server-side in the task queue, so the
+// wizard keeps only the task id here and polls it: a page reload or a closed tab never
+// interrupts the migration.
+const migTask = ref<any>(null)
+const migTaskId = ref('')
+let migPollTimer: ReturnType<typeof setInterval> | null = null
+const MIG_TASK_STORAGE_KEY = 'emby-lite:migrate-task-id'
+
+const migTaskRunning = computed(() => {
+  const st = migTask.value?.status
+  return st === 'pending' || st === 'running'
+})
+const migTaskPercent = computed(() => {
+  const t = migTask.value
+  if (!t || !t.total) return 0
+  return Math.min(100, Math.round((t.progress / t.total) * 100))
+})
+const migTaskTagLabel = computed(() => {
+  switch (migTask.value?.status) {
+    case 'pending': return '排队中'
+    case 'running': return '迁移中'
+    case 'completed': return '已完成'
+    case 'failed': return '失败'
+    case 'cancelled': return '已取消'
+    default: return '未知'
+  }
+})
+const migTaskTagType = computed<'default' | 'info' | 'success' | 'warning' | 'error'>(() => {
+  switch (migTask.value?.status) {
+    case 'pending': return 'default'
+    case 'running': return 'info'
+    case 'completed': return 'success'
+    case 'failed': return 'error'
+    case 'cancelled': return 'warning'
+    default: return 'default'
+  }
+})
 
 // Visual directory picker state
 const pickerOpen = ref(false)
@@ -412,18 +487,105 @@ async function previewMigration() {
 async function runMigration() {
   migLoading.value = true
   try {
+    // The endpoint only enqueues the job and returns 202 with a task id.
     const res = await apiFetch('/api/admin/migration/emby/import', {
       method: 'POST',
       body: JSON.stringify(buildMigrationPayload()),
     })
-    message.success(
-      `迁移完成：媒体库 +${res.libraries_created}，影视条目 +${res.items_imported}，用户 +${res.users_created}，观看记录 +${res.watch_imported}`,
-    )
-    await load()
+    migPreview.value = null
+    await resumeMigrationTask(res.task_id)
+    message.success(res.queued ? '迁移任务已提交后台执行' : '已有相同的迁移任务在执行中')
   } catch (e: any) {
-    message.error(e.message || '迁移失败')
+    message.error(e.message || '迁移提交失败')
   } finally {
     migLoading.value = false
+  }
+}
+
+async function fetchMigrationTask(taskId: string) {
+  return await apiFetch(`/api/admin/tasks/${taskId}`)
+}
+
+// clearStoredMigrationTask forgets the tracked job so a reload starts a clean wizard.
+function clearStoredMigrationTask() {
+  migTaskId.value = ''
+  try {
+    localStorage.removeItem(MIG_TASK_STORAGE_KEY)
+  } catch {
+    // storage may be unavailable; the in-memory state above is enough
+  }
+}
+
+function stopMigrationPolling() {
+  if (migPollTimer) {
+    clearInterval(migPollTimer)
+    migPollTimer = null
+  }
+}
+
+// resumeMigrationTask reattaches the wizard to a running job, e.g. after a page reload.
+async function resumeMigrationTask(taskId: string) {
+  migTaskId.value = taskId
+  try {
+    localStorage.setItem(MIG_TASK_STORAGE_KEY, taskId)
+  } catch {
+    // storage can be unavailable in private mode; polling still works this session
+  }
+  stopMigrationPolling()
+  try {
+    migTask.value = await fetchMigrationTask(taskId)
+  } catch {
+    // The task row is gone (fresh database or pruned history): drop the stale handle
+    // instead of retrying it on every page load.
+    migTask.value = null
+    clearStoredMigrationTask()
+    return
+  }
+  if (migTaskRunning.value) {
+    migPollTimer = setInterval(pollMigrationTask, 2000)
+  } else {
+    await settleMigrationTask()
+  }
+}
+
+async function pollMigrationTask() {
+  if (!migTaskId.value) return
+  try {
+    migTask.value = await fetchMigrationTask(migTaskId.value)
+  } catch {
+    return
+  }
+  if (!migTaskRunning.value) {
+    stopMigrationPolling()
+    await settleMigrationTask()
+  }
+}
+
+// settleMigrationTask reports the final outcome once the task leaves pending/running.
+async function settleMigrationTask() {
+  const t = migTask.value
+  if (!t) return
+  // The task reached a terminal state, so a later page load should not reattach to it.
+  clearStoredMigrationTask()
+  if (t.status === 'completed') {
+    message.success(t.message || '迁移完成')
+    await load()
+  } else if (t.status === 'failed') {
+    message.error(`迁移失败：${t.error || t.message || '未知错误'}`)
+  } else if (t.status === 'cancelled') {
+    message.warning('迁移已取消')
+  }
+}
+
+async function cancelMigrationTask() {
+  if (!migTask.value?.id) return
+  try {
+    await apiFetch(`/api/admin/tasks/${migTask.value.id}/cancel`, { method: 'POST' })
+    message.success('已请求取消迁移')
+    stopMigrationPolling()
+    await resumeMigrationTask(migTask.value.id)
+  } catch (e: any) {
+    message.error(e.message || '取消失败')
   }
 }
 
@@ -445,5 +607,17 @@ async function deleteKey(id: string) {
   await load()
 }
 
-onMounted(load)
+onMounted(async () => {
+  await load()
+  // Reattach to a migration started before this page load, so a refresh never hides progress.
+  let saved = ''
+  try {
+    saved = localStorage.getItem(MIG_TASK_STORAGE_KEY) || ''
+  } catch {
+    saved = ''
+  }
+  if (saved) await resumeMigrationTask(saved)
+})
+
+onBeforeUnmount(stopMigrationPolling)
 </script>
