@@ -66,12 +66,14 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 	now := time.Now().UTC()
 	deletedAt := now.Add(-time.Hour)
 	t1 := now.Add(-10 * time.Minute)
+	t1Older := now.Add(-15 * time.Minute)
+	t1EvenOlder := now.Add(-18 * time.Minute)
 	t2 := now.Add(-20 * time.Minute)
 	t3 := now.Add(-30 * time.Minute)
 	t4 := now.Add(-40 * time.Minute)
 	t5 := now.Add(-50 * time.Minute)
 
-	// 1. Standard linked Series -> Season -> Episode (no own episode Primary image; Series has Primary/Backdrop/Thumb/Logo)
+	// 1. Standard linked Series -> Season -> multiple resumable Episodes (must dedup to the most recently watched epNormal)
 	series1 := model.Item{
 		ID: "ser-1", LibraryID: lib.ID, ParentID: lib.ID, Type: "Series",
 		Name: "绝命毒师", SortName: "绝命毒师", IsFolder: true,
@@ -88,12 +90,35 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 		DirPath: "/media/tv/绝命毒师/Season 1",
 		ScanKey: "ep-normal", RandomKey: "r3", AddedAt: now, CreatedAt: now, UpdatedAt: now,
 	}
-
-	// 2. Episode with EMPTY SeriesID, only linked via SeasonID -> Season -> Series
-	epViaSeason := model.Item{
-		ID: "ep-via-season", LibraryID: lib.ID, ParentID: season1.ID, SeriesID: "", SeasonID: season1.ID, Type: "Episode",
-		Name: "第 7 集", SortName: "001-0007", SeasonNum: 1, EpisodeNum: 7, RuntimeTicks: 3000 * 1e7,
+	epNormalOlder := model.Item{
+		ID: "ep-normal-older", LibraryID: lib.ID, ParentID: season1.ID, SeriesID: series1.ID, SeasonID: season1.ID, Type: "Episode",
+		Name: "灰色物质", SortName: "001-0005", SeasonNum: 1, EpisodeNum: 5, RuntimeTicks: 3000 * 1e7,
 		DirPath: "/media/tv/绝命毒师/Season 1",
+		ScanKey: "ep-normal-older", RandomKey: "r3b", AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	// Another older episode under ser-1 with empty SeriesID (must still collapse into ser-1 via SeasonID!)
+	epNormalViaSeasonDup := model.Item{
+		ID: "ep-normal-season-dup", LibraryID: lib.ID, ParentID: season1.ID, SeriesID: "", SeasonID: season1.ID, Type: "Episode",
+		Name: "癌症患者", SortName: "001-0004", SeasonNum: 1, EpisodeNum: 4, RuntimeTicks: 3000 * 1e7,
+		DirPath: "/media/tv/绝命毒师/Season 1",
+		ScanKey: "ep-normal-season-dup", RandomKey: "r3c", AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+
+	// 2. Separate Series whose Episode has EMPTY SeriesID, only linked via SeasonID -> Season -> Series
+	series2 := model.Item{
+		ID: "ser-2", LibraryID: lib.ID, ParentID: lib.ID, Type: "Series",
+		Name: "太平年", SortName: "太平年", IsFolder: true,
+		ScanKey: "ser-2", RandomKey: "r4a", AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	season2 := model.Item{
+		ID: "sea-2", LibraryID: lib.ID, ParentID: series2.ID, SeriesID: series2.ID, Type: "Season",
+		Name: "第 1 季", SortName: "001", SeasonNum: 1, IsFolder: true,
+		ScanKey: "sea-2", RandomKey: "r4b", AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	epViaSeason := model.Item{
+		ID: "ep-via-season", LibraryID: lib.ID, ParentID: season2.ID, SeriesID: "", SeasonID: season2.ID, Type: "Episode",
+		Name: "第 7 集", SortName: "001-0007", SeasonNum: 1, EpisodeNum: 7, RuntimeTicks: 3000 * 1e7,
+		DirPath: "/media/tv/太平年/Season 1",
 		ScanKey: "ep-via-season", RandomKey: "r4", AddedAt: now, CreatedAt: now, UpdatedAt: now,
 	}
 
@@ -110,7 +135,14 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 		ScanKey: "ep-softdel", RandomKey: "r6", AddedAt: now, CreatedAt: now, UpdatedAt: now,
 	}
 
-	// 4. Episode with dangling SeriesID and missing Season row (falls back to DirPath folder name!)
+	// 4. Two episodes sharing dangling SeriesID AND identical LastPlayedAt/UpdatedAt:
+	//    must dedup to the higher episode number (E22 over E09) and fall back to DirPath folder name!
+	epPathFallbackOld := model.Item{
+		ID: "ep-path-old", LibraryID: lib.ID, ParentID: lib.ID, SeriesID: "missing-series", SeasonID: "", Type: "Episode",
+		Name: "第 9 集", SortName: "001-0009", SeasonNum: 1, EpisodeNum: 9, RuntimeTicks: 2700 * 1e7,
+		DirPath: "/media/tv/西游记后传 (2000)/Season 1",
+		ScanKey: "ep-path-old", RandomKey: "r7a", AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
 	epPathFallback := model.Item{
 		ID: "ep-path", LibraryID: lib.ID, ParentID: lib.ID, SeriesID: "missing-series", SeasonID: "", Type: "Episode",
 		Name: "第 22 集", SortName: "001-0022", SeasonNum: 1, EpisodeNum: 22, RuntimeTicks: 2700 * 1e7,
@@ -118,14 +150,20 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 		ScanKey: "ep-path", RandomKey: "r7", AddedAt: now, CreatedAt: now, UpdatedAt: now,
 	}
 
-	// 5. Resumable Movie for IncludeItemTypes / ExcludeItemTypes filter verification
+	// 5. Resumable Movie for IncludeItemTypes / ExcludeItemTypes filter verification (movies are never collapsed)
 	movie := model.Item{
 		ID: "mov-1", LibraryID: lib.ID, ParentID: lib.ID, Type: "Movie",
 		Name: "沙丘", SortName: "沙丘", RuntimeTicks: 9000 * 1e7,
 		ScanKey: "mov-1", RandomKey: "r8", AddedAt: now, CreatedAt: now, UpdatedAt: now,
 	}
 
-	for _, it := range []model.Item{series1, season1, epNormal, epViaSeason, seriesSoftDel, epSoftDelSeries, epPathFallback, movie} {
+	for _, it := range []model.Item{
+		series1, season1, epNormal, epNormalOlder, epNormalViaSeasonDup,
+		series2, season2, epViaSeason,
+		seriesSoftDel, epSoftDelSeries,
+		epPathFallbackOld, epPathFallback,
+		movie,
+	} {
 		if err := srv.DB.Gorm.Create(&it).Error; err != nil {
 			t.Fatalf("create item %s: %v", it.ID, err)
 		}
@@ -137,6 +175,7 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 		{ID: "img-s1-b", ItemID: series1.ID, Kind: "Backdrop", IndexNum: 0, SourceType: "local", SourceRef: "/tmp/s1-bg.jpg", Tag: "s1backdroptag", UpdatedAt: now},
 		{ID: "img-s1-t", ItemID: series1.ID, Kind: "Thumb", IndexNum: 0, SourceType: "local", SourceRef: "/tmp/s1-thumb.jpg", Tag: "s1thumbtag", UpdatedAt: now},
 		{ID: "img-s1-l", ItemID: series1.ID, Kind: "Logo", IndexNum: 0, SourceType: "local", SourceRef: "/tmp/s1-logo.png", Tag: "s1logotag", UpdatedAt: now},
+		{ID: "img-s2-p", ItemID: series2.ID, Kind: "Primary", IndexNum: 0, SourceType: "local", SourceRef: "/tmp/s2-poster.jpg", Tag: "s2primarytag", UpdatedAt: now},
 	} {
 		if err := srv.DB.Gorm.Create(&img).Error; err != nil {
 			t.Fatalf("create image %d: %v", i, err)
@@ -146,8 +185,11 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 	// All UserData rows share identical UpdatedAt (mimicking Emby migration) but distinct LastPlayedAt.
 	for _, ud := range []model.UserData{
 		{UserID: uid, ItemID: epNormal.ID, PositionTicks: 1200 * 1e7, Played: false, LastPlayedAt: &t1, UpdatedAt: now},
+		{UserID: uid, ItemID: epNormalOlder.ID, PositionTicks: 1100 * 1e7, Played: false, LastPlayedAt: &t1Older, UpdatedAt: now},
+		{UserID: uid, ItemID: epNormalViaSeasonDup.ID, PositionTicks: 1050 * 1e7, Played: false, LastPlayedAt: &t1EvenOlder, UpdatedAt: now},
 		{UserID: uid, ItemID: epViaSeason.ID, PositionTicks: 1000 * 1e7, Played: false, LastPlayedAt: &t2, UpdatedAt: now},
 		{UserID: uid, ItemID: epSoftDelSeries.ID, PositionTicks: 900 * 1e7, Played: false, LastPlayedAt: &t3, UpdatedAt: now},
+		{UserID: uid, ItemID: epPathFallbackOld.ID, PositionTicks: 850 * 1e7, Played: false, LastPlayedAt: &t4, UpdatedAt: now},
 		{UserID: uid, ItemID: epPathFallback.ID, PositionTicks: 800 * 1e7, Played: false, LastPlayedAt: &t4, UpdatedAt: now},
 		{UserID: uid, ItemID: movie.ID, PositionTicks: 700 * 1e7, Played: false, LastPlayedAt: &t5, UpdatedAt: now},
 	} {
@@ -156,7 +198,7 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 		}
 	}
 
-	// --- Case A: Yamby / Standard Emby client on /Items/Resume ---
+	// --- Case A: Yamby / Standard Emby client on /Items/Resume (8 raw rows -> 5 deduplicated items) ---
 	yambyHeaders := map[string]string{
 		"X-Emby-Authorization": `MediaBrowser Client="Yamby", Device="Pixel 9", DeviceId="yamby-1", Version="1.0.9"`,
 	}
@@ -172,15 +214,28 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 		t.Fatalf("decode Yamby resume: %v", err)
 	}
 	if res.TotalRecordCount != 5 || len(res.Items) != 5 {
-		t.Fatalf("expected 5 resume items, got total=%d len=%d", res.TotalRecordCount, len(res.Items))
+		t.Fatalf("expected 5 deduplicated resume items, got total=%d len=%d", res.TotalRecordCount, len(res.Items))
 	}
 
-	// Verify LastPlayedAt ordering (most recently played first).
+	// Verify LastPlayedAt ordering + tie-break by latest episode number (E22 over E09).
 	wantOrder := []string{epNormal.ID, epViaSeason.ID, epSoftDelSeries.ID, epPathFallback.ID, movie.ID}
 	for i, wantID := range wantOrder {
 		if gotID, _ := res.Items[i]["Id"].(string); gotID != wantID {
 			t.Fatalf("resume order[%d] = %q, want %q", i, gotID, wantID)
 		}
+	}
+
+	// Verify pagination after deduplication (StartIndex=1, Limit=2 -> epViaSeason, epSoftDelSeries, TotalRecordCount=5).
+	rec = doEmbyReq(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/Resume?StartIndex=1&Limit=2", tok, yambyHeaders)
+	var paged struct {
+		TotalRecordCount int              `json:"TotalRecordCount"`
+		StartIndex       int              `json:"StartIndex"`
+		Items            []map[string]any `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &paged)
+	if paged.TotalRecordCount != 5 || paged.StartIndex != 1 || len(paged.Items) != 2 ||
+		paged.Items[0]["Id"] != epViaSeason.ID || paged.Items[1]["Id"] != epSoftDelSeries.ID {
+		t.Fatalf("deduplicated pagination mismatch: %#v", paged)
 	}
 
 	byID := map[string]map[string]any{}
@@ -207,7 +262,7 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 
 	// 2. Episode with empty SeriesID recovered SeriesId + SeriesName + Series artwork via SeasonID!
 	got2 := byID[epViaSeason.ID]
-	if got2["SeriesName"] != "绝命毒师" || got2["SeriesId"] != series1.ID || got2["SeriesPrimaryImageTag"] == nil {
+	if got2["SeriesName"] != "太平年" || got2["SeriesId"] != series2.ID || got2["SeriesPrimaryImageTag"] == nil {
 		t.Fatalf("epViaSeason failed to recover Series via SeasonID: %#v", got2)
 	}
 
@@ -231,7 +286,7 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &epOnly)
 	if epOnly.TotalRecordCount != 4 || len(epOnly.Items) != 4 {
-		t.Fatalf("IncludeItemTypes=Episode expected 4, got total=%d len=%d", epOnly.TotalRecordCount, len(epOnly.Items))
+		t.Fatalf("IncludeItemTypes=Episode expected 4 deduplicated episodes, got total=%d len=%d", epOnly.TotalRecordCount, len(epOnly.Items))
 	}
 	rec = doEmbyReq(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/Resume?MediaTypes=Audio", tok, yambyHeaders)
 	var audioOnly struct {
@@ -252,9 +307,13 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 		t.Fatalf("Filmly resume status=%d body=%s", rec.Code, rec.Body.String())
 	}
 	var filmlyRes struct {
-		Items []map[string]any `json:"Items"`
+		TotalRecordCount int              `json:"TotalRecordCount"`
+		Items            []map[string]any `json:"Items"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &filmlyRes)
+	if filmlyRes.TotalRecordCount != 5 || len(filmlyRes.Items) != 5 {
+		t.Fatalf("Filmly resume expected 5 deduplicated items, got total=%d len=%d", filmlyRes.TotalRecordCount, len(filmlyRes.Items))
+	}
 	filmlyByID := map[string]map[string]any{}
 	for _, it := range filmlyRes.Items {
 		id, _ := it["Id"].(string)
@@ -275,9 +334,9 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 			t.Fatalf("Filmly UserData identity mismatch: %#v", ud)
 		}
 	}
-	// Duplicate "第 7 集" / "第 22 集" must not become "绝命毒师 第7集 第 7 集"!
-	if f2 := filmlyByID[epViaSeason.ID]; f2["Name"] != "绝命毒师 第7集" {
-		t.Fatalf("Filmly duplicate episode label = %#v, want '绝命毒师 第7集'", f2["Name"])
+	// Duplicate "第 7 集" / "第 22 集" must not become "太平年 第7集 第 7 集"!
+	if f2 := filmlyByID[epViaSeason.ID]; f2["Name"] != "太平年 第7集" {
+		t.Fatalf("Filmly duplicate episode label = %#v, want '太平年 第7集'", f2["Name"])
 	}
 	if f4 := filmlyByID[epPathFallback.ID]; f4["Name"] != "西游记后传 第22集" {
 		t.Fatalf("Filmly path-fallback episode title = %#v, want '西游记后传 第22集'", f4["Name"])
@@ -297,13 +356,23 @@ func TestResumeEpisodeSeriesNameArtworkAndClientCompat(t *testing.T) {
 		t.Fatalf("Yamby resume response polluted by Filmly cache: %#v", yambyAgain.Items[0])
 	}
 
-	// Verify /Items?Filters=IsResumable also applies SeriesName + Filmly compat cleanly.
+	// Verify /Items?Filters=IsResumable also deduplicates per-series and applies Filmly compat cleanly.
 	rec = doEmbyReq(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?Filters=IsResumable&Recursive=true&IncludeItemTypes=Episode", tok, filmlyHeaders)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "绝命毒师 第6集 空手套白狼") {
+	var filmlyFilterRes struct {
+		TotalRecordCount int              `json:"TotalRecordCount"`
+		Items            []map[string]any `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &filmlyFilterRes)
+	if rec.Code != http.StatusOK || filmlyFilterRes.TotalRecordCount != 4 || !strings.Contains(rec.Body.String(), "绝命毒师 第6集 空手套白狼") {
 		t.Fatalf("Filmly IsResumable query failed: %d %s", rec.Code, rec.Body.String())
 	}
 	rec = doEmbyReq(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?Filters=IsResumable&Recursive=true&IncludeItemTypes=Episode", tok, yambyHeaders)
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"SeriesName":"绝命毒师"`) {
+	var yambyFilterRes struct {
+		TotalRecordCount int              `json:"TotalRecordCount"`
+		Items            []map[string]any `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &yambyFilterRes)
+	if rec.Code != http.StatusOK || yambyFilterRes.TotalRecordCount != 4 || !strings.Contains(rec.Body.String(), `"SeriesName":"绝命毒师"`) {
 		t.Fatalf("Yamby IsResumable query failed: %d %s", rec.Code, rec.Body.String())
 	}
 }

@@ -717,6 +717,50 @@ func (h *Handler) GetItems(c *gin.Context) {
 	wantUnplayed := strings.EqualFold(isPlayed, "false") || containsCI(filters, "IsUnplayed")
 	wantResumable := containsCI(filters, "IsResumable")
 
+	// When a client queries Continue Watching via /Items?Filters=IsResumable without extra catalog
+	// filters, reuse the same per-series deduplicated Resume query and ordering as /Items/Resume.
+	if wantResumable && uid != "" &&
+		!wantFav && !wantPlayed && !wantUnplayed &&
+		idsParam == "" && len(excludeIDs) == 0 && searchTerm == "" &&
+		nameStartsWith == "" && nameStartsWithOrGreater == "" && nameLessThan == "" &&
+		len(genres) == 0 && len(tags) == 0 && len(studios) == 0 &&
+		len(years) == 0 && len(officialRatings) == 0 && minRatingStr == "" &&
+		len(personIDs) == 0 && personName == "" && isFolderParam == "" &&
+		!strings.HasPrefix(parentID, "vlib-") {
+		needDetail := fieldsNeedDetail(queryCI(c, "Fields"))
+		out, total := h.buildResumeDTOsWithOpts(c.Request, p, visibleIDs, resumeQueryOpts{
+			ParentID:     parentID,
+			IncludeTypes: includeTypes,
+			ExcludeTypes: excludeTypes,
+			MediaTypes:   splitCSV(queryCI(c, "MediaTypes")),
+			StartIndex:   startIndex,
+			Limit:        limit,
+			Detail:       needDetail,
+		})
+		if isFilmlyRequest(c, p) {
+			applyFilmlyResumeCompatibility(out)
+		}
+		hasMore := int64(startIndex+len(out)) < total
+		nextCursor := ""
+		if hasMore {
+			nextCursor = signCursor(h.auth.ImageSecret(), cursorPayload{
+				Offset:    startIndex + len(out),
+				Limit:     limit,
+				ScopeHash: scopeHash,
+				Exp:       time.Now().Add(15 * time.Minute).Unix(),
+			})
+			c.Header("X-Next-Cursor", nextCursor)
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"Items":            out,
+			"TotalRecordCount": total,
+			"StartIndex":       startIndex,
+			"NextCursor":       nextCursor,
+			"HasMore":          hasMore,
+		})
+		return
+	}
+
 	if uid != "" {
 		if wantFav {
 			q = q.Where("items.id IN (SELECT item_id FROM user_data WHERE user_id = ? AND is_favorite = ?)", uid, true)

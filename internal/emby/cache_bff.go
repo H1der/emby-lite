@@ -172,14 +172,65 @@ func (h *Handler) buildResumeDTOsWithOpts(r *http.Request, p *auth.Principal, vi
 	if exc := normalizeItemTypes(opts.ExcludeTypes); len(exc) > 0 {
 		base = base.Where("items.type NOT IN ?", exc)
 	}
-	var total int64
-	_ = base.Session(&gorm.Session{}).Count(&total).Error
-	var rows []model.Item
+	type resumeCandidate struct {
+		ID             string
+		Type           string
+		SeriesID       string
+		SeasonID       string
+		SeasonSeriesID string
+	}
+	var candidates []resumeCandidate
 	_ = base.Session(&gorm.Session{}).
-		Select("items.*").
-		Order("COALESCE(user_data.last_played_at, user_data.updated_at) DESC, user_data.updated_at DESC").
-		Offset(opts.StartIndex).Limit(opts.Limit).
-		Find(&rows).Error
+		Select("items.id, items.type, items.series_id, items.season_id, COALESCE(season_parent.series_id, '') AS season_series_id").
+		Joins("LEFT JOIN items AS season_parent ON season_parent.id = items.season_id AND items.type = 'Episode' AND items.series_id = ''").
+		Order("COALESCE(user_data.last_played_at, user_data.updated_at) DESC, user_data.updated_at DESC, items.season_num DESC, items.episode_num DESC, items.id ASC").
+		Scan(&candidates).Error
+
+	// Keep at most one resumable episode per series (most recently watched, breaking ties by latest season/episode).
+	seenSeries := make(map[string]bool, len(candidates))
+	winnerIDs := make([]string, 0, len(candidates))
+	for _, cand := range candidates {
+		if cand.Type == "Episode" {
+			seriesKey := cand.SeriesID
+			if seriesKey == "" {
+				seriesKey = cand.SeasonSeriesID
+			}
+			if seriesKey == "" && cand.SeasonID != "" {
+				seriesKey = "season:" + cand.SeasonID
+			}
+			if seriesKey != "" {
+				if seenSeries[seriesKey] {
+					continue
+				}
+				seenSeries[seriesKey] = true
+			}
+		}
+		winnerIDs = append(winnerIDs, cand.ID)
+	}
+
+	total := int64(len(winnerIDs))
+	if opts.StartIndex >= len(winnerIDs) || opts.Limit <= 0 {
+		return []map[string]any{}, total
+	}
+	end := opts.StartIndex + opts.Limit
+	if end > len(winnerIDs) {
+		end = len(winnerIDs)
+	}
+	pageIDs := winnerIDs[opts.StartIndex:end]
+
+	var fetched []model.Item
+	_ = h.db.Read().Where("id IN ?", pageIDs).Find(&fetched).Error
+	byID := make(map[string]model.Item, len(fetched))
+	for _, it := range fetched {
+		byID[it.ID] = it
+	}
+	rows := make([]model.Item, 0, len(pageIDs))
+	for _, id := range pageIDs {
+		if it, ok := byID[id]; ok {
+			rows = append(rows, it)
+		}
+	}
+
 	dtos := h.itemsToDTOs(r, p, rows, opts.Detail)
 	attachResumeSeriesArtwork(dtos)
 	return dtos, total
