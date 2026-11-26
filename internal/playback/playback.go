@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"emby-lite/internal/auth"
 	"emby-lite/internal/config"
@@ -104,6 +105,7 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 	}
 
 	origin := PublicOrigin(r, s.cfg.Server.PublicURL)
+	seriesNamesByItem := s.resolveEpisodeSeriesNames(items)
 	for _, src := range sources {
 		item := itemByID[src.ItemID]
 		if item == nil {
@@ -123,7 +125,12 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 		if src.ProbeJSON != "" && src.ProbeJSON != "null" {
 			var parsed []map[string]any
 			if json.Unmarshal([]byte(src.ProbeJSON), &parsed) == nil {
-				streams = append(streams, parsed...)
+				for _, st := range parsed {
+					if st == nil {
+						continue
+					}
+					streams = append(streams, normalizeMediaStream(st, len(streams)))
+				}
 			}
 		}
 
@@ -142,7 +149,9 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 				"Title":                  sub.Title,
 				"IsExternal":             sub.IsExternal,
 				"IsExternalUrl":          false,
-				"IsTextSubtitleStream":   true,
+				"IsInterlaced":           false,
+				"IsHearingImpaired":      false,
+				"IsTextSubtitleStream":   isTextSubtitleCodec(sub.Codec, sub.IsExternal),
 				"IsDefault":              sub.IsDefault,
 				"IsForced":               sub.IsForced,
 				"SupportsExternalStream": true,
@@ -151,14 +160,7 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 			})
 		}
 
-		name := item.Name
-		if src.VersionLabel != "" {
-			name = item.Name + " - " + src.VersionLabel
-		} else if sourceCountByItem[item.ID] > 1 {
-			if fallback := fallbackVersionLabel(&src); fallback != "" {
-				name = item.Name + " - " + fallback
-			}
-		}
+		name := formatMediaSourceName(item, seriesNamesByItem[item.ID], &src, sourceCountByItem[item.ID])
 
 		runtimeTicks := item.RuntimeTicks
 		if runtimeTicks == 0 && src.DurationSecs > 0 {
@@ -247,6 +249,252 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 		result[item.ID] = append(result[item.ID], ms)
 	}
 	return result
+}
+
+func (s *Service) resolveEpisodeSeriesNames(items []model.Item) map[string]string {
+	epItems := make([]*model.Item, 0)
+	parentIDSet := make(map[string]bool)
+	for i := range items {
+		if items[i].Type != "Episode" {
+			continue
+		}
+		epItems = append(epItems, &items[i])
+		if items[i].SeriesID != "" {
+			parentIDSet[items[i].SeriesID] = true
+		}
+		if items[i].SeasonID != "" {
+			parentIDSet[items[i].SeasonID] = true
+		}
+		if items[i].ParentID != "" {
+			parentIDSet[items[i].ParentID] = true
+		}
+	}
+	if len(epItems) == 0 {
+		return nil
+	}
+
+	type parentRow struct {
+		ID            string
+		Type          string
+		Name          string
+		SeriesID      string
+		ParentID      string
+		SoftDeletedAt *time.Time
+	}
+	rowsByID := make(map[string]parentRow, len(parentIDSet))
+	load := func(idSet map[string]bool) {
+		ids := make([]string, 0, len(idSet))
+		for id := range idSet {
+			if id != "" {
+				if _, ok := rowsByID[id]; !ok {
+					ids = append(ids, id)
+				}
+			}
+		}
+		if len(ids) == 0 {
+			return
+		}
+		var rows []parentRow
+		_ = s.db.Read().Table("items").
+			Select("id, type, name, series_id, parent_id, soft_deleted_at").
+			Where("id IN ?", ids).
+			Scan(&rows).Error
+		for _, r := range rows {
+			rowsByID[r.ID] = r
+		}
+	}
+	load(parentIDSet)
+
+	secondHop := make(map[string]bool)
+	for _, r := range rowsByID {
+		if r.SeriesID != "" {
+			if _, ok := rowsByID[r.SeriesID]; !ok {
+				secondHop[r.SeriesID] = true
+			}
+		}
+		if r.ParentID != "" && r.Type != "Series" {
+			if _, ok := rowsByID[r.ParentID]; !ok {
+				secondHop[r.ParentID] = true
+			}
+		}
+	}
+	load(secondHop)
+
+	out := make(map[string]string, len(epItems))
+	for _, it := range epItems {
+		candidates := make([]string, 0, 4)
+		addCand := func(id string) {
+			if id == "" {
+				return
+			}
+			for _, c := range candidates {
+				if c == id {
+					return
+				}
+			}
+			candidates = append(candidates, id)
+		}
+		addCand(it.SeriesID)
+		if it.SeasonID != "" {
+			if sr, ok := rowsByID[it.SeasonID]; ok {
+				addCand(sr.SeriesID)
+				if sr.ParentID != "" {
+					if gr, ok := rowsByID[sr.ParentID]; ok && gr.Type == "Series" {
+						addCand(gr.ID)
+					}
+				}
+			}
+		}
+		if it.ParentID != "" {
+			if pr, ok := rowsByID[it.ParentID]; ok {
+				if pr.Type == "Series" {
+					addCand(pr.ID)
+				} else {
+					addCand(pr.SeriesID)
+					if pr.ParentID != "" {
+						if gr, ok := rowsByID[pr.ParentID]; ok && gr.Type == "Series" {
+							addCand(gr.ID)
+						}
+					}
+				}
+			}
+		}
+
+		name := ""
+		for _, cid := range candidates {
+			if r, ok := rowsByID[cid]; ok && r.SoftDeletedAt == nil && r.Type == "Series" && strings.TrimSpace(r.Name) != "" {
+				name = strings.TrimSpace(r.Name)
+				break
+			}
+		}
+		if name == "" {
+			for _, cid := range candidates {
+				if r, ok := rowsByID[cid]; ok && r.SoftDeletedAt == nil && r.Type != "Season" && strings.TrimSpace(r.Name) != "" {
+					name = strings.TrimSpace(r.Name)
+					break
+				}
+			}
+		}
+		if name == "" {
+			for _, cid := range candidates {
+				if r, ok := rowsByID[cid]; ok && r.Type == "Series" && strings.TrimSpace(r.Name) != "" {
+					name = strings.TrimSpace(r.Name)
+					break
+				}
+			}
+		}
+		if name != "" {
+			out[it.ID] = name
+		}
+	}
+	return out
+}
+
+func formatMediaSourceName(item *model.Item, seriesName string, src *model.MediaSource, sourceCount int) string {
+	ver := strings.TrimSpace(src.VersionLabel)
+	if ver == "" && sourceCount > 1 {
+		ver = strings.TrimSpace(fallbackVersionLabel(src))
+	}
+
+	if item.Type == "Episode" {
+		seCode := ""
+		if item.EpisodeNum > 0 {
+			seasonNum := item.SeasonNum
+			if seasonNum < 0 {
+				seasonNum = 0
+			}
+			seCode = fmt.Sprintf("S%02dE%02d", seasonNum, item.EpisodeNum)
+		}
+		base := strings.TrimSpace(seriesName)
+		switch {
+		case base != "" && seCode != "":
+			base = base + " " + seCode
+		case base == "" && seCode != "":
+			if epName := strings.TrimSpace(item.Name); epName != "" {
+				base = seCode + " " + epName
+			} else {
+				base = seCode
+			}
+		case base == "":
+			base = strings.TrimSpace(item.Name)
+		}
+		if ver != "" {
+			if base != "" {
+				return base + " " + ver
+			}
+			return ver
+		}
+		if base != "" {
+			return base
+		}
+		return item.Name
+	}
+
+	if ver != "" {
+		return item.Name + " - " + ver
+	}
+	return item.Name
+}
+
+func normalizeMediaStream(st map[string]any, fallbackIndex int) map[string]any {
+	streamType, _ := st["Type"].(string)
+	if strings.TrimSpace(streamType) == "" {
+		streamType = "Unknown"
+		st["Type"] = streamType
+	}
+	if idx := streamIndexInt(st["Index"]); idx >= 0 {
+		st["Index"] = idx
+	} else {
+		st["Index"] = fallbackIndex
+	}
+	if _, ok := st["IsDefault"].(bool); !ok {
+		st["IsDefault"] = false
+	}
+	if _, ok := st["IsForced"].(bool); !ok {
+		st["IsForced"] = false
+	}
+	isExternal, ok := st["IsExternal"].(bool)
+	if !ok {
+		isExternal = false
+		st["IsExternal"] = false
+	}
+	if _, ok := st["IsInterlaced"].(bool); !ok {
+		st["IsInterlaced"] = false
+	}
+	if _, ok := st["IsHearingImpaired"].(bool); !ok {
+		st["IsHearingImpaired"] = false
+	}
+	if _, ok := st["IsTextSubtitleStream"].(bool); !ok {
+		if strings.EqualFold(streamType, "Subtitle") {
+			codec, _ := st["Codec"].(string)
+			st["IsTextSubtitleStream"] = isTextSubtitleCodec(codec, isExternal)
+		} else {
+			st["IsTextSubtitleStream"] = false
+		}
+	}
+	if _, ok := st["SupportsExternalStream"].(bool); !ok {
+		st["SupportsExternalStream"] = isExternal
+	}
+	return st
+}
+
+func isTextSubtitleCodec(codec string, isExternal bool) bool {
+	c := strings.ToLower(strings.TrimSpace(codec))
+	if c == "" {
+		return isExternal
+	}
+	if strings.Contains(c, "pgs") ||
+		strings.Contains(c, "dvdsub") ||
+		strings.Contains(c, "dvd_subtitle") ||
+		strings.Contains(c, "vobsub") ||
+		strings.Contains(c, "dvbsub") ||
+		strings.Contains(c, "dvb_subtitle") ||
+		strings.Contains(c, "xsub") ||
+		c == "sup" ||
+		c == "sub" {
+		return false
+	}
+	return true
 }
 
 func streamIndexInt(v any) int {

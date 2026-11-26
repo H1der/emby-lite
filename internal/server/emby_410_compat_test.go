@@ -178,6 +178,8 @@ func TestEmby410AndYambyCompatibility(t *testing.T) {
 	_ = srv.DB.Gorm.Create(&model.ItemTag{ItemID: movie.ID, Tag: "IMAX"}).Error
 	_ = srv.DB.Gorm.Create(&model.MediaSource{
 		ID: "src-1", ItemID: movie.ID, SourceType: "local", Path: moviePath, Container: "mkv", FileSize: 13, Width: 3840, Height: 2160,
+		// Legacy ProbeJSON emitted before removing omitempty from IsDefault/IsForced.
+		ProbeJSON: `[{"Type":"Video","Index":0,"Codec":"hevc","Width":3840,"Height":2160,"VideoRange":"HDR10","IsExternal":false},{"Type":"Audio","Index":1,"Codec":"eac3","Channels":6,"IsExternal":false}]`,
 	}).Error
 	_ = srv.DB.Gorm.Create(&model.MediaSource{
 		ID: "src-2", ItemID: movie.ID, SourceType: "local", Path: moviePath, Container: "mkv", FileSize: 13, Width: 1920, Height: 1080,
@@ -198,13 +200,40 @@ func TestEmby410AndYambyCompatibility(t *testing.T) {
 		Name string `json:"Name"`
 		Id   int64  `json:"Id"`
 	}
+	type strictMediaStream struct {
+		Type                   string `json:"Type"`
+		Index                  *int   `json:"Index"`
+		IsDefault              *bool  `json:"IsDefault"`
+		IsForced               *bool  `json:"IsForced"`
+		IsExternal             *bool  `json:"IsExternal"`
+		IsInterlaced           *bool  `json:"IsInterlaced"`
+		IsTextSubtitleStream   *bool  `json:"IsTextSubtitleStream"`
+		SupportsExternalStream *bool  `json:"SupportsExternalStream"`
+	}
+	type strictMediaSource struct {
+		ID           string              `json:"Id"`
+		MediaStreams []strictMediaStream `json:"MediaStreams"`
+	}
+	assertStrictStreams := func(label string, streams []strictMediaStream, minCount int) {
+		t.Helper()
+		if len(streams) < minCount {
+			t.Fatalf("%s: expected at least %d MediaStreams, got %d", label, minCount, len(streams))
+		}
+		for i, st := range streams {
+			if st.Type == "" || st.Index == nil || st.IsDefault == nil || st.IsForced == nil || st.IsExternal == nil || st.IsInterlaced == nil || st.IsTextSubtitleStream == nil || st.SupportsExternalStream == nil {
+				t.Fatalf("%s: stream[%d] missing required EmbyMediaStream fields: %+v", label, i, st)
+			}
+		}
+	}
 	var strictItem struct {
-		ID           string           `json:"Id"`
-		Name         string           `json:"Name"`
-		DisplayOrder string           `json:"DisplayOrder"`
-		GenreItems   []nameLongIDPair `json:"GenreItems"`
-		Studios      []nameLongIDPair `json:"Studios"`
-		TagItems     []nameLongIDPair `json:"TagItems"`
+		ID           string              `json:"Id"`
+		Name         string              `json:"Name"`
+		DisplayOrder string              `json:"DisplayOrder"`
+		GenreItems   []nameLongIDPair    `json:"GenreItems"`
+		Studios      []nameLongIDPair    `json:"Studios"`
+		TagItems     []nameLongIDPair    `json:"TagItems"`
+		MediaSources []strictMediaSource `json:"MediaSources"`
+		MediaStreams []strictMediaStream `json:"MediaStreams"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &strictItem); err != nil {
 		t.Fatalf("strict Yamby BaseItemDto decode failed (type mismatch!): %v body=%s", err, rec.Body.String())
@@ -220,6 +249,39 @@ func TestEmby410AndYambyCompatibility(t *testing.T) {
 	}
 	if len(strictItem.TagItems) != 1 || strictItem.TagItems[0].Id <= 0 {
 		t.Fatalf("invalid TagItems: %+v", strictItem.TagItems)
+	}
+	if len(strictItem.MediaSources) < 1 {
+		t.Fatalf("expected MediaSources in item detail")
+	}
+	assertStrictStreams("item detail MediaSources[0]", strictItem.MediaSources[0].MediaStreams, 3)
+	assertStrictStreams("item detail MediaStreams", strictItem.MediaStreams, 3)
+
+	// Mark favorite and verify Favorites + Search with Fields=MediaSources also normalize legacy ProbeJSON.
+	rec = doJSON(t, h, http.MethodPost, "/emby/Users/"+uid+"/FavoriteItems/"+movie.ID, tok, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mark favorite failed: %d %s", rec.Code, rec.Body.String())
+	}
+	for _, listPath := range []string{
+		"/emby/Users/" + uid + "/Items?Recursive=true&Filters=IsFavorite&Fields=MediaSources",
+		"/emby/Users/" + uid + "/Items?Recursive=true&SearchTerm=Dune&Fields=MediaSources",
+	} {
+		rec = doJSON(t, h, http.MethodGet, listPath, tok, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s failed: %d %s", listPath, rec.Code, rec.Body.String())
+		}
+		var listResp struct {
+			Items []struct {
+				ID           string              `json:"Id"`
+				MediaSources []strictMediaSource `json:"MediaSources"`
+			} `json:"Items"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &listResp); err != nil {
+			t.Fatalf("decode %s failed: %v", listPath, err)
+		}
+		if len(listResp.Items) != 1 || len(listResp.Items[0].MediaSources) < 1 {
+			t.Fatalf("GET %s expected 1 item with MediaSources, got %s", listPath, rec.Body.String())
+		}
+		assertStrictStreams(listPath, listResp.Items[0].MediaSources[0].MediaStreams, 3)
 	}
 
 	// 5. Strict schema check on /Items/Filters2 (NameLongIdPair int64 IDs for Genres, Tags, Studios)
@@ -326,5 +388,106 @@ func TestEmby410AndYambyCompatibility(t *testing.T) {
 	rec = doJSON(t, h, http.MethodPost, "/emby/DisplayPreferences/usersettings", tok, map[string]any{"SortBy": "SortName"})
 	if rec.Code != http.StatusNoContent {
 		t.Fatalf("POST DisplayPreferences failed: %d", rec.Code)
+	}
+}
+
+func TestEpisodeMultiVersionMediaSourceName(t *testing.T) {
+	srv, tmp := setupTestServer(t)
+	h := srv.Handler
+
+	rec := doJSON(t, h, http.MethodPost, "/api/web/setup", "", map[string]any{
+		"username":    "admin",
+		"password":    "SecretPass123!",
+		"server_name": "EmbyLite EpVersion",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup failed: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, h, http.MethodPost, "/emby/Users/AuthenticateByName", "", map[string]any{
+		"Username": "admin",
+		"Pw":       "SecretPass123!",
+	})
+	var login struct {
+		AccessToken string `json:"AccessToken"`
+		User        struct {
+			ID string `json:"Id"`
+		} `json:"User"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &login)
+
+	mediaDir := filepath.Join(tmp, "tv")
+	_ = os.MkdirAll(mediaDir, 0o755)
+	rec = doJSON(t, h, http.MethodPost, "/api/admin/libraries", login.AccessToken, map[string]any{
+		"name":  "剧集",
+		"kind":  "tvshows",
+		"paths": []string{mediaDir},
+	})
+	var libResp struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &libResp)
+
+	now := time.Now().UTC()
+	series := model.Item{
+		ID: "series-lj", LibraryID: libResp.ID, ParentID: libResp.ID, Type: "Series",
+		Name: "两京十五日", SortName: "liangjingshiwuri", ScanKey: "tv:lj", RandomKey: "r1",
+		AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	season := model.Item{
+		ID: "season-lj-1", LibraryID: libResp.ID, ParentID: series.ID, SeriesID: series.ID, Type: "Season",
+		Name: "第 1 季", SortName: "s01", SeasonNum: 1, ScanKey: "tv:lj:s1", RandomKey: "r2",
+		AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	// Intentionally omit SeriesID on ep to verify SeasonID -> Series lookup works too.
+	ep := model.Item{
+		ID: "ep-lj-14", LibraryID: libResp.ID, ParentID: season.ID, SeasonID: season.ID, Type: "Episode",
+		Name: "泥", SortName: "s01e14", SeasonNum: 1, EpisodeNum: 14, ScanKey: "tv:lj:s1e14", RandomKey: "r3",
+		AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	for _, it := range []*model.Item{&series, &season, &ep} {
+		if err := srv.DB.Gorm.Create(it).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = srv.DB.Gorm.Create(&model.MediaSource{
+		ID: "ep-src-hdr", ItemID: ep.ID, SourceType: "strm", Path: filepath.Join(mediaDir, "两京十五日 S01E14 2160p.HDR.strm"),
+		StrmURL: "https://example.com/hdr.mkv", Container: "mkv", Width: 3840, Height: 2160, Bitrate: 12790000, HDRType: "HDR",
+		VersionLabel: "4K HDR",
+	}).Error
+	_ = srv.DB.Gorm.Create(&model.MediaSource{
+		ID: "ep-src-sdr", ItemID: ep.ID, SourceType: "strm", Path: filepath.Join(mediaDir, "两京十五日 S01E14 2160p.strm"),
+		StrmURL: "https://example.com/sdr.mkv", Container: "mkv", Width: 3840, Height: 2160, Bitrate: 4780000,
+		VersionLabel: "4K",
+	}).Error
+
+	for _, endpoint := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/emby/Users/" + login.User.ID + "/Items/" + ep.ID},
+		{http.MethodPost, "/emby/Users/" + login.User.ID + "/Items/" + ep.ID + "/PlaybackInfo"},
+	} {
+		rec = doJSON(t, h, endpoint.method, endpoint.path, login.AccessToken, map[string]any{})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s %s failed: %d %s", endpoint.method, endpoint.path, rec.Code, rec.Body.String())
+		}
+		var resp struct {
+			MediaSources []struct {
+				ID   string `json:"Id"`
+				Name string `json:"Name"`
+			} `json:"MediaSources"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode %s failed: %v", endpoint.path, err)
+		}
+		if len(resp.MediaSources) != 2 {
+			t.Fatalf("%s: expected 2 MediaSources, got %+v", endpoint.path, resp.MediaSources)
+		}
+		if resp.MediaSources[0].Name != "两京十五日 S01E14 4K HDR" {
+			t.Fatalf("%s: MediaSources[0].Name = %q, want %q", endpoint.path, resp.MediaSources[0].Name, "两京十五日 S01E14 4K HDR")
+		}
+		if resp.MediaSources[1].Name != "两京十五日 S01E14 4K" {
+			t.Fatalf("%s: MediaSources[1].Name = %q, want %q", endpoint.path, resp.MediaSources[1].Name, "两京十五日 S01E14 4K")
+		}
 	}
 }

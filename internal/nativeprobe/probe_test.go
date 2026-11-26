@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -157,5 +158,26 @@ func TestProbeMKV(t *testing.T) {
 	}
 	if len(res.Streams) != 2 || res.Streams[1].Codec != "ac3" || res.Streams[1].Language != "chi" || res.Streams[1].Channels != 6 {
 		t.Fatalf("unexpected MKV audio stream: %+v", res.Streams)
+	}
+
+	// Emby/Yamby strict serializers require explicit IsDefault/IsForced booleans even when false.
+	raw, err := json.Marshal(res.Streams)
+	if err != nil {
+		t.Fatalf("marshal streams: %v", err)
+	}
+	var decoded []map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("unmarshal streams: %v", err)
+	}
+	for i, st := range decoded {
+		if _, ok := st["IsDefault"].(bool); !ok {
+			t.Fatalf("stream[%d] missing bool IsDefault: %s", i, string(raw))
+		}
+		if _, ok := st["IsForced"].(bool); !ok {
+			t.Fatalf("stream[%d] missing bool IsForced: %s", i, string(raw))
+		}
+		if _, ok := st["IsExternal"].(bool); !ok {
+			t.Fatalf("stream[%d] missing bool IsExternal: %s", i, string(raw))
+		}
 	}
 }

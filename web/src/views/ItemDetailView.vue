@@ -386,6 +386,16 @@ function sourceLabel(src: any, idx: number): string {
   if (full.startsWith(prefix) && full.length > prefix.length) {
     return full.slice(prefix.length)
   }
+  if (item.value?.Type === 'Episode') {
+    const series = String(item.value?.SeriesName || '').trim()
+    const epNum = Number(item.value?.IndexNumber || 0)
+    const seasonNum = Math.max(0, Number(item.value?.ParentIndexNumber || 0))
+    const seCode = epNum > 0 ? `S${String(seasonNum).padStart(2, '0')}E${String(epNum).padStart(2, '0')}` : ''
+    const epPrefix = [series, seCode].filter(Boolean).join(' ') + ' '
+    if (epPrefix.trim() && full.startsWith(epPrefix) && full.length > epPrefix.length) {
+      return full.slice(epPrefix.length)
+    }
+  }
   const parts: string[] = []
   const w = Number(src?.Width || 0)
   const h = Number(src?.Height || 0)

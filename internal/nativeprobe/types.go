@@ -13,8 +13,8 @@ type StreamInfo struct {
 	Height      int    `json:"Height,omitempty"`
 	Channels    int    `json:"Channels,omitempty"`
 	VideoRange  string `json:"VideoRange,omitempty"` // SDR | HDR | HDR10 | HLG | DOVI
-	IsDefault   bool   `json:"IsDefault,omitempty"`
-	IsForced    bool   `json:"IsForced,omitempty"`
+	IsDefault   bool   `json:"IsDefault"`
+	IsForced    bool   `json:"IsForced"`
 	IsExternal  bool   `json:"IsExternal"`
 }
 

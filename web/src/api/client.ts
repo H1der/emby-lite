@@ -30,7 +30,7 @@ export async function apiFetch<T = any>(path: string, init: RequestInit = {}): P
   }
   headers.set(
     'X-Emby-Authorization',
-    `MediaBrowser Client="Emby-Lite Web", Device="Browser", DeviceId="${getDeviceId()}", Version="0.3.8"`,
+    `MediaBrowser Client="Emby-Lite Web", Device="Browser", DeviceId="${getDeviceId()}", Version="0.3.9"`,
   )
   if (init.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
