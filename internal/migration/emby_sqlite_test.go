@@ -173,9 +173,15 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = uDB.Exec(`CREATE TABLE LocalUsersv2 (Id INTEGER PRIMARY KEY, guid BLOB, data TEXT)`).Error
+	_ = uDB.Exec(`CREATE TABLE UserSettings (UserId INTEGER NOT NULL, UserSettingsKeyId INTEGER NOT NULL, Value TEXT NOT NULL, PRIMARY KEY (UserId, UserSettingsKeyId))`).Error
+	_ = uDB.Exec(`CREATE TABLE UserSettingsKeys (UserSettingsKeyId INTEGER PRIMARY KEY AUTOINCREMENT, Name TEXT)`).Error
 	_ = uDB.Exec(`INSERT INTO LocalUsersv2 (Id, guid, data) VALUES
-		(1, NULL, '{"Name":"alice","IdString":"alice-guid","Password":"x"}'),
+		(1, NULL, '{"Name":"alice","IdString":"alice-guid","Password":"x","Policy":{"IsAdministrator":true}}'),
 		(2, NULL, '{"Name":"carol","IdString":"carol-guid","Password":"y"}')`).Error
+	_ = uDB.Exec(`INSERT INTO UserSettingsKeys (UserSettingsKeyId, Name) VALUES (1, 'usersettings'), (2, 'usernotifications')`).Error
+	_ = uDB.Exec(`INSERT INTO UserSettings (UserId, UserSettingsKeyId, Value) VALUES
+		(1, 1, '{"Playback":{"MaxStreamingBitrate":120000000}}'),
+		(1, 2, '{"NotificationOptions":[]}')`).Error
 	sqlU, _ := uDB.DB()
 	_ = sqlU.Close()
 
@@ -186,11 +192,19 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 	_ = lDB.Exec(`CREATE TABLE MediaItems (
 		Id INTEGER PRIMARY KEY, guid BLOB, type INTEGER, ParentId INTEGER, Path TEXT, Name TEXT,
 		PremiereDate TEXT, ProductionYear INTEGER, CommunityRating REAL, RunTimeTicks INTEGER,
-		IndexNumber INTEGER, ParentIndexNumber INTEGER, ProviderIds TEXT, UserDataKeyId INTEGER
+		IndexNumber INTEGER, ParentIndexNumber INTEGER, ProviderIds TEXT, Images TEXT, UserDataKeyId INTEGER,
+		SortName TEXT, Overview TEXT,
+		Status TEXT, DisplayOrder INTEGER, CustomRating TEXT, CriticRating REAL, ProductionLocations TEXT, RemoteTrailers TEXT, Tags TEXT
 	)`).Error
 	_ = lDB.Exec(`CREATE TABLE ItemLinks2 (ItemId INTEGER, Type INTEGER, LinkedId INTEGER, LinkOrder INTEGER)`).Error
+	_ = lDB.Exec(`CREATE TABLE ItemPeople2 (ItemId INTEGER, PersonId INTEGER, Role TEXT, PersonType INTEGER NOT NULL, ListOrder INTEGER)`).Error
 	_ = lDB.Exec(`CREATE TABLE UserDataKeys2 (Id INTEGER PRIMARY KEY, UserDataKey TEXT)`).Error
 	_ = lDB.Exec(`CREATE TABLE UserDatas (UserDataKeyId INTEGER, userId INTEGER, played INTEGER, playCount INTEGER, isFavorite INTEGER, playbackPositionTicks INTEGER, LastPlayedDateInt INTEGER)`).Error
+	_ = lDB.Exec(`CREATE TABLE Chapters3 (ItemId INTEGER, ChapterIndex INTEGER, StartPositionTicks INTEGER, Name TEXT, ImagePath TEXT, ImageDateModified TEXT, MarkerType INTEGER, PRIMARY KEY (ItemId, ChapterIndex))`).Error
+	_ = lDB.Exec(`CREATE TABLE MediaStreams2 (ItemId INTEGER, StreamIndex INTEGER, StreamType INTEGER, Codec TEXT, Language TEXT, Path TEXT, Width INTEGER, Height INTEGER, IsExternal INTEGER, IsDefault INTEGER, Title TEXT, PRIMARY KEY (ItemId, StreamIndex))`).Error
+	_ = lDB.Exec(`CREATE TABLE ItemExtradataTypes (ExtradataTypeId INTEGER PRIMARY KEY, Name TEXT)`).Error
+	_ = lDB.Exec(`CREATE TABLE ItemExtradata (ItemId INTEGER, ExtradataTypeId INTEGER, Value TEXT, PRIMARY KEY (ItemId, ExtradataTypeId))`).Error
+	_ = lDB.Exec(`INSERT INTO ItemExtradataTypes (ExtradataTypeId, Name) VALUES (1, 'IntroDetectionExtradata'), (2, 'LibraryOptions')`).Error
 
 	// Root + "Media Folders" pseudo library, then two real libraries (type 4)
 	// that only reference their physical folders through ItemLinks2 type 8.
@@ -199,19 +213,26 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 		(11, 2, 10, NULL, 'Media Folders'),
 		(4, 4, 11, NULL, '电影'),
 		(5, 4, 11, NULL, '电视节目'),
+		(6, 4, 11, NULL, '合集'),
 		(1, 3, 11, '/emby/movies', 'movies'),
 		(2, 3, 11, '/emby/tv', 'tv'),
 		(300, 21, NULL, NULL, '科幻'),
-		(400, 29, NULL, NULL, '传奇影业')`).Error
+		(400, 29, NULL, NULL, '传奇影业'),
+		(700, 34, NULL, NULL, '经典'),
+		(800, 9, NULL, NULL, '诺兰合集')`).Error
+	_ = lDB.Exec(`INSERT INTO ItemExtradata (ItemId, ExtradataTypeId, Value) VALUES (6, 2, '{"ContentType":"boxsets","PathInfos":[],"MinCollectionItems":2}')`).Error
+	_ = lDB.Exec(`UPDATE MediaItems SET Images = 'https://image.tmdb.org/t/p/original/nolan.jpg*0*Primary*1000*1500*null' WHERE Id = 800`).Error
 	_ = lDB.Exec(`INSERT INTO ItemLinks2 (ItemId, Type, LinkedId, LinkOrder) VALUES
 		(4, 8, 1, 0),
 		(5, 8, 2, 0),
 		(100, 2, 300, 0),
-		(100, 3, 400, 0)`).Error
+		(100, 3, 400, 0),
+		(100, 4, 700, 0),
+		(100, 6, 800, 0)`).Error
 
 	// Movie: epoch PremiereDate, no ProductionYear column value, genres/studios only via links.
-	_ = lDB.Exec(`INSERT INTO MediaItems (Id, type, ParentId, Path, Name, PremiereDate, ProductionYear, CommunityRating, RunTimeTicks, ProviderIds, UserDataKeyId) VALUES
-		(100, 5, 1, '/emby/movies/Inception (2010)/Inception.mkv', '盗梦空间', '1293840000', 0, 8.8, 88800000000, 'Tmdb=27205|Imdb=tt1375666', 501)`).Error
+	_ = lDB.Exec(`INSERT INTO MediaItems (Id, type, ParentId, Path, Name, PremiereDate, ProductionYear, CommunityRating, RunTimeTicks, ProviderIds, UserDataKeyId, Status, DisplayOrder, CustomRating, CriticRating, ProductionLocations, RemoteTrailers) VALUES
+		(100, 5, 1, '/emby/movies/Inception (2010)/Inception.mkv', '盗梦空间', '1293840000', 0, 8.8, 88800000000, 'Tmdb=27205|Imdb=tt1375666', 501, '', 1, 'PG-13', 8.5, 'United States of America', 'https://youtube.com/watch?v=abc')`).Error
 	// Series path resolves the library, the season has no path at all and must
 	// inherit it from the series; 203 is an episode hanging off the series.
 	_ = lDB.Exec(`INSERT INTO MediaItems (Id, type, ParentId, Path, Name, IndexNumber, UserDataKeyId) VALUES
@@ -226,6 +247,33 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 		(501, 1, 1, 2, 1, 1234, 1600000000),
 		(502, 1, 1, 1, 0, 0, 1600000100),
 		(503, 2, 0, 0, 1, 0, 1600000200)`).Error
+	_ = lDB.Exec(`INSERT INTO Chapters3 (ItemId, ChapterIndex, StartPositionTicks, Name, MarkerType) VALUES
+		(100, 0, 0, '开场', 0),
+		(100, 1, 30000000, '片头', 1),
+		(100, 2, 60000000, '片尾', 2)`).Error
+	_ = lDB.Exec(`INSERT INTO MediaStreams2 (ItemId, StreamIndex, StreamType, Codec, Language, Path, Width, Height, IsExternal, IsDefault, Title) VALUES
+		(100, 0, 2, 'h264', 'und', '', 1920, 1080, 0, 1, '1080p'),
+		(100, 1, 1, 'aac', 'chi', '', 0, 0, 0, 1, '国语'),
+		(100, 2, 3, 'ass', 'chi', '/emby/subs/inception.ass', 0, 0, 1, 0, '简体中文')`).Error
+	// Person items (type 23) and their links. 900 has a remote portrait and a
+	// TMDB id; the movie carries every major PersonType to prove nothing is dropped.
+	_ = lDB.Exec(`INSERT INTO MediaItems (Id, type, Name, ProviderIds, Images) VALUES
+		(900, 23, '莱昂纳多·迪卡普里奥', 'Tmdb=6193', 'https://image.tmdb.org/t/p/original/leonardo.jpg*0*Primary*0*0*null'),
+		(901, 23, '约瑟夫·高登-莱维特', 'Tmdb=24045', ''),
+		(902, 23, '克里斯托弗·诺兰', 'Tmdb=525', ''),
+		(903, 23, '乔纳森·诺兰', 'Tmdb=1010', ''),
+		(904, 23, '艾玛·托马斯', 'Tmdb=9999', ''),
+		(905, 23, '渡边谦', 'Tmdb=3894', ''),
+		(906, 23, '汉斯·季默', 'Tmdb=947', '')`).Error
+	_ = lDB.Exec(`INSERT INTO ItemPeople2 (ItemId, PersonId, Role, PersonType, ListOrder) VALUES
+		(100, 900, '柯布', 0, 1),
+		(100, 901, '亚瑟', 0, 0),
+		(100, 902, '', 1, 0),
+		(100, 903, '', 2, 0),
+		(100, 904, '', 3, 0),
+		(100, 905, '客串角色', 4, 0),
+		(100, 906, '', 5, 0),
+		(202, 900, '', 0, 0)`).Error
 	sqlL, _ := lDB.DB()
 	_ = sqlL.Close()
 
@@ -239,15 +287,17 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 	defer db.Close()
 
 	svc := NewService(db)
-	req := EmbyMigrationRequest{UsersDBPath: usersPath, LibraryDBPath: libraryPath}
+	snapshotDir := t.TempDir()
+	req := EmbyMigrationRequest{UsersDBPath: usersPath, LibraryDBPath: libraryPath, SnapshotDir: snapshotDir}
 
 	preview, err := svc.Preview(req)
 	if err != nil {
 		t.Fatalf("Preview failed: %v", err)
 	}
-	if preview.LibrariesFound != 2 || preview.MoviesFound != 1 || preview.SeriesFound != 1 ||
-		preview.SeasonsFound != 2 || preview.EpisodesFound != 3 || preview.UsersFound != 2 ||
-		preview.WatchRecordsFound != 3 || preview.MatchedWatchRecords != 3 {
+	if preview.LibrariesFound != 3 || preview.MoviesFound != 1 || preview.SeriesFound != 1 ||
+		preview.SeasonsFound != 2 || preview.EpisodesFound != 3 || preview.BoxSetsFound != 1 ||
+		preview.TagsFound != 1 || preview.ChaptersFound != 3 || preview.StreamsFound != 3 ||
+		preview.UsersFound != 2 || preview.WatchRecordsFound != 3 || preview.MatchedWatchRecords != 3 {
 		t.Fatalf("unexpected preview for Emby 4.9+ schema: %+v", preview)
 	}
 	for _, w := range preview.Warnings {
@@ -260,7 +310,9 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Import failed: %v", err)
 	}
-	if imp.LibrariesCreated != 2 || imp.ItemsImported != 7 || imp.UsersCreated != 2 || imp.WatchImported != 3 {
+	if imp.LibrariesCreated != 3 || imp.ItemsImported != 7 || imp.UsersCreated != 2 || imp.WatchImported != 3 ||
+		imp.TagsImported != 1 || imp.ChaptersImported != 3 || imp.StreamsImported != 3 || imp.BoxSetsImported != 1 ||
+		imp.SettingsImported != 2 {
 		t.Fatalf("unexpected import report: %+v", imp)
 	}
 
@@ -286,6 +338,64 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 	}
 	if !strings.Contains(movie.ProviderIDsJSON, "27205") {
 		t.Fatalf("provider ids not migrated: %q", movie.ProviderIDsJSON)
+	}
+	if movie.CustomRating != "PG-13" || movie.CriticRating != 8.5 || movie.DisplayOrder != 1 || !strings.Contains(movie.ProductionLocationsJSON, "United States") {
+		t.Fatalf("extended movie metadata not migrated: %+v", movie)
+	}
+	if movie.OriginalName != "" {
+		t.Fatalf("unexpected original name: %+v", movie)
+	}
+	var tagCount, chapterCount, subtitleCount, boxSetCount, boxItemCount int64
+	_ = db.Gorm.Model(&model.ItemTag{}).Where("item_id = ?", movie.ID).Count(&tagCount).Error
+	_ = db.Gorm.Model(&model.ItemChapter{}).Where("item_id = ?", movie.ID).Count(&chapterCount).Error
+	_ = db.Gorm.Model(&model.MediaSubtitle{}).Where("item_id = ?", movie.ID).Count(&subtitleCount).Error
+	_ = db.Gorm.Model(&model.BoxSet{}).Count(&boxSetCount).Error
+	_ = db.Gorm.Model(&model.BoxSetItem{}).Count(&boxItemCount).Error
+	if tagCount != 1 || chapterCount != 3 || subtitleCount != 1 || boxSetCount != 1 || boxItemCount != 1 {
+		t.Fatalf("extras not migrated: tags=%d chapters=%d subtitles=%d boxsets=%d boxitems=%d", tagCount, chapterCount, subtitleCount, boxSetCount, boxItemCount)
+	}
+	var boxsetLib model.Library
+	if err := db.Gorm.Where("name = ?", "合集").First(&boxsetLib).Error; err != nil {
+		t.Fatalf("boxsets library missing: %v", err)
+	}
+	if boxsetLib.Kind != "boxsets" {
+		t.Fatalf("boxsets library kind = %q", boxsetLib.Kind)
+	}
+	var boxsetItem model.Item
+	if err := db.Gorm.Where("type = ?", "BoxSet").First(&boxsetItem).Error; err != nil {
+		t.Fatalf("boxset item missing: %v", err)
+	}
+	if boxsetItem.LibraryID != boxsetLib.ID || boxsetItem.ParentID != boxsetLib.ID || !boxsetItem.IsFolder {
+		t.Fatalf("boxset item not attached to boxsets library: %+v", boxsetItem)
+	}
+	var boxsetLink model.BoxSetItem
+	if err := db.Gorm.Where("box_set_id = ?", boxsetItem.ID).First(&boxsetLink).Error; err != nil {
+		t.Fatalf("boxset membership missing: %v", err)
+	}
+	if boxsetLink.ItemID != movie.ID {
+		t.Fatalf("boxset member = %q, want %q", boxsetLink.ItemID, movie.ID)
+	}
+	var boxsetImage model.ItemImage
+	if err := db.Gorm.Where("item_id = ? AND kind = ?", boxsetItem.ID, "primary").First(&boxsetImage).Error; err != nil {
+		t.Fatalf("boxset image missing: %v", err)
+	}
+	if !strings.Contains(boxsetImage.SourceRef, "nolan.jpg") {
+		t.Fatalf("boxset image source = %q", boxsetImage.SourceRef)
+	}
+	var source model.MediaSource
+	if err := db.Gorm.Where("item_id = ?", movie.ID).First(&source).Error; err != nil {
+		t.Fatalf("movie source missing: %v", err)
+	}
+	if !strings.Contains(source.ProbeJSON, "h264") || source.Width != 1920 || source.Height != 1080 {
+		t.Fatalf("probe streams not migrated: %+v", source)
+	}
+	if imp.SnapshotDir == "" || len(imp.SnapshotFiles) != 2 {
+		t.Fatalf("source snapshot missing: %+v", imp)
+	}
+	for _, f := range imp.SnapshotFiles {
+		if st, err := os.Stat(f); err != nil || st.Size() == 0 {
+			t.Fatalf("snapshot file invalid: %s (%v)", f, err)
+		}
 	}
 	var genres []model.ItemGenre
 	_ = db.Gorm.Where("item_id = ?", movie.ID).Find(&genres).Error
@@ -347,6 +457,14 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 	if alice.ID == "" || carol.ID == "" {
 		t.Fatalf("users from LocalUsersv2 JSON not migrated: %+v %+v", alice, carol)
 	}
+	if !alice.IsAdmin || carol.IsAdmin {
+		t.Fatalf("admin flag not migrated: alice=%+v carol=%+v", alice, carol)
+	}
+	var settings []model.UserSetting
+	_ = db.Gorm.Where("user_id = ?", alice.ID).Order("key ASC").Find(&settings).Error
+	if len(settings) != 2 || !strings.Contains(settings[0].Value+settings[1].Value, "MaxStreamingBitrate") {
+		t.Fatalf("user settings not migrated: %+v", settings)
+	}
 	var aliceData model.UserData
 	if err := db.Gorm.Where("user_id = ? AND item_id = ?", alice.ID, movie.ID).First(&aliceData).Error; err != nil {
 		t.Fatalf("watch record not bound to movie: %v", err)
@@ -360,5 +478,133 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 	}
 	if !carolData.IsFavorite {
 		t.Fatalf("unexpected favorite state: %+v", carolData)
+	}
+	if imp.PeopleImported != 8 {
+		t.Fatalf("expected 8 migrated people links, got %+v", imp)
+	}
+
+	var peopleLinks []model.ItemPerson
+	if err := db.Gorm.Where("item_id = ?", movie.ID).Order("sort_idx ASC").Find(&peopleLinks).Error; err != nil {
+		t.Fatalf("load movie people: %v", err)
+	}
+	if len(peopleLinks) != 7 {
+		t.Fatalf("expected 7 movie people links, got %+v", peopleLinks)
+	}
+	wantRoles := []struct{ roleType, roleName string }{
+		{"Actor", "亚瑟"},
+		{"Actor", "柯布"},
+		{"GuestStar", "客串角色"},
+		{"Director", ""},
+		{"Writer", ""},
+		{"Producer", ""},
+		{"Composer", ""},
+	}
+	for i, want := range wantRoles {
+		link := peopleLinks[i]
+		if link.RoleType != want.roleType || link.RoleName != want.roleName {
+			t.Fatalf("role %d mismatch: got %+v want %+v", i, link, want)
+		}
+		if link.SortIdx != i {
+			t.Fatalf("expected sequential sort index %d, got %+v", i, link)
+		}
+	}
+
+	var person model.Person
+	if err := db.Gorm.Where("name = ?", "莱昂纳多·迪卡普里奥").First(&person).Error; err != nil {
+		t.Fatalf("migrated person missing: %v", err)
+	}
+	if person.TMDBID != "6193" || !strings.Contains(person.ThumbPath, "image.tmdb.org") {
+		t.Fatalf("person metadata not migrated: %+v", person)
+	}
+	var producer model.Person
+	if err := db.Gorm.Where("name = ?", "艾玛·托马斯").First(&producer).Error; err != nil {
+		t.Fatalf("producer missing: %v", err)
+	}
+	var producerLink model.ItemPerson
+	if err := db.Gorm.Where("item_id = ? AND person_id = ? AND role_type = ?", movie.ID, producer.ID, "Producer").First(&producerLink).Error; err != nil {
+		t.Fatalf("producer link missing: %v", err)
+	}
+	var personCount int64
+	_ = db.Gorm.Model(&model.Person{}).Count(&personCount).Error
+	if personCount != 7 {
+		t.Fatalf("expected 7 imported people, got %d", personCount)
+	}
+
+	var episodeCast []model.ItemPerson
+	if err := db.Gorm.Where("item_id = ?", ep.ID).Find(&episodeCast).Error; err != nil {
+		t.Fatalf("load episode cast: %v", err)
+	}
+	if len(episodeCast) != 1 || episodeCast[0].RoleType != "Actor" {
+		t.Fatalf("episode cast not migrated: %+v", episodeCast)
+	}
+
+	// Running again while item_people rows exist must not duplicate them.
+	again, err := svc.Import(req)
+	if err != nil {
+		t.Fatalf("second Import failed: %v", err)
+	}
+	if again.ItemsSkipped != 8 || again.PeopleImported != 0 {
+		t.Fatalf("unexpected second import report: %+v", again)
+	}
+	var peopleCount int64
+	_ = db.Gorm.Model(&model.ItemPerson{}).Where("item_id = ?", movie.ID).Count(&peopleCount).Error
+	if peopleCount != 7 {
+		t.Fatalf("people rows were duplicated: %d", peopleCount)
+	}
+
+	// Removing a role added by this version and re-running must repair the gap
+	// without touching the links that already exist.
+	if err := db.Gorm.Where("item_id = ? AND person_id = ? AND role_type = ?", movie.ID, producer.ID, "Producer").Delete(&model.ItemPerson{}).Error; err != nil {
+		t.Fatalf("delete producer link: %v", err)
+	}
+	missingRole, err := svc.Import(req)
+	if err != nil {
+		t.Fatalf("missing-role Import failed: %v", err)
+	}
+	if missingRole.PeopleImported != 1 {
+		t.Fatalf("expected one repaired producer link, got %+v", missingRole)
+	}
+	var restoredProducer model.ItemPerson
+	if err := db.Gorm.Where("item_id = ? AND person_id = ? AND role_type = ?", movie.ID, producer.ID, "Producer").First(&restoredProducer).Error; err != nil {
+		t.Fatalf("producer link was not repaired: %v", err)
+	}
+
+	// Re-running an older migration without overwrite must repair all missing
+	// people links for already-imported items instead of skipping them entirely.
+	if err := db.Gorm.Exec("DELETE FROM item_people").Error; err != nil {
+		t.Fatalf("clear item_people: %v", err)
+	}
+	if err := db.Gorm.Exec("DELETE FROM people").Error; err != nil {
+		t.Fatalf("clear people: %v", err)
+	}
+	repair, err := svc.Import(req)
+	if err != nil {
+		t.Fatalf("repair Import failed: %v", err)
+	}
+	if repair.ItemsSkipped != 8 || repair.PeopleImported != 8 {
+		t.Fatalf("unexpected repair report: %+v", repair)
+	}
+	var repaired []model.ItemPerson
+	if err := db.Gorm.Where("item_id = ?", movie.ID).Order("sort_idx ASC").Find(&repaired).Error; err != nil {
+		t.Fatalf("load repaired people: %v", err)
+	}
+	if len(repaired) != 7 {
+		t.Fatalf("people links were not repaired: %+v", repaired)
+	}
+
+	// Older migrations created the boxsets library as "mixed" because
+	// ItemExtradata was not read yet. A re-run must upgrade the kind.
+	if err := db.Gorm.Model(&model.Library{}).Where("id = ?", boxsetLib.ID).Update("kind", "mixed").Error; err != nil {
+		t.Fatalf("downgrade boxsets library: %v", err)
+	}
+	if _, err := svc.Import(req); err != nil {
+		t.Fatalf("kind-upgrade Import failed: %v", err)
+	}
+	var upgradedLib model.Library
+	if err := db.Gorm.First(&upgradedLib, "id = ?", boxsetLib.ID).Error; err != nil {
+		t.Fatalf("load upgraded library: %v", err)
+	}
+	if upgradedLib.Kind != "boxsets" {
+		t.Fatalf("boxsets library kind was not upgraded: %q", upgradedLib.Kind)
 	}
 }

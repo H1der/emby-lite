@@ -341,6 +341,7 @@ function libraryIcon(lib: any) {
   if (String(lib.Id || '').startsWith('vlib-')) return '✨'
   if (lib.CollectionType === 'movies') return '🎞️'
   if (lib.CollectionType === 'tvshows') return '📺'
+  if (lib.CollectionType === 'boxsets') return '🎬'
   return '🗂️'
 }
 

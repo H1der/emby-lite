@@ -573,6 +573,7 @@ const kindOptions = [
   { label: '电影 (movies)', value: 'movies' },
   { label: '剧集 (tvshows)', value: 'tvshows' },
   { label: '混合 (mixed)', value: 'mixed' },
+  { label: '合集 (boxsets)', value: 'boxsets' },
 ]
 
 const showUserModal = ref(false)
@@ -861,7 +862,7 @@ function removeLibPath(idx: number) {
 }
 
 async function saveLibrary() {
-  if (!libForm.name.trim() || libForm.paths.length === 0) {
+  if (!libForm.name.trim() || (libForm.kind !== 'boxsets' && libForm.paths.length === 0)) {
     message.warning('请填写媒体库名称并至少选择一个目录')
     return
   }

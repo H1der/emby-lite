@@ -123,9 +123,11 @@ func New(cfg *config.Config, db *database.DB, cacheStore cache.Store) *Server {
 		// Leave the final counts on the task row: the wizard and the 后台任务 tab both
 		// render task.message when the run completes.
 		summary := fmt.Sprintf(
-			"迁移完成：媒体库 +%d（已存在 %d），条目 +%d（跳过 %d），用户 +%d（已存在 %d），观看记录 +%d（跳过 %d）",
+			"迁移完成：媒体库 +%d（已存在 %d），条目 +%d（跳过 %d；标签 %d、章节 %d、媒体流 %d、合集 %d），用户 +%d（已存在 %d，设置 %d），观看记录 +%d（跳过 %d）",
 			rep.LibrariesCreated, rep.LibrariesExisting, rep.ItemsImported, rep.ItemsSkipped,
-			rep.UsersCreated, rep.UsersExisting, rep.WatchImported, rep.WatchSkipped,
+			rep.TagsImported, rep.ChaptersImported, rep.StreamsImported, rep.BoxSetsImported,
+			rep.UsersCreated, rep.UsersExisting, rep.SettingsImported,
+			rep.WatchImported, rep.WatchSkipped,
 		)
 		if rep.ItemsFailed > 0 || rep.WatchFailed > 0 {
 			// Batched writes report how many rows had to be dropped; surfacing them keeps a

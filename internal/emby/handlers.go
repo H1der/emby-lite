@@ -185,18 +185,18 @@ func (h *Handler) AuthenticateByName(c *gin.Context) {
 		"AccessToken": token,
 		"ServerId":    h.serverID(),
 		"SessionInfo": gin.H{
-			"Id":                      meta.DeviceID,
-			"UserId":                  user.ID,
-			"UserName":                user.Username,
-			"Client":                  meta.Client,
-			"DeviceId":                meta.DeviceID,
-			"DeviceName":              meta.Device,
-			"ApplicationVersion":      meta.Version,
-			"LastActivityDate":        now,
-			"SupportsRemoteControl":   false,
-			"SupportsMediaControl":    false,
-			"PlayableMediaTypes":      []string{"Video"},
-			"SupportedCommands":       []string{},
+			"Id":                    meta.DeviceID,
+			"UserId":                user.ID,
+			"UserName":              user.Username,
+			"Client":                meta.Client,
+			"DeviceId":              meta.DeviceID,
+			"DeviceName":            meta.Device,
+			"ApplicationVersion":    meta.Version,
+			"LastActivityDate":      now,
+			"SupportsRemoteControl": false,
+			"SupportsMediaControl":  false,
+			"PlayableMediaTypes":    []string{"Video"},
+			"SupportedCommands":     []string{},
 		},
 	})
 }
@@ -450,7 +450,16 @@ func (h *Handler) GetItems(c *gin.Context) {
 			q = q.Where("(items.library_id = ? OR items.parent_id = ? OR items.series_id = ? OR items.season_id = ?)",
 				parentID, parentID, parentID, parentID)
 		} else {
-			q = q.Where("items.parent_id = ?", parentID)
+			// BoxSet members are linked through box_set_items instead of parent_id.
+			var memberIDs []string
+			if err := h.db.Read().Model(&model.BoxSetItem{}).
+				Where("box_set_id = ?", parentID).
+				Order("sort_idx ASC").
+				Pluck("item_id", &memberIDs).Error; err == nil && len(memberIDs) > 0 {
+				q = q.Where("items.id IN ?", memberIDs)
+			} else {
+				q = q.Where("items.parent_id = ?", parentID)
+			}
 		}
 	} else if !recursive && len(includeTypes) == 0 && searchTerm == "" && idsParam == "" {
 		q = q.Where("items.type IN ?", []string{"Movie", "Series"})
@@ -847,11 +856,11 @@ func (h *Handler) GetFilters(c *gin.Context) {
 
 func (h *Handler) DisplayPreferences(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"Id":           c.Param("id"),
-		"SortBy":       "SortName",
-		"SortOrder":    "Ascending",
-		"CustomPrefs":  gin.H{},
-		"Client":       queryCI(c, "client"),
+		"Id":          c.Param("id"),
+		"SortBy":      "SortName",
+		"SortOrder":   "Ascending",
+		"CustomPrefs": gin.H{},
+		"Client":      queryCI(c, "client"),
 	})
 }
 

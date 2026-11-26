@@ -297,6 +297,7 @@ const heroBackdropUrl = computed(() => {
 function kindLabel(k: string) {
   if (k === 'movies') return '电影库'
   if (k === 'tvshows') return '剧集库'
+  if (k === 'boxsets') return '合集库'
   return '混合媒体库'
 }
 

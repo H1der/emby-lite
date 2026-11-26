@@ -37,7 +37,7 @@
       </n-card>
 
       <!-- Emby Full Migration Wizard -->
-      <n-card size="small" title="从旧 Emby 完整迁移（媒体库 / 元数据 / 用户 / 观看进度）">
+      <n-card size="small" title="从旧 Emby 完整迁移（媒体库 / 元数据 / 演职人员 / 用户 / 观看进度）">
         <div class="text-xs text-ink-muted mb-3">
           纯 Go 只读读取原 Emby 配置目录，自动识别 <code>root/default</code>（媒体库）、<code>data/library.db</code>（影视元数据）与 <code>data/users.db</code>（用户与观看记录）。
         </div>
@@ -56,7 +56,7 @@
           <n-form-item label="迁移内容">
             <div class="flex flex-wrap gap-x-4 gap-y-1.5">
               <n-checkbox v-model:checked="migForm.import_libraries">媒体库定义</n-checkbox>
-              <n-checkbox v-model:checked="migForm.import_items">影视元数据与源路径</n-checkbox>
+              <n-checkbox v-model:checked="migForm.import_items">影视元数据、演职人员与源路径</n-checkbox>
               <n-checkbox v-model:checked="migForm.import_users">用户账号</n-checkbox>
               <n-checkbox v-model:checked="migForm.import_watch">观看进度与收藏</n-checkbox>
             </div>
@@ -109,8 +109,14 @@
                 <n-input v-model:value="migForm.users_db_path" placeholder="例如：/emby-config/data/users.db" />
               </n-form-item>
               <n-form-item label="library.db 文件路径（可选覆盖）" :show-feedback="false">
-                <n-input v-model:value="migForm.library_db_path" placeholder="例如：/emby-config/data/library.db" />
-              </n-form-item>
+				<n-input v-model:value="migForm.library_db_path" placeholder="例如：/emby-config/data/library.db" />
+			</n-form-item>
+			<n-form-item label="旧库原始快照目录（可选，整库克隆时保存 library.db / users.db）" :show-feedback="false">
+				<div class="flex gap-2 w-full">
+					<n-input v-model:value="migForm.snapshot_dir" placeholder="例如：/app/data/emby-snapshots，留空则不保存原始库" />
+					<n-button size="small" secondary @click="openPicker('snapshot')">📁</n-button>
+				</div>
+			</n-form-item>
               <n-checkbox v-model:checked="migForm.overwrite" class="pt-1">
                 允许覆盖已有同路径条目 / 观看记录
               </n-checkbox>
@@ -187,6 +193,9 @@
             </div>
             <div class="rounded-xl glass-card px-2.5 py-1.5">
               观看记录：<strong>{{ migPreview.watch_records_found }}</strong>（预计可关联 <strong>{{ migPreview.matched_watch_records }}</strong>）
+            </div>
+            <div class="rounded-xl glass-card px-2.5 py-1.5 col-span-2">
+              整库元数据：合集 <strong>{{ migPreview.box_sets_found || 0 }}</strong> / 标签 <strong>{{ migPreview.tags_found || 0 }}</strong> / 章节 <strong>{{ migPreview.chapters_found || 0 }}</strong> / 媒体流 <strong>{{ migPreview.streams_found || 0 }}</strong>
             </div>
           </div>
 
@@ -304,6 +313,7 @@ const migForm = reactive({
   emby_config_dir: '',
   users_db_path: '',
   library_db_path: '',
+  snapshot_dir: '',
   root_default_dir: '',
   default_password: '',
   import_libraries: true,
@@ -356,18 +366,20 @@ const migTaskTagType = computed<'default' | 'info' | 'success' | 'warning' | 'er
 
 // Visual directory picker state
 const pickerOpen = ref(false)
-const pickerTarget = ref<'config' | 'root' | 'mapping'>('config')
+const pickerTarget = ref<'config' | 'root' | 'mapping' | 'snapshot'>('config')
 const pickerMappingIdx = ref(-1)
 
 const pickerTitle = computed(() => {
   if (pickerTarget.value === 'config') return '选择原 Emby 配置根目录'
   if (pickerTarget.value === 'root') return '选择 Emby root/default 目录'
+  if (pickerTarget.value === 'snapshot') return '选择旧库原始快照保存目录'
   return '选择映射后的本机目录'
 })
 
 const pickerSelected = computed(() => {
   if (pickerTarget.value === 'config' && migForm.emby_config_dir) return [migForm.emby_config_dir]
   if (pickerTarget.value === 'root' && migForm.root_default_dir) return [migForm.root_default_dir]
+  if (pickerTarget.value === 'snapshot' && migForm.snapshot_dir) return [migForm.snapshot_dir]
   if (pickerTarget.value === 'mapping' && pickerMappingIdx.value >= 0) {
     const val = migForm.path_mappings[pickerMappingIdx.value]?.to
     return val ? [val] : []
@@ -375,7 +387,7 @@ const pickerSelected = computed(() => {
   return []
 })
 
-function openPicker(target: 'config' | 'root' | 'mapping', idx = -1) {
+function openPicker(target: 'config' | 'root' | 'mapping' | 'snapshot', idx = -1) {
   pickerTarget.value = target
   pickerMappingIdx.value = idx
   pickerOpen.value = true
@@ -386,6 +398,8 @@ function onPickerSelect(path: string) {
     migForm.emby_config_dir = path
   } else if (pickerTarget.value === 'root') {
     migForm.root_default_dir = path
+  } else if (pickerTarget.value === 'snapshot') {
+    migForm.snapshot_dir = path
   } else if (pickerTarget.value === 'mapping' && pickerMappingIdx.value >= 0) {
     migForm.path_mappings[pickerMappingIdx.value].to = path
   }
@@ -405,6 +419,7 @@ function buildMigrationPayload() {
     emby_config_dir: migForm.emby_config_dir.trim(),
     users_db_path: migForm.users_db_path.trim(),
     library_db_path: migForm.library_db_path.trim(),
+    snapshot_dir: migForm.snapshot_dir.trim(),
     root_default_dir: migForm.root_default_dir.trim(),
     default_password: migForm.default_password,
     import_libraries: migForm.import_libraries,

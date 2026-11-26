@@ -228,10 +228,20 @@
 
       <!-- Cast & Crew -->
       <section v-if="item.People && item.People.length > 0" class="space-y-3">
-        <h2 class="text-lg sm:text-xl font-bold text-ink tracking-tight">演职人员</h2>
+        <div class="flex items-center justify-between gap-3">
+          <h2 class="text-lg sm:text-xl font-bold text-ink tracking-tight">演职人员</h2>
+          <n-button
+            v-if="item.People.length > 20"
+            size="tiny"
+            secondary
+            @click="showAllPeople = !showAllPeople"
+          >
+            {{ showAllPeople ? '收起' : `显示全部 ${item.People.length} 人` }}
+          </n-button>
+        </div>
         <div class="glass-rail">
           <div
-            v-for="person in item.People.slice(0, 20)"
+            v-for="person in displayedPeople"
             :key="person.Id + person.Type"
             class="glass-card rounded-2xl p-3 w-28 sm:w-32 shrink-0 text-center snap-start"
           >
@@ -248,9 +258,18 @@
               </div>
             </div>
             <div class="text-xs font-semibold text-ink truncate">{{ person.Name }}</div>
-            <div class="text-[11px] text-ink-muted truncate mt-0.5">{{ person.Role || person.Type }}</div>
+            <div class="text-[11px] text-ink-muted truncate mt-0.5">{{ personRoleLabel(person) }}</div>
           </div>
         </div>
+      </section>
+
+      <!-- BoxSet Collections -->
+      <section v-if="item.Type === 'BoxSet'" class="space-y-3.5">
+        <h2 class="text-lg sm:text-xl font-bold text-ink tracking-tight">合集内容</h2>
+        <div v-if="boxsetItems.length > 0" class="poster-grid">
+          <PosterCard v-for="member in boxsetItems" :key="member.Id" :item="member" />
+        </div>
+        <p v-else class="text-sm text-ink-muted">这个合集里还没有影片。</p>
       </section>
 
       <!-- Similar Recommendations -->
@@ -290,10 +309,17 @@ const loading = ref(true)
 const item = ref<any>(null)
 const seasons = ref<any[]>([])
 const episodes = ref<any[]>([])
+const boxsetItems = ref<any[]>([])
 const similarItems = ref<any[]>([])
 const activeSeasonId = ref('')
 const externalPlay = ref<any>(null)
 const showMetaEditor = ref(false)
+const showAllPeople = ref(false)
+
+const displayedPeople = computed(() => {
+  const people = item.value?.People || []
+  return showAllPeople.value ? people : people.slice(0, 20)
+})
 
 const posterUrl = computed(() => {
   if (!item.value) return ''
@@ -350,6 +376,32 @@ function episodeThumbUrl(ep: any): string {
   return ''
 }
 
+const personRoleLabels: Record<string, string> = {
+  Actor: '演员',
+  Director: '导演',
+  Writer: '编剧',
+  Producer: '制片人',
+  GuestStar: '客串',
+  Composer: '作曲',
+  Conductor: '指挥',
+  Lyricist: '作词',
+  Arranger: '编曲',
+  Engineer: '工程师',
+  Mixer: '混音',
+  Performer: '表演者',
+  Author: '作者',
+  Illustrator: '插画',
+  Editor: '剪辑',
+  Translator: '翻译',
+  Other: '其他',
+}
+
+function personRoleLabel(person: any): string {
+  const role = String(person?.Role || '').trim()
+  if (role) return role
+  return personRoleLabels[person?.Type] || person?.Type || ''
+}
+
 function personImageUrl(personId: string): string {
   const token = getToken()
   return `/emby/Persons/${encodeURIComponent(personId)}/Images/Primary?maxWidth=185&api_key=${encodeURIComponent(token)}`
@@ -362,6 +414,7 @@ async function load() {
   loading.value = true
   seasons.value = []
   episodes.value = []
+  boxsetItems.value = []
   similarItems.value = []
   externalPlay.value = null
   try {
@@ -378,6 +431,9 @@ async function load() {
       if (seasons.value.length > 0) {
         await selectSeason(seasons.value[0].Id)
       }
+    } else if (detail?.Type === 'BoxSet') {
+      const members = await apiFetch(`/emby/Users/${uid}/Items?ParentId=${encodeURIComponent(id)}&Limit=200`).catch(() => null)
+      boxsetItems.value = members?.Items || []
     } else if (detail?.Type === 'Movie' || detail?.Type === 'Episode') {
       externalPlay.value = await apiFetch(`/api/web/external-play/${id}`).catch(() => null)
     }

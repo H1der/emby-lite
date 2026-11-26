@@ -29,6 +29,7 @@ type DB struct {
 	SQL      *sql.DB
 	ReadSQL  *sql.DB
 	Dialect  string // "sqlite" | "postgres"
+	Path     string // sqlite database path (empty for in-memory)
 	HasTrgm  bool
 	HasFTS5  bool
 
@@ -142,6 +143,7 @@ func Open(cfg *config.Config) (*DB, error) {
 		SQL:           sqlDB,
 		ReadSQL:       readSQL,
 		Dialect:       dialect,
+		Path:          cfg.Database.SQLitePath,
 		settingsCache: make(map[string]string, 16),
 	}
 

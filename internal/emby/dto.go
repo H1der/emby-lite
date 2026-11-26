@@ -74,6 +74,8 @@ func (h *Handler) libraryViewDTOWithFallback(lib *model.Library, p *auth.Princip
 		collectionType = "tvshows"
 	case "mixed":
 		collectionType = "mixed"
+	case "boxsets":
+		collectionType = "boxsets"
 	}
 
 	imageTags := map[string]string{}
@@ -193,7 +195,7 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 	var playableItems []model.Item
 	var seriesTypeIDs []string
 	var seasonTypeIDs []string
-
+	var boxsetTypeIDs []string
 	for i := range items {
 		it := &items[i]
 		itemIDs = append(itemIDs, it.ID)
@@ -218,6 +220,8 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 				seriesTypeIDs = append(seriesTypeIDs, it.ID)
 			} else if it.Type == "Season" {
 				seasonTypeIDs = append(seasonTypeIDs, it.ID)
+			} else if it.Type == "BoxSet" {
+				boxsetTypeIDs = append(boxsetTypeIDs, it.ID)
 			}
 		}
 	}
@@ -288,6 +292,8 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		seriesSeasonCounts map[string]int64
 		seriesEpCounts     map[string]int64
 		seasonEpCounts     map[string]int64
+		boxsetMemberCounts map[string]int64
+		chaptersByItem     map[string][]model.ItemChapter
 	)
 
 	if detail {
@@ -296,6 +302,12 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		_ = rdb.Where("item_id IN ?", itemIDs).Find(&allTags).Error
 		for _, t := range allTags {
 			tagsByItem[t.ItemID] = append(tagsByItem[t.ItemID], t.Tag)
+		}
+		chaptersByItem = make(map[string][]model.ItemChapter, len(itemIDs))
+		var allChapters []model.ItemChapter
+		_ = rdb.Where("item_id IN ?", itemIDs).Order("item_id, index_num").Find(&allChapters).Error
+		for _, c := range allChapters {
+			chaptersByItem[c.ItemID] = append(chaptersByItem[c.ItemID], c)
 		}
 
 		type personRow struct {
@@ -312,7 +324,7 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			Select("item_people.item_id, item_people.person_id, people.name, people.tmdb_id, item_people.role_type, item_people.role_name, people.thumb_path").
 			Joins("JOIN people ON people.id = item_people.person_id").
 			Where("item_people.item_id IN ?", itemIDs).
-			Order("item_people.sort_idx ASC").
+			Order("CASE item_people.role_type WHEN 'Actor' THEN 0 WHEN 'GuestStar' THEN 1 WHEN 'Director' THEN 2 WHEN 'Writer' THEN 3 WHEN 'Producer' THEN 4 ELSE 5 END ASC, item_people.sort_idx ASC, item_people.person_id ASC").
 			Scan(&pRows).Error
 		metaDir := h.embyMetadataDir()
 		embyPersonImgCache := make(map[string]bool)
@@ -410,6 +422,23 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 				seasonEpCounts[cr.SeasonID] = cr.Cnt
 			}
 		}
+
+		if len(boxsetTypeIDs) > 0 {
+			boxsetMemberCounts = make(map[string]int64, len(boxsetTypeIDs))
+			type boxCntRow struct {
+				BoxSetID string
+				Cnt      int64
+			}
+			var cnts []boxCntRow
+			_ = rdb.Table("box_set_items").
+				Select("box_set_id, COUNT(*) AS cnt").
+				Where("box_set_id IN ?", boxsetTypeIDs).
+				Group("box_set_id").
+				Scan(&cnts).Error
+			for _, cr := range cnts {
+				boxsetMemberCounts[cr.BoxSetID] = cr.Cnt
+			}
+		}
 	}
 
 	out := make([]map[string]any, 0, len(items))
@@ -446,7 +475,7 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			userDataMap["PlayedPercentage"] = pct
 		}
 
-		isFolder := item.Type == "Series" || item.Type == "Season" || item.Type == "Folder" || item.Type == "CollectionFolder"
+		isFolder := item.Type == "Series" || item.Type == "Season" || item.Type == "Folder" || item.Type == "CollectionFolder" || item.Type == "BoxSet"
 		mediaType := ""
 		if item.Type == "Movie" || item.Type == "Episode" {
 			mediaType = "Video"
@@ -490,6 +519,24 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		}
 		if item.RuntimeTicks > 0 {
 			m["RunTimeTicks"] = item.RuntimeTicks
+		}
+		if item.CustomRating != "" {
+			m["CustomRating"] = item.CustomRating
+		}
+		if item.CriticRating != 0 {
+			m["CriticRating"] = item.CriticRating
+		}
+		if item.Status != "" {
+			m["Status"] = embySeriesStatus(item.Status)
+		}
+		if item.DisplayOrder != 0 {
+			m["DisplayOrder"] = item.DisplayOrder
+		}
+		if item.ProductionLocationsJSON != "" {
+			var places []string
+			if json.Unmarshal([]byte(item.ProductionLocationsJSON), &places) == nil && len(places) > 0 {
+				m["ProductionLocations"] = places
+			}
 		}
 		if item.Tagline != "" {
 			m["Taglines"] = []string{item.Tagline}
@@ -576,7 +623,17 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 						m["Container"] = container
 					}
 				}
-				if mk, ok := introByItem[item.ID]; ok {
+				if cs := chaptersByItem[item.ID]; len(cs) > 0 {
+					chapters := make([]map[string]any, 0, len(cs))
+					for _, c := range cs {
+						chapters = append(chapters, map[string]any{
+							"StartPositionTicks": c.StartTicks,
+							"Name":               c.Name,
+							"MarkerType":         embyChapterMarkerName(c.MarkerType),
+						})
+					}
+					m["Chapters"] = chapters
+				} else if mk, ok := introByItem[item.ID]; ok {
 					if chapters := introMarkerToChapters(&mk); len(chapters) > 0 {
 						m["Chapters"] = chapters
 					}
@@ -594,6 +651,8 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 				m["RecursiveItemCount"] = seriesEpCounts[item.ID]
 			} else if item.Type == "Season" {
 				m["ChildCount"] = seasonEpCounts[item.ID]
+			} else if item.Type == "BoxSet" {
+				m["ChildCount"] = boxsetMemberCounts[item.ID]
 			}
 		}
 
@@ -672,4 +731,28 @@ func introMarkerToChapters(marker *model.IntroMarker) []map[string]any {
 		})
 	}
 	return chapters
+}
+
+func embySeriesStatus(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "continuing", "0":
+		return "Continuing"
+	case "2", "ended":
+		return "Ended"
+	default:
+		return strings.TrimSpace(raw)
+	}
+}
+
+func embyChapterMarkerName(markerType int) string {
+	switch markerType {
+	case 1:
+		return "IntroStart"
+	case 2:
+		return "IntroEnd"
+	case 3:
+		return "CreditsStart"
+	default:
+		return "Chapter"
+	}
 }

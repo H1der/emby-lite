@@ -37,6 +37,7 @@ type EmbyMigrationRequest struct {
 	LibraryDBPath   string        `json:"library_db_path"`
 	RootDefaultDir  string        `json:"root_default_dir"`
 	PathMappings    []PathMapping `json:"path_mappings"`
+	SnapshotDir     string        `json:"snapshot_dir"`     // optional: where to keep a raw copy of the source library.db/users.db
 	DefaultPassword string        `json:"default_password"` // assigned to newly imported users
 	ImportLibraries *bool         `json:"import_libraries"`
 	ImportItems     *bool         `json:"import_items"`
@@ -75,6 +76,10 @@ type PreviewReport struct {
 	SeriesFound          int              `json:"series_found"`
 	SeasonsFound         int              `json:"seasons_found"`
 	EpisodesFound        int              `json:"episodes_found"`
+	BoxSetsFound         int              `json:"box_sets_found"`
+	TagsFound            int              `json:"tags_found"`
+	ChaptersFound        int              `json:"chapters_found"`
+	StreamsFound         int              `json:"streams_found"`
 	UsersFound           int              `json:"users_found"`
 	NewUsersToCreate     int              `json:"new_users_to_create"`
 	WatchRecordsFound    int              `json:"watch_records_found"`
@@ -89,6 +94,14 @@ type ImportReport struct {
 	ItemsImported     int      `json:"items_imported"`
 	ItemsSkipped      int      `json:"items_skipped"`
 	ItemsFailed       int      `json:"items_failed"`
+	PeopleImported    int      `json:"people_imported"`
+	TagsImported      int      `json:"tags_imported"`
+	ChaptersImported  int      `json:"chapters_imported"`
+	StreamsImported   int      `json:"streams_imported"`
+	BoxSetsImported   int      `json:"box_sets_imported"`
+	SettingsImported  int      `json:"settings_imported"`
+	SnapshotDir       string   `json:"snapshot_dir,omitempty"`
+	SnapshotFiles     []string `json:"snapshot_files,omitempty"`
 	UsersCreated      int      `json:"users_created"`
 	UsersExisting     int      `json:"users_existing"`
 	WatchImported     int      `json:"watch_imported"`
@@ -108,7 +121,7 @@ func NewService(db *database.DB) *Service {
 type embyLibraryDef struct {
 	EmbyID string
 	Name   string
-	Kind   string // movies | tvshows | mixed
+	Kind   string // movies | tvshows | mixed | boxsets
 	Paths  []string
 }
 
@@ -136,25 +149,38 @@ type embyItemRow struct {
 	ProviderIDs       map[string]string
 	Genres            []string
 	Studios           []string
+	Tags              []string
+	Images            []embyImageRow
+	Chapters          []embyChapterRow
+	Streams           []embyStreamRow
+	BoxSetMembers     []string
+	Status            string
+	DisplayOrder      int
+	CustomRating      string
+	CriticRating      float64
+	ProductionPlaces  []string
+	RemoteTrailers    []string
 }
 
 type embyUserRow struct {
 	ID       string
 	Username string
+	IsAdmin  bool
+	Settings map[string]string
 }
-
 type embyWatchRow struct {
-	UserID        string
-	Username      string
-	UserDataKey   string
-	ItemEmbyID    string
-	ItemName      string
-	ItemPath      string
-	Played        bool
-	PositionTicks int64
-	PlayCount     int
-	IsFavorite    bool
-	LastPlayed    *time.Time
+	UserID         string
+	Username       string
+	UserDataKey    string
+	ItemEmbyID     string
+	ItemName       string
+	ItemPath       string
+	Played         bool
+	PositionTicks  int64
+	PlayCount      int
+	IsFavorite     bool
+	HideFromResume bool
+	LastPlayed     *time.Time
 }
 
 // resolveSources auto-discovers users.db, library.db, and root/default from EmbyConfigDir if explicit paths are empty.
@@ -276,7 +302,12 @@ func (s *Service) Preview(req EmbyMigrationRequest) (*PreviewReport, error) {
 			report.SeasonsFound++
 		case "Episode":
 			report.EpisodesFound++
+		case "BoxSet":
+			report.BoxSetsFound++
 		}
+		report.TagsFound += len(it.Tags)
+		report.ChaptersFound += len(it.Chapters)
+		report.StreamsFound += len(it.Streams)
 		if it.EmbyID != "" {
 			itemEmbyIDs[it.EmbyID] = true
 		}
@@ -360,6 +391,15 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 
 	report := &ImportReport{Warnings: warnings}
 
+	// Keep a complete raw copy before anything touches the target database. The
+	// normalized import below is intentionally lossy for fields emby-lite does
+	// not model; the snapshot is the escape hatch for later repairs.
+	snapshotDir, snapshotFiles, snapshotWarn := s.snapshotEmbyDatabases(req, resolved)
+	report.SnapshotDir = snapshotDir
+	report.SnapshotFiles = snapshotFiles
+	if snapshotWarn != "" {
+		report.Warnings = append(report.Warnings, snapshotWarn)
+	}
 	// Count the work up front so the UI can show a real percentage. The item loop is by
 	// far the largest phase, so it dominates the total.
 	totalWork := len(items)
@@ -400,7 +440,7 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 	}
 	var allLibPaths []libPathEntry
 	var fallbackLibID string
-
+	var boxsetsLibID string
 	if wantLibraries {
 		if onProgress != nil {
 			onProgress(done, totalWork, "正在迁移媒体库…")
@@ -416,6 +456,11 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 			var libID string
 			if existing, ok := existingLibs[lowerName]; ok {
 				libID = existing.ID
+				if l.Kind != "" && existing.Kind != l.Kind {
+					existing.Kind = l.Kind
+					_ = s.db.Gorm.Model(&existing).Update("kind", l.Kind).Error
+					existingLibs[lowerName] = existing
+				}
 				report.LibrariesExisting++
 			} else {
 				pathsBytes, _ := json.Marshal(l.Paths)
@@ -436,6 +481,9 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 			if libID != "" {
 				if fallbackLibID == "" {
 					fallbackLibID = libID
+				}
+				if l.Kind == "boxsets" {
+					boxsetsLibID = libID
 				}
 				if l.EmbyID != "" {
 					embyLibIDToLocal[l.EmbyID] = libID
@@ -508,7 +556,7 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 			}
 		}
 
-		order := []string{"Series", "Season", "Movie", "Episode"}
+		order := []string{"Series", "Season", "Movie", "Episode", "BoxSet"}
 		now := time.Now().UTC()
 		itemKinds := make(map[string]string, len(items))
 		for _, it := range items {
@@ -532,8 +580,91 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 				}
 				advance(1, "正在迁移影视条目…")
 				libID := resolveItemLibrary(it)
+				if wantType == "BoxSet" && boxsetsLibID != "" {
+					libID = boxsetsLibID
+				}
 				if libID == "" {
 					report.ItemsSkipped++
+					continue
+				}
+				if wantType == "BoxSet" {
+					scanKey := buildMigratedScanKey(wantType, libID, "", it)
+					bsID := scanner.StableID("item", scanKey)
+					existingBox := false
+					if existingLocalID, ok := existingIDs[scanKey]; ok {
+						existingBox = true
+						bsID = existingLocalID
+						if !req.Overwrite {
+							report.ItemsSkipped++
+							continue
+						}
+					}
+					sortName := it.SortName
+					if sortName == "" {
+						sortName = scanner.BuildSortName(it.Name)
+					}
+					rec := model.Item{
+						ID:              bsID,
+						LibraryID:       libID,
+						ParentID:        libID,
+						Type:            "BoxSet",
+						Name:            it.Name,
+						SortName:        sortName,
+						Overview:        it.Overview,
+						ProviderIDsJSON: mustJSON(it.ProviderIDs),
+						IsFolder:        true,
+						ScanKey:         scanKey,
+						RandomKey:       scanner.StableID("rnd", scanKey)[:12],
+						AddedAt:         now,
+						CreatedAt:       now,
+					}
+					bs := model.BoxSet{
+						ID:              bsID,
+						LibraryID:       libID,
+						Name:            it.Name,
+						SortName:        sortName,
+						Overview:        it.Overview,
+						ProviderIDsJSON: mustJSON(it.ProviderIDs),
+						CreatedAt:       now,
+						UpdatedAt:       now,
+					}
+					row := itemBatchRow{item: rec, existed: existingBox, boxSet: &bs}
+					for idx, member := range it.BoxSetMembers {
+						if local := embyItemToLocal[member]; local != "" {
+							row.boxItems = append(row.boxItems, model.BoxSetItem{BoxSetID: bsID, ItemID: local, SortIdx: idx})
+						}
+					}
+					for idx, img := range it.Images {
+						kind := strings.ToLower(strings.TrimSpace(img.Type))
+						switch kind {
+						case "primary", "backdrop", "thumb", "logo", "banner":
+						default:
+							continue
+						}
+						imgPath := resolveEmbyMetadataPath(img.Path, req.EmbyConfigDir)
+						sourceType := "remote"
+						if !strings.HasPrefix(strings.ToLower(imgPath), "http://") && !strings.HasPrefix(strings.ToLower(imgPath), "https://") {
+							if _, statErr := os.Stat(imgPath); statErr != nil {
+								continue
+							}
+							sourceType = "local"
+						}
+						row.images = append(row.images, model.ItemImage{
+							ID:         scanner.StableID("img", fmt.Sprintf("%s|%s|%d", bsID, kind, idx)),
+							ItemID:     bsID,
+							Kind:       kind,
+							IndexNum:   idx,
+							SourceType: sourceType,
+							SourceRef:  imgPath,
+							Tag:        scanner.StableID("imgtag", imgPath)[:16],
+							Width:      img.Width,
+							Height:     img.Height,
+							UpdatedAt:  now,
+						})
+					}
+					writer.add(row)
+					embyItemToLocal[it.EmbyID] = bsID
+					report.BoxSetsImported++
 					continue
 				}
 
@@ -607,32 +738,38 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 				}
 
 				rec := model.Item{
-					ID:              localID,
-					LibraryID:       libID,
-					ParentID:        parentID,
-					SeriesID:        seriesID,
-					SeasonID:        seasonID,
-					Type:            wantType,
-					Name:            it.Name,
-					OriginalName:    it.OriginalTitle,
-					SortName:        sortName,
-					PinyinInitials:  scanner.PinyinInitials(it.Name + " " + it.OriginalTitle),
-					Overview:        it.Overview,
-					Tagline:         it.Tagline,
-					Year:            it.Year,
-					PremiereDate:    it.PremiereDate,
-					SeasonNum:       seasonNum,
-					EpisodeNum:      episodeNum,
-					CommunityRating: it.CommunityRating,
-					OfficialRating:  it.OfficialRating,
-					RuntimeTicks:    it.RunTimeTicks,
-					ProviderIDsJSON: string(pidsJSON),
-					StudiosJSON:     string(studiosJSON),
-					DirPath:         dirPath,
-					ScanKey:         scanKey,
-					RandomKey:       scanner.StableID("rnd", scanKey)[:12],
-					AddedAt:         now,
-					CreatedAt:       now,
+					ID:                      localID,
+					LibraryID:               libID,
+					ParentID:                parentID,
+					SeriesID:                seriesID,
+					SeasonID:                seasonID,
+					Type:                    wantType,
+					Name:                    it.Name,
+					OriginalName:            it.OriginalTitle,
+					SortName:                sortName,
+					PinyinInitials:          scanner.PinyinInitials(it.Name + " " + it.OriginalTitle),
+					Overview:                it.Overview,
+					Tagline:                 it.Tagline,
+					Year:                    it.Year,
+					PremiereDate:            it.PremiereDate,
+					SeasonNum:               seasonNum,
+					EpisodeNum:              episodeNum,
+					CommunityRating:         it.CommunityRating,
+					CriticRating:            it.CriticRating,
+					CustomRating:            it.CustomRating,
+					OfficialRating:          it.OfficialRating,
+					Status:                  it.Status,
+					DisplayOrder:            it.DisplayOrder,
+					RuntimeTicks:            it.RunTimeTicks,
+					IsFolder:                wantType == "Series" || wantType == "Season",
+					ProductionLocationsJSON: mustJSONString(it.ProductionPlaces),
+					ProviderIDsJSON:         string(pidsJSON),
+					StudiosJSON:             string(studiosJSON),
+					DirPath:                 dirPath,
+					ScanKey:                 scanKey,
+					RandomKey:               scanner.StableID("rnd", scanKey)[:12],
+					AddedAt:                 now,
+					CreatedAt:               now,
 				}
 				row := itemBatchRow{item: rec, existed: existingItem}
 
@@ -640,6 +777,39 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 					if gn := strings.TrimSpace(g); gn != "" {
 						row.genres = append(row.genres, model.ItemGenre{ItemID: rec.ID, Genre: gn})
 					}
+				}
+				for _, tag := range it.Tags {
+					if tag = strings.TrimSpace(tag); tag != "" {
+						row.tags = append(row.tags, model.ItemTag{ItemID: rec.ID, Tag: tag})
+					}
+				}
+				for _, c := range it.Chapters {
+					row.chapters = append(row.chapters, model.ItemChapter{
+						ItemID: rec.ID, IndexNum: c.IndexNum, StartTicks: c.StartTicks,
+						Name: c.Name, MarkerType: c.MarkerType, ImagePath: c.ImagePath,
+					})
+				}
+				for idx, img := range it.Images {
+					kind := strings.TrimSpace(img.Type)
+					switch kind {
+					case "Primary", "Backdrop", "Thumb", "Logo", "Banner":
+					default:
+						continue
+					}
+					imgPath := resolveEmbyMetadataPath(img.Path, req.EmbyConfigDir)
+					sourceType := "remote"
+					if !strings.HasPrefix(strings.ToLower(imgPath), "http://") && !strings.HasPrefix(strings.ToLower(imgPath), "https://") {
+						if _, statErr := os.Stat(imgPath); statErr != nil {
+							continue
+						}
+						sourceType = "local"
+					}
+					row.images = append(row.images, model.ItemImage{
+						ID:     scanner.StableID("img", fmt.Sprintf("%s|%s|%d", rec.ID, kind, idx)),
+						ItemID: rec.ID, Kind: kind, IndexNum: idx, SourceType: sourceType,
+						SourceRef: imgPath, Tag: scanner.StableID("imgtag", imgPath)[:16],
+						Width: img.Width, Height: img.Height, UpdatedAt: now,
+					})
 				}
 
 				// Attach MediaSource for playable items (Movie / Episode).
@@ -654,8 +824,10 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 					if !fileOK {
 						fileSize, fileMtime = 0, 0
 					}
+					srcID := scanner.StableID("src", it.Path)
+					video := firstEmbyStream(it.Streams, 2)
 					row.source = &model.MediaSource{
-						ID:           scanner.StableID("src", it.Path),
+						ID:           srcID,
 						ItemID:       rec.ID,
 						SourceType:   srcType,
 						Path:         it.Path,
@@ -664,9 +836,33 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 						FileMtime:    fileMtime,
 						Fingerprint:  scanner.Fingerprint(it.Path, fileSize),
 						Container:    scanner.ContainerFromPath(it.Path, strmURL),
+						VideoCodec:   video.Codec,
+						Width:        video.Width,
+						Height:       video.Height,
+						HDRType:      video.ExtendedVideoType,
 						DurationSecs: float64(it.RunTimeTicks) / 1e7,
+						Bitrate:      video.BitRate,
+						ProbeJSON:    embyProbeJSON(it.Streams, req.PathMappings),
+					}
+					for _, s := range it.Streams {
+						if s.StreamType != 3 || !s.IsExternal {
+							continue
+						}
+						p := applyPathMappings(s.Path, req.PathMappings)
+						if p == "" {
+							continue
+						}
+						row.subtitles = append(row.subtitles, model.MediaSubtitle{
+							ID:            scanner.StableID("sub", fmt.Sprintf("%s|%d", rec.ID, s.Index)),
+							MediaSourceID: srcID, ItemID: rec.ID, StreamIndex: s.Index,
+							IsExternal: true, Path: p, Language: s.Language, Title: s.Title,
+							Codec: s.Codec, IsDefault: s.IsDefault, IsForced: s.IsForced, CreatedAt: now,
+						})
 					}
 				}
+				report.StreamsImported += len(it.Streams)
+				report.ChaptersImported += len(it.Chapters)
+				report.TagsImported += len(it.Tags)
 
 				// Discover local posters immediately if the path is accessible on disk. The
 				// directory listing and stat results are cached: without it a season folder is
@@ -707,11 +903,20 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 		// Write whatever is still buffered before counting.
 		writer.flush()
 
+		// Migrate cast/crew for the items mapped above. Re-running an older migration
+		// with Overwrite=false fills items that still have no people rows.
+		peopleImported, peopleWarnings, err := s.importEmbyPeople(ctx, resolved.LibraryDBPath, embyItemToLocal, req.Overwrite, now)
+		report.Warnings = append(report.Warnings, peopleWarnings...)
+		report.PeopleImported += peopleImported
+		if err != nil {
+			return nil, err
+		}
+
 		// Update library item counts.
 		for _, ex := range existingLibs {
 			var cnt int64
 			s.db.Gorm.Model(&model.Item{}).
-				Where("library_id = ? AND soft_deleted_at IS NULL AND type IN ?", ex.ID, []string{"Movie", "Series"}).
+				Where("library_id = ? AND soft_deleted_at IS NULL AND type IN ?", ex.ID, []string{"Movie", "Series", "BoxSet"}).
 				Count(&cnt)
 			_ = s.db.Gorm.Model(&model.Library{}).Where("id = ?", ex.ID).Update("item_count", cnt).Error
 		}
@@ -746,6 +951,9 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 			if localID, ok := existingUsers[lower]; ok {
 				embyIDToLocalUserID[u.ID] = localID
 				report.UsersExisting++
+				if n, setErr := s.importUserSettings(localID, u.Settings, time.Now().UTC()); setErr == nil {
+					report.SettingsImported += n
+				}
 				continue
 			}
 			newUser := model.User{
@@ -753,12 +961,15 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 				Username:     strings.TrimSpace(u.Username),
 				DisplayName:  strings.TrimSpace(u.Username),
 				PasswordHash: defHash,
-				IsAdmin:      false,
+				IsAdmin:      u.IsAdmin,
 			}
 			if err := s.db.Gorm.Create(&newUser).Error; err == nil {
 				existingUsers[lower] = newUser.ID
 				embyIDToLocalUserID[u.ID] = newUser.ID
 				report.UsersCreated++
+				if n, setErr := s.importUserSettings(newUser.ID, u.Settings, time.Now().UTC()); setErr == nil {
+					report.SettingsImported += n
+				}
 			}
 		}
 	}
@@ -808,6 +1019,7 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 			if prev, ok := userDataLookup[key]; ok && !req.Overwrite {
 				prev.Played = prev.Played || w.Played
 				prev.IsFavorite = prev.IsFavorite || w.IsFavorite
+				prev.HideFromResume = prev.HideFromResume || w.HideFromResume
 				if w.PositionTicks > prev.PositionTicks {
 					prev.PositionTicks = w.PositionTicks
 				}
@@ -823,14 +1035,15 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 			} else {
 				// Nothing to merge into (or Overwrite was requested): the source row wins.
 				row := model.UserData{
-					UserID:        localUserID,
-					ItemID:        localItemID,
-					Played:        w.Played,
-					PositionTicks: w.PositionTicks,
-					PlayCount:     w.PlayCount,
-					IsFavorite:    w.IsFavorite,
-					LastPlayedAt:  w.LastPlayed,
-					UpdatedAt:     now,
+					UserID:         localUserID,
+					ItemID:         localItemID,
+					Played:         w.Played,
+					PositionTicks:  w.PositionTicks,
+					PlayCount:      w.PlayCount,
+					IsFavorite:     w.IsFavorite,
+					HideFromResume: w.HideFromResume,
+					LastPlayedAt:   w.LastPlayed,
+					UpdatedAt:      now,
 				}
 				userDataLookup[key] = row
 				writer.add(row)
@@ -876,6 +1089,10 @@ func (s *Service) readAllEmbyData(resolved ResolvedSources, mappings []PathMappi
 		if idx, exists := libByLowerName[key]; exists {
 			if libs[idx].EmbyID == "" {
 				libs[idx].EmbyID = def.EmbyID
+			}
+			// Prefer the concrete ContentType over the mixed fallback.
+			if libs[idx].Kind == "" || (libs[idx].Kind == "mixed" && def.Kind != "" && def.Kind != "mixed") {
+				libs[idx].Kind = def.Kind
 			}
 			for _, p := range mapped {
 				found := false
@@ -952,13 +1169,15 @@ func (s *Service) readAllEmbyData(resolved ResolvedSources, mappings []PathMappi
 					var profile struct {
 						Name     string `json:"Name"`
 						IdString string `json:"IdString"`
+						Policy   struct {
+							IsAdministrator bool `json:"IsAdministrator"`
+						} `json:"Policy"`
 					}
 					if json.Unmarshal(payload, &profile) != nil || strings.TrimSpace(profile.Name) == "" {
 						continue
 					}
 					id = strings.TrimSpace(id)
-					users = append(users, embyUserRow{ID: id, Username: profile.Name})
-					usersByID[id] = profile.Name
+					users = append(users, embyUserRow{ID: id, Username: profile.Name, IsAdmin: profile.Policy.IsAdministrator})
 					usersByID[strings.ToLower(id)] = profile.Name
 					if profile.IdString != "" {
 						usersByID[profile.IdString] = profile.Name
@@ -971,6 +1190,27 @@ func (s *Service) readAllEmbyData(resolved ResolvedSources, mappings []PathMappi
 		}
 		if !loaded {
 			warnings = append(warnings, "users.db 中未识别到 LocalUsersv2 或 Users 表")
+		}
+		if len(users) > 0 && len(tableColumns(sqlDB, "UserSettings")) > 0 && len(tableColumns(sqlDB, "UserSettingsKeys")) > 0 {
+			settingsByUser := map[string]map[string]string{}
+			q := `SELECT CAST(s.UserId AS TEXT), k.Name, s.Value FROM UserSettings s JOIN UserSettingsKeys k ON k.UserSettingsKeyId = s.UserSettingsKeyId`
+			if srows, qErr := sqlDB.Query(q); qErr == nil {
+				for srows.Next() {
+					var uid, key, value string
+					if srows.Scan(&uid, &key, &value) == nil {
+						if settingsByUser[uid] == nil {
+							settingsByUser[uid] = map[string]string{}
+						}
+						settingsByUser[uid][key] = value
+					}
+				}
+				_ = srows.Close()
+			}
+			for i := range users {
+				if m := settingsByUser[users[i].ID]; len(m) > 0 {
+					users[i].Settings = m
+				}
+			}
 		}
 		if len(users) > 0 {
 			warnings = append(warnings, fmt.Sprintf("已读取 %d 个 Emby 用户；Emby 密码为加密存储无法迁移，导入后统一使用默认密码", len(users)))
@@ -1051,7 +1291,7 @@ func readEmbyRootDefaultLibraries(rootDefaultDir string) ([]embyLibraryDef, []st
 			}
 		}
 
-		if len(def.Paths) > 0 {
+		if len(def.Paths) > 0 || mapEmbyContentType(def.Kind) == "boxsets" {
 			out = append(out, def)
 		}
 	}
@@ -1117,6 +1357,8 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 	if !cols["userdatakeyid"] && cols["userdatakey"] {
 		udKeyCol = "UserDataKey"
 	}
+	extras := readEmbyItemExtras(sqlDB, table, idCol, enumKind)
+	libOptions := readEmbyLibraryOptions(sqlDB)
 
 	// Emby 4.9+ keeps genres/studios and library folder paths in ItemLinks2:
 	// Type 2 -> Genre, Type 3 -> Studio, Type 8 -> physical folder behind a library path.
@@ -1163,7 +1405,7 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 	q := fmt.Sprintf(`SELECT
 		%s, %s, %s, %s, %s, %s, %s,
 		%s, %s, %s, %s, %s, %s, %s,
-		%s, %s, %s, %s, %s, %s, %s, %s, %s
+		%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
 		FROM %s`,
 		colOrEmpty(idCol), colOrEmpty("ParentId"), colOrEmpty("TopParentId"),
 		colOrEmpty("SeriesId"), colOrEmpty("SeasonId"), colOrEmpty(udKeyCol), colOrEmpty("type"),
@@ -1172,6 +1414,8 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 		colOrZero("CommunityRating"), colOrEmpty("OfficialRating"), colOrZero("RunTimeTicks"),
 		colOrZero("IndexNumber"), colOrZero("ParentIndexNumber"), colOrEmpty("Path"),
 		colOrEmpty("ProviderIds"), colOrEmpty("Genres"), colOrEmpty("Studios"),
+		colOrEmpty("Status"), colOrZero("DisplayOrder"), colOrEmpty("CustomRating"),
+		colOrZero("CriticRating"), colOrEmpty("ProductionLocations"), colOrEmpty("RemoteTrailers"),
 		table,
 	)
 
@@ -1188,15 +1432,17 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 	for rows.Next() {
 		var id, parentID, topParentID, seriesID, seasonID, udKey, rawType string
 		var name, origTitle, sortName, overview, tagline, premiere, officialRating, rawPath, rawPids, rawGenres, rawStudios string
-		var year, idxNum, parentIdxNum int
+		var status, customRating, productionPlaces, remoteTrailers string
+		var year, idxNum, parentIdxNum, displayOrder int
 		var runtimeTicks int64
-		var rating float64
+		var rating, criticRating float64
 
 		if err := rows.Scan(
 			&id, &parentID, &topParentID, &seriesID, &seasonID, &udKey, &rawType,
 			&name, &origTitle, &sortName, &overview, &tagline, &year, &premiere,
 			&rating, &officialRating, &runtimeTicks, &idxNum, &parentIdxNum, &rawPath,
 			&rawPids, &rawGenres, &rawStudios,
+			&status, &displayOrder, &customRating, &criticRating, &productionPlaces, &remoteTrailers,
 		); err != nil {
 			continue
 		}
@@ -1220,13 +1466,22 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 					paths = append(paths, p)
 				}
 			}
+			libKind := "mixed"
+			if opts, ok := libOptions[id]; ok {
+				if strings.TrimSpace(opts.ContentType) != "" {
+					libKind = mapEmbyContentType(opts.ContentType)
+				}
+			}
 			libs = append(libs, embyLibraryDef{
 				EmbyID: id,
 				Name:   name,
-				Kind:   "mixed",
+				Kind:   libKind,
 				Paths:  paths,
 			})
 			continue
+		}
+		if kind == "BoxSet" {
+			continue // materialized below with member links
 		}
 		if kind == "" || strings.TrimSpace(name) == "" {
 			continue
@@ -1271,9 +1526,55 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 			ProviderIDs:       parseEmbyProviderIDs(rawPids),
 			Genres:            genres,
 			Studios:           studios,
+			Status:            strings.TrimSpace(status),
+			DisplayOrder:      displayOrder,
+			CustomRating:      strings.TrimSpace(customRating),
+			CriticRating:      criticRating,
+			ProductionPlaces:  splitPipe(productionPlaces),
+			RemoteTrailers:    splitPipe(remoteTrailers),
+			Tags:              extras.tags[id],
+			Images:            extras.images[id],
+			Chapters:          extras.chapters[id],
+			Streams:           extras.streams[id],
 		})
 		kindsByID[id] = kind
 		parentsByID[id] = parentID
+	}
+
+	topByEmbyID := make(map[string]string, len(items))
+	for _, it := range items {
+		topByEmbyID[it.EmbyID] = it.TopParentID
+	}
+	boxsetsLibEmbyID := ""
+	for _, l := range libs {
+		if l.Kind == "boxsets" {
+			boxsetsLibEmbyID = l.EmbyID
+			break
+		}
+	}
+	for _, bs := range extras.boxSets {
+		row := embyItemRow{
+			EmbyID:        bs.EmbyID,
+			ItemType:      "BoxSet",
+			Name:          strings.TrimSpace(bs.Name),
+			SortName:      strings.TrimSpace(bs.SortName),
+			Overview:      strings.TrimSpace(bs.Overview),
+			ProviderIDs:   parseEmbyProviderIDs(bs.ProviderIDsJSON),
+			BoxSetMembers: extras.boxSetItems[bs.EmbyID],
+			Tags:          extras.tags[bs.EmbyID],
+			Images:        extras.images[bs.EmbyID],
+		}
+		if boxsetsLibEmbyID != "" {
+			row.TopParentID = boxsetsLibEmbyID
+		} else {
+			for _, member := range row.BoxSetMembers {
+				if top := topByEmbyID[member]; top != "" {
+					row.TopParentID = top
+					break
+				}
+			}
+		}
+		items = append(items, row)
 	}
 
 	// Emby 4.9+ no longer stores SeriesId/SeasonId columns; derive them from the
@@ -1479,6 +1780,10 @@ func readEmbyWatchData(sqlDB *sql.DB, usersByID map[string]string, mappings []Pa
 			lastPlayedExpr = "''"
 		}
 	}
+	hideExpr := "0"
+	if udCols["hidefromresume"] {
+		hideExpr = "COALESCE(u.HideFromResume,0)"
+	}
 
 	var watches []embyWatchRow
 	var lastErr error
@@ -1490,7 +1795,7 @@ func readEmbyWatchData(sqlDB *sql.DB, usersByID map[string]string, mappings []Pa
 		q := `SELECT CAST(u.userId AS TEXT), CAST(u.` + j.userKey + ` AS TEXT), CAST(m.` + idCol + ` AS TEXT),
 			COALESCE(m.Name,''), COALESCE(m.Path,''), COALESCE(u.played,0),
 			COALESCE(u.playbackPositionTicks,0), COALESCE(u.playCount,0), COALESCE(u.isFavorite,0),
-			` + lastPlayedExpr + `
+			` + lastPlayedExpr + `, ` + hideExpr + `
 			FROM UserDatas u JOIN ` + j.table + ` m ON m.` + j.itemKey + ` = u.` + j.userKey
 		rows, qErr := sqlDB.Query(q)
 		if qErr != nil {
@@ -1499,21 +1804,22 @@ func readEmbyWatchData(sqlDB *sql.DB, usersByID map[string]string, mappings []Pa
 		}
 		for rows.Next() {
 			var uid, udKey, itemEmbyID, name, path, playedOn string
-			var played, fav, playCount int
+			var played, fav, playCount, hide int
 			var pos int64
-			if rows.Scan(&uid, &udKey, &itemEmbyID, &name, &path, &played, &pos, &playCount, &fav, &playedOn) == nil {
+			if rows.Scan(&uid, &udKey, &itemEmbyID, &name, &path, &played, &pos, &playCount, &fav, &playedOn, &hide) == nil {
 				watches = append(watches, embyWatchRow{
-					UserID:        uid,
-					Username:      usersByID[uid],
-					UserDataKey:   udKey,
-					ItemEmbyID:    itemEmbyID,
-					ItemName:      name,
-					ItemPath:      applyPathMappings(path, mappings),
-					Played:        played != 0,
-					PositionTicks: pos,
-					PlayCount:     playCount,
-					IsFavorite:    fav != 0,
-					LastPlayed:    parseEmbyTimestamp(playedOn),
+					UserID:         uid,
+					Username:       usersByID[uid],
+					UserDataKey:    udKey,
+					ItemEmbyID:     itemEmbyID,
+					ItemName:       name,
+					ItemPath:       applyPathMappings(path, mappings),
+					Played:         played != 0,
+					PositionTicks:  pos,
+					PlayCount:      playCount,
+					IsFavorite:     fav != 0,
+					HideFromResume: hide != 0,
+					LastPlayed:     parseEmbyTimestamp(playedOn),
 				})
 			}
 		}
@@ -1597,6 +1903,8 @@ func classifyEmbyType(raw string, enumKind bool) string {
 			return "Season"
 		case 8:
 			return "Episode"
+		case 9:
+			return "BoxSet"
 		case 1, 2:
 			if !enumKind {
 				return "CollectionFolder"
@@ -1616,6 +1924,8 @@ func classifyEmbyType(raw string, enumKind bool) string {
 		return "Season"
 	case strings.HasSuffix(lower, ".episode") || lower == "episode":
 		return "Episode"
+	case strings.HasSuffix(lower, ".boxset") || lower == "boxset":
+		return "BoxSet"
 	default:
 		return ""
 	}
@@ -1627,6 +1937,8 @@ func mapEmbyContentType(raw string) string {
 		return "movies"
 	case "tvshows":
 		return "tvshows"
+	case "boxsets":
+		return "boxsets"
 	default:
 		return "mixed"
 	}

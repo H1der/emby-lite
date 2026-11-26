@@ -9,10 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"emby-lite/internal/cache"
 	"emby-lite/internal/config"
 	"emby-lite/internal/database"
+	"emby-lite/internal/model"
 	"emby-lite/internal/server"
 )
 
@@ -560,5 +562,122 @@ func TestEmbyEndToEndPlaybackAndPermissions(t *testing.T) {
 	recActorImg := doJSON(t, h, http.MethodGet, "/emby/Persons/Matthew%20McConaughey/Images/Primary", adminTok, nil)
 	if recActorImg.Code != http.StatusOK || !strings.Contains(recActorImg.Body.String(), "ACTORPORTRAIT") {
 		t.Fatalf("expected mounted Emby actor portrait served, got %d %q", recActorImg.Code, recActorImg.Body.String())
+	}
+}
+
+func TestBoxSetLibraryBrowsing(t *testing.T) {
+	srv, tmp := setupTestServer(t)
+	h := srv.Handler
+
+	rec := doJSON(t, h, http.MethodPost, "/api/web/setup", "", map[string]any{
+		"username":    "admin",
+		"password":    "BoxSet-Pass-123",
+		"server_name": "BoxSet Test",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup failed: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, h, http.MethodPost, "/emby/Users/AuthenticateByName", "", map[string]any{
+		"Username": "admin",
+		"Pw":       "BoxSet-Pass-123",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("login failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var login struct {
+		AccessToken string `json:"AccessToken"`
+		User        struct {
+			ID string `json:"Id"`
+		} `json:"User"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &login); err != nil {
+		t.Fatalf("parse login: %v", err)
+	}
+	if login.AccessToken == "" || login.User.ID == "" {
+		t.Fatalf("missing login fields: %s", rec.Body.String())
+	}
+
+	newLibrary := func(name, kind string, paths []string) string {
+		rec := doJSON(t, h, http.MethodPost, "/api/admin/libraries", login.AccessToken, map[string]any{
+			"name":  name,
+			"kind":  kind,
+			"paths": paths,
+		})
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %s library failed: %d %s", kind, rec.Code, rec.Body.String())
+		}
+		var lib struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &lib); err != nil || lib.ID == "" {
+			t.Fatalf("parse %s library: %v %s", kind, err, rec.Body.String())
+		}
+		return lib.ID
+	}
+	boxLibID := newLibrary("合集", "boxsets", nil)
+	movieLibID := newLibrary("电影", "movies", []string{filepath.Join(tmp, "boxset-movies")})
+
+	now := time.Now().UTC()
+	boxItem := model.Item{ID: "boxset-e2e", LibraryID: boxLibID, ParentID: boxLibID, Type: "BoxSet", Name: "诺兰合集", SortName: "诺兰合集", IsFolder: true, ScanKey: "e2e:boxset", RandomKey: "boxsete2e", AddedAt: now, CreatedAt: now}
+	movieItem := model.Item{ID: "boxset-movie-e2e", LibraryID: movieLibID, Type: "Movie", Name: "盗梦空间", SortName: "盗梦空间", ScanKey: "e2e:boxset-movie", RandomKey: "boxmoviee2e", AddedAt: now, CreatedAt: now}
+	if err := srv.DB.Gorm.Create(&boxItem).Error; err != nil {
+		t.Fatalf("create boxset item: %v", err)
+	}
+	if err := srv.DB.Gorm.Create(&movieItem).Error; err != nil {
+		t.Fatalf("create movie item: %v", err)
+	}
+	if err := srv.DB.Gorm.Create(&model.BoxSet{ID: boxItem.ID, LibraryID: boxLibID, Name: boxItem.Name, SortName: boxItem.SortName, CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatalf("create boxset: %v", err)
+	}
+	if err := srv.DB.Gorm.Create(&model.BoxSetItem{BoxSetID: boxItem.ID, ItemID: movieItem.ID, SortIdx: 0}).Error; err != nil {
+		t.Fatalf("create boxset link: %v", err)
+	}
+
+	type itemList struct {
+		Items []struct {
+			ID       string `json:"Id"`
+			Name     string `json:"Name"`
+			Type     string `json:"Type"`
+			IsFolder bool   `json:"IsFolder"`
+		} `json:"Items"`
+	}
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+login.User.ID+"/Items?ParentId="+boxLibID, login.AccessToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list boxsets library: %d %s", rec.Code, rec.Body.String())
+	}
+	var listed itemList
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("parse boxsets library: %v", err)
+	}
+	if len(listed.Items) != 1 || listed.Items[0].ID != boxItem.ID || listed.Items[0].Type != "BoxSet" || !listed.Items[0].IsFolder {
+		t.Fatalf("boxset not listed as folder: %+v", listed.Items)
+	}
+
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+login.User.ID+"/Items?ParentId="+boxItem.ID, login.AccessToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list boxset members: %d %s", rec.Code, rec.Body.String())
+	}
+	var members itemList
+	if err := json.Unmarshal(rec.Body.Bytes(), &members); err != nil {
+		t.Fatalf("parse boxset members: %v", err)
+	}
+	if len(members.Items) != 1 || members.Items[0].ID != movieItem.ID {
+		t.Fatalf("boxset members = %+v, want %s", members.Items, movieItem.ID)
+	}
+
+	rec = doJSON(t, h, http.MethodGet, "/emby/Items/"+boxItem.ID, login.AccessToken, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("boxset detail: %d %s", rec.Code, rec.Body.String())
+	}
+	var detail struct {
+		Type       string `json:"Type"`
+		IsFolder   bool   `json:"IsFolder"`
+		ChildCount int    `json:"ChildCount"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("parse boxset detail: %v", err)
+	}
+	if detail.Type != "BoxSet" || !detail.IsFolder || detail.ChildCount != 1 {
+		t.Fatalf("boxset detail = %+v", detail)
 	}
 }

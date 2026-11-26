@@ -91,7 +91,7 @@ type UserAvatar struct {
 type Library struct {
 	ID            string     `gorm:"primaryKey;size:64" json:"id"`
 	Name          string     `gorm:"size:128;not null" json:"name"`
-	Kind          string     `gorm:"size:32;not null" json:"kind"` // movies | tvshows | mixed
+	Kind          string     `gorm:"size:32;not null" json:"kind"` // movies | tvshows | mixed | boxsets
 	PathsJSON     string     `gorm:"type:text;not null" json:"-"`
 	Hidden        bool       `gorm:"default:false;not null" json:"hidden"`
 	SortOrder     int        `gorm:"default:0;not null" json:"sort_order"`
@@ -128,34 +128,40 @@ type LibraryCover struct {
 
 // Item represents a Movie, Series, Season, Episode, or Folder.
 type Item struct {
-	ID              string     `gorm:"primaryKey;size:64" json:"id"`
-	LibraryID       string     `gorm:"size:64;index:idx_items_lib_type;not null" json:"library_id"`
-	ParentID        string     `gorm:"size:64;index" json:"parent_id"`
-	SeriesID        string     `gorm:"size:64;index" json:"series_id"`
-	SeasonID        string     `gorm:"size:64;index" json:"season_id"`
-	Type            string     `gorm:"size:32;index:idx_items_lib_type;not null" json:"type"` // Movie | Series | Season | Episode | Folder
-	Name            string     `gorm:"size:512;index;not null" json:"name"`
-	OriginalName    string     `gorm:"size:512" json:"original_name"`
-	SortName        string     `gorm:"size:512;index" json:"sort_name"`
-	PinyinInitials  string     `gorm:"size:256;index" json:"pinyin_initials"`
-	Overview        string     `gorm:"type:text" json:"overview"`
-	Tagline         string     `gorm:"size:512" json:"tagline"`
-	Year            int        `gorm:"index" json:"year"`
-	PremiereDate    string     `gorm:"size:32" json:"premiere_date"` // YYYY-MM-DD
-	SeasonNum       int        `gorm:"index" json:"season_num"`
-	EpisodeNum      int        `gorm:"index" json:"episode_num"`
-	CommunityRating float64    `json:"community_rating"`
-	OfficialRating  string     `gorm:"size:32" json:"official_rating"`
-	RuntimeTicks    int64      `json:"runtime_ticks"`
-	ProviderIDsJSON string     `gorm:"type:text" json:"provider_ids_json"`
-	StudiosJSON     string     `gorm:"type:text" json:"studios_json"`
-	DirPath         string     `gorm:"size:1024;index" json:"dir_path"`
-	ScanKey         string     `gorm:"size:1024;uniqueIndex" json:"scan_key"`
-	RandomKey       string     `gorm:"size:32;index" json:"random_key"`
-	AddedAt         time.Time  `gorm:"index;not null" json:"added_at"`
-	SoftDeletedAt   *time.Time `gorm:"index" json:"soft_deleted_at"`
-	CreatedAt       time.Time  `json:"created_at"`
-	UpdatedAt       time.Time  `json:"updated_at"`
+	ID                      string     `gorm:"primaryKey;size:64" json:"id"`
+	LibraryID               string     `gorm:"size:64;index:idx_items_lib_type;not null" json:"library_id"`
+	ParentID                string     `gorm:"size:64;index" json:"parent_id"`
+	SeriesID                string     `gorm:"size:64;index" json:"series_id"`
+	SeasonID                string     `gorm:"size:64;index" json:"season_id"`
+	Type                    string     `gorm:"size:32;index:idx_items_lib_type;not null" json:"type"` // Movie | Series | Season | Episode | Folder | BoxSet
+	Name                    string     `gorm:"size:512;index;not null" json:"name"`
+	OriginalName            string     `gorm:"size:512" json:"original_name"`
+	SortName                string     `gorm:"size:512;index" json:"sort_name"`
+	PinyinInitials          string     `gorm:"size:256;index" json:"pinyin_initials"`
+	Overview                string     `gorm:"type:text" json:"overview"`
+	Tagline                 string     `gorm:"size:512" json:"tagline"`
+	Year                    int        `gorm:"index" json:"year"`
+	PremiereDate            string     `gorm:"size:32" json:"premiere_date"` // YYYY-MM-DD
+	SeasonNum               int        `gorm:"index" json:"season_num"`
+	EpisodeNum              int        `gorm:"index" json:"episode_num"`
+	CommunityRating         float64    `json:"community_rating"`
+	OfficialRating          string     `gorm:"size:32" json:"official_rating"`
+	RuntimeTicks            int64      `json:"runtime_ticks"`
+	CriticRating            float64    `json:"critic_rating"`
+	CustomRating            string     `gorm:"size:64" json:"custom_rating"`
+	ProductionLocationsJSON string     `gorm:"type:text" json:"-"`
+	Status                  string     `gorm:"size:32" json:"status"`
+	DisplayOrder            int        `gorm:"default:0" json:"display_order"`
+	IsFolder                bool       `gorm:"default:false;not null" json:"is_folder"`
+	ProviderIDsJSON         string     `gorm:"type:text" json:"provider_ids_json"`
+	StudiosJSON             string     `gorm:"type:text" json:"studios_json"`
+	DirPath                 string     `gorm:"size:1024;index" json:"dir_path"`
+	ScanKey                 string     `gorm:"size:1024;uniqueIndex" json:"scan_key"`
+	RandomKey               string     `gorm:"size:32;index" json:"random_key"`
+	AddedAt                 time.Time  `gorm:"index;not null" json:"added_at"`
+	SoftDeletedAt           *time.Time `gorm:"index" json:"soft_deleted_at"`
+	CreatedAt               time.Time  `json:"created_at"`
+	UpdatedAt               time.Time  `json:"updated_at"`
 }
 
 // MediaSource represents a concrete playable media file or STRM source for an Item (supports multi-version).
@@ -218,19 +224,19 @@ type Person struct {
 type ItemPerson struct {
 	ItemID   string `gorm:"primaryKey;size:64"`
 	PersonID string `gorm:"primaryKey;size:64;index"`
-	RoleType string `gorm:"primaryKey;size:32"` // Actor | Director | Writer
+	RoleType string `gorm:"primaryKey;size:32"` // Actor | Director | Writer | Producer | GuestStar | Composer | ...
 	RoleName string `gorm:"size:256"`
 	SortIdx  int    `gorm:"default:0"`
 }
 
 type ItemImage struct {
-	ID         string    `gorm:"primaryKey;size:64"`
-	ItemID     string    `gorm:"size:64;index:idx_item_images_lookup;not null"`
-	Kind       string    `gorm:"size:32;index:idx_item_images_lookup;not null"` // Primary | Backdrop | Thumb | Logo | Banner
-	IndexNum   int       `gorm:"default:0;not null"`
-	SourceType string    `gorm:"size:16;not null"` // local | remote | upload
-	SourceRef  string    `gorm:"size:1024;not null"`
-	Tag        string    `gorm:"size:64;not null"`
+	ID         string `gorm:"primaryKey;size:64"`
+	ItemID     string `gorm:"size:64;index:idx_item_images_lookup;not null"`
+	Kind       string `gorm:"size:32;index:idx_item_images_lookup;not null"` // Primary | Backdrop | Thumb | Logo | Banner
+	IndexNum   int    `gorm:"default:0;not null"`
+	SourceType string `gorm:"size:16;not null"` // local | remote | upload
+	SourceRef  string `gorm:"size:1024;not null"`
+	Tag        string `gorm:"size:64;not null"`
 	Width      int
 	Height     int
 	UpdatedAt  time.Time
@@ -295,6 +301,42 @@ type IntroMarker struct {
 	Source            string    `gorm:"size:32" json:"source"`
 	Confidence        float64   `json:"confidence"`
 	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+// ItemChapter stores the chapter markers embedded in a media file.
+type ItemChapter struct {
+	ItemID     string `gorm:"primaryKey;size:64"`
+	IndexNum   int    `gorm:"primaryKey"`
+	StartTicks int64  `json:"start_ticks"`
+	Name       string `gorm:"size:512" json:"name"`
+	MarkerType int    `json:"marker_type"`
+	ImagePath  string `gorm:"size:1024" json:"-"`
+}
+
+// BoxSet mirrors an Emby collection (MediaItems.type=9).
+type BoxSet struct {
+	ID              string    `gorm:"primaryKey;size:64" json:"id"`
+	LibraryID       string    `gorm:"size:64;index" json:"library_id"`
+	Name            string    `gorm:"size:512;not null" json:"name"`
+	SortName        string    `gorm:"size:512" json:"sort_name"`
+	Overview        string    `gorm:"type:text" json:"overview"`
+	ProviderIDsJSON string    `gorm:"type:text" json:"-"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+type BoxSetItem struct {
+	BoxSetID string `gorm:"primaryKey;size:64"`
+	ItemID   string `gorm:"primaryKey;size:64;index"`
+	SortIdx  int    `gorm:"default:0"`
+}
+
+// UserSetting stores a raw Emby user preference blob (usersettings, usernotifications, ...).
+type UserSetting struct {
+	UserID    string    `gorm:"primaryKey;size:64" json:"user_id"`
+	Key       string    `gorm:"primaryKey;size:128" json:"key"`
+	Value     string    `gorm:"type:text;not null" json:"value"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type ScanFile struct {
@@ -377,6 +419,10 @@ func AllModels() []any {
 		&UserData{},
 		&PlaybackLease{},
 		&IntroMarker{},
+		&ItemChapter{},
+		&BoxSet{},
+		&BoxSetItem{},
+		&UserSetting{},
 		&ScanFile{},
 		&BackgroundTask{},
 		&ProviderCache{},

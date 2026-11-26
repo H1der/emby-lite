@@ -35,9 +35,14 @@ type itemBatchRow struct {
 	// and doing that for every freshly inserted row would make a full migration quadratic.
 	existed bool
 
-	genres []model.ItemGenre
-	source *model.MediaSource
-	images []model.ItemImage
+	genres    []model.ItemGenre
+	tags      []model.ItemTag
+	chapters  []model.ItemChapter
+	subtitles []model.MediaSubtitle
+	source    *model.MediaSource
+	images    []model.ItemImage
+	boxSet    *model.BoxSet
+	boxItems  []model.BoxSetItem
 }
 
 func newItemBatch(db *gorm.DB, hasFTS bool) *itemBatch {
@@ -84,7 +89,19 @@ func (b *itemBatch) writeRows(rows []itemBatchRow) error {
 		if err := b.replaceGenres(tx, rows); err != nil {
 			return err
 		}
+		if err := b.replaceTags(tx, rows); err != nil {
+			return err
+		}
+		if err := b.replaceChapters(tx, rows); err != nil {
+			return err
+		}
 		if err := b.saveSources(tx, rows); err != nil {
+			return err
+		}
+		if err := b.replaceSubtitles(tx, rows); err != nil {
+			return err
+		}
+		if err := b.saveBoxSets(tx, rows); err != nil {
 			return err
 		}
 		return b.saveImages(tx, rows)
@@ -107,6 +124,9 @@ func (b *itemBatch) saveItems(tx *gorm.DB, rows []itemBatchRow) error {
 		}
 		items := make([]model.Item, 0, end-start)
 		for _, row := range rows[start:end] {
+			if row.item.ID == "" {
+				continue
+			}
 			items = append(items, row.item)
 		}
 		if err := tx.Clauses(clause.OnConflict{
@@ -128,7 +148,7 @@ func (b *itemBatch) syncFTS(tx *gorm.DB, rows []itemBatchRow) error {
 
 	var replaced []string
 	for _, row := range rows {
-		if row.existed {
+		if row.existed && row.item.ID != "" {
 			replaced = append(replaced, row.item.ID)
 		}
 	}
@@ -139,6 +159,9 @@ func (b *itemBatch) syncFTS(tx *gorm.DB, rows []itemBatchRow) error {
 	}
 
 	values, args := ftsValues(rows)
+	if values == "" {
+		return nil
+	}
 	return tx.Exec(values, args...).Error
 }
 
@@ -148,16 +171,119 @@ func (b *itemBatch) replaceGenres(tx *gorm.DB, rows []itemBatchRow) error {
 	itemIDs := make([]string, 0, len(rows))
 	genres := make([]model.ItemGenre, 0, len(rows))
 	for _, row := range rows {
+		if row.item.ID == "" {
+			continue
+		}
 		itemIDs = append(itemIDs, row.item.ID)
 		genres = append(genres, row.genres...)
 	}
-	if len(genres) == 0 {
+	if len(itemIDs) == 0 {
 		return nil
 	}
 	if err := tx.Where("item_id IN ?", itemIDs).Delete(&model.ItemGenre{}).Error; err != nil {
 		return err
 	}
+	if len(genres) == 0 {
+		return nil
+	}
 	return tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(genres, batchSize).Error
+}
+
+// replaceTags rewrites tag links for the batch so re-imports do not leave stale tags.
+func (b *itemBatch) replaceTags(tx *gorm.DB, rows []itemBatchRow) error {
+	itemIDs := make([]string, 0, len(rows))
+	tags := make([]model.ItemTag, 0, len(rows))
+	for _, row := range rows {
+		if row.item.ID == "" {
+			continue
+		}
+		itemIDs = append(itemIDs, row.item.ID)
+		tags = append(tags, row.tags...)
+	}
+	if len(itemIDs) == 0 {
+		return nil
+	}
+	if err := tx.Where("item_id IN ?", itemIDs).Delete(&model.ItemTag{}).Error; err != nil {
+		return err
+	}
+	if len(tags) == 0 {
+		return nil
+	}
+	return tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(tags, batchSize).Error
+}
+
+func (b *itemBatch) replaceChapters(tx *gorm.DB, rows []itemBatchRow) error {
+	itemIDs := make([]string, 0, len(rows))
+	chapters := make([]model.ItemChapter, 0, len(rows))
+	for _, row := range rows {
+		if row.item.ID == "" {
+			continue
+		}
+		itemIDs = append(itemIDs, row.item.ID)
+		chapters = append(chapters, row.chapters...)
+	}
+	if len(itemIDs) == 0 {
+		return nil
+	}
+	if err := tx.Where("item_id IN ?", itemIDs).Delete(&model.ItemChapter{}).Error; err != nil {
+		return err
+	}
+	if len(chapters) == 0 {
+		return nil
+	}
+	return tx.CreateInBatches(chapters, batchSize).Error
+}
+
+func (b *itemBatch) replaceSubtitles(tx *gorm.DB, rows []itemBatchRow) error {
+	itemIDs := make([]string, 0, len(rows))
+	subs := make([]model.MediaSubtitle, 0, len(rows))
+	for _, row := range rows {
+		if row.item.ID == "" {
+			continue
+		}
+		itemIDs = append(itemIDs, row.item.ID)
+		subs = append(subs, row.subtitles...)
+	}
+	if len(itemIDs) == 0 {
+		return nil
+	}
+	if err := tx.Where("item_id IN ?", itemIDs).Delete(&model.MediaSubtitle{}).Error; err != nil {
+		return err
+	}
+	if len(subs) == 0 {
+		return nil
+	}
+	return tx.CreateInBatches(subs, batchSize).Error
+}
+
+func (b *itemBatch) saveBoxSets(tx *gorm.DB, rows []itemBatchRow) error {
+	var sets []model.BoxSet
+	for _, row := range rows {
+		if row.boxSet != nil {
+			sets = append(sets, *row.boxSet)
+		}
+	}
+	if len(sets) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(sets))
+	for _, s := range sets {
+		ids = append(ids, s.ID)
+	}
+	if err := tx.Where("box_set_id IN ?", ids).Delete(&model.BoxSetItem{}).Error; err != nil {
+		return err
+	}
+	if err := tx.Clauses(clause.OnConflict{Columns: []clause.Column{{Name: "id"}}, UpdateAll: true}).CreateInBatches(sets, batchSize).Error; err != nil {
+		return err
+	}
+	var links []model.BoxSetItem
+	for _, row := range rows {
+		links = append(links, row.boxItems...)
+	}
+	if len(links) == 0 {
+		return nil
+	}
+	return tx.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(links, batchSize).Error
 }
 
 func (b *itemBatch) saveSources(tx *gorm.DB, rows []itemBatchRow) error {
@@ -195,12 +321,20 @@ func ftsValues(rows []itemBatchRow) (sql string, args []any) {
 	var sb strings.Builder
 	sb.WriteString("INSERT INTO items_fts(item_id, name, original_name, pinyin_initials) VALUES ")
 	args = make([]any, 0, len(rows)*4)
-	for i, row := range rows {
-		if i > 0 {
+	count := 0
+	for _, row := range rows {
+		if row.item.ID == "" {
+			continue
+		}
+		if count > 0 {
 			sb.WriteString(",")
 		}
 		sb.WriteString("(?,?,?,?)")
 		args = append(args, row.item.ID, row.item.Name, row.item.OriginalName, row.item.PinyinInitials)
+		count++
+	}
+	if count == 0 {
+		return "", nil
 	}
 	return sb.String(), args
 }

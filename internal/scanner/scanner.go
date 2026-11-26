@@ -317,11 +317,11 @@ type dirSnapshot struct {
 }
 
 type scanCandidate struct {
-	root string
-	path string
-	dir  string
-	name string
-	size int64
+	root  string
+	path  string
+	dir   string
+	name  string
+	size  int64
 	mtime int64
 }
 
@@ -720,6 +720,9 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 		return nil, err
 	}
 
+	if lib.Kind == "boxsets" {
+		return &ScanStats{LibraryID: libraryID, StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}, nil
+	}
 	var paths []string
 	_ = json.Unmarshal([]byte(lib.PathsJSON), &paths)
 	if len(paths) == 0 {

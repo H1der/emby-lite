@@ -204,7 +204,8 @@ const sortBy = ref('DateCreated')
 const sortOrder = ref<'Ascending' | 'Descending'>('Descending')
 const favOnly = ref(route.query.fav === '1')
 const unplayedOnly = ref(false)
-const typeFilter = ref<'all' | 'Movie' | 'Series'>('all')
+const typeFilter = ref<string>('all')
+const collectionType = ref('')
 const selectedGenre = ref<string | null>(null)
 const selectedYear = ref<number | null>(null)
 const letter = ref('')
@@ -226,11 +227,19 @@ const sortOptions = [
   { label: '随机发现', value: 'Random' },
 ]
 
-const typeFilterOptions: { label: string; value: 'all' | 'Movie' | 'Series' }[] = [
-  { label: '全部', value: 'all' },
-  { label: '电影', value: 'Movie' },
-  { label: '剧集', value: 'Series' },
-]
+const typeFilterOptions = computed<{ label: string; value: string }[]>(() => {
+  if (collectionType.value === 'boxsets') {
+    return [
+      { label: '全部', value: 'all' },
+      { label: '合集', value: 'BoxSet' },
+    ]
+  }
+  return [
+    { label: '全部', value: 'all' },
+    { label: '电影', value: 'Movie' },
+    { label: '剧集', value: 'Series' },
+  ]
+})
 
 const hasActiveFilters = computed(() =>
   Boolean(
@@ -292,6 +301,12 @@ async function loadMetaAndFilters() {
   if (libId && libId !== 'all') {
     const info = await apiFetchCached(`/emby/Items/${libId}`, { ttlMs: 60000 }).catch(() => null)
     title.value = info?.Name || '媒体库'
+    collectionType.value = String(info?.CollectionType || '')
+    if (collectionType.value === 'boxsets') {
+      if (typeFilter.value !== 'all' && typeFilter.value !== 'BoxSet') typeFilter.value = 'all'
+    } else if (typeFilter.value === 'BoxSet') {
+      typeFilter.value = 'all'
+    }
   } else if (favOnly.value) {
     title.value = '我的收藏'
   } else if (search.value.trim()) {
@@ -349,7 +364,7 @@ function toggleSortOrder() {
   reload()
 }
 
-function selectType(val: 'all' | 'Movie' | 'Series') {
+function selectType(val: string) {
   typeFilter.value = val
   reload()
 }

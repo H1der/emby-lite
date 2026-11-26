@@ -100,7 +100,7 @@ func (a *AdminHandler) Bootstrap(c *gin.Context) {
 		"initialized": initialized,
 		"server_name": a.db.GetSetting("server_name", a.cfg.Server.ServerName),
 		"server_id":   a.db.GetSetting("server_id", ""),
-		"version":     "0.3.1",
+		"version":     "0.3.2",
 	})
 }
 
@@ -238,8 +238,8 @@ func (a *AdminHandler) Dashboard(c *gin.Context) {
 
 type libraryPayload struct {
 	Name         string   `json:"name" binding:"required"`
-	Kind         string   `json:"kind" binding:"required"` // movies | tvshows | mixed
-	Paths        []string `json:"paths" binding:"required,min=1"`
+	Kind         string   `json:"kind" binding:"required"` // movies | tvshows | mixed | boxsets
+	Paths        []string `json:"paths"`
 	Hidden       bool     `json:"hidden"`
 	SortOrder    int      `json:"sort_order"`
 	ScanSchedule string   `json:"scan_schedule"`
@@ -280,8 +280,12 @@ func (a *AdminHandler) CreateLibrary(c *gin.Context) {
 		return
 	}
 	kind := strings.ToLower(strings.TrimSpace(body.Kind))
-	if kind != "movies" && kind != "tvshows" && kind != "mixed" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "kind must be movies, tvshows, or mixed"})
+	if kind != "movies" && kind != "tvshows" && kind != "mixed" && kind != "boxsets" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "kind must be movies, tvshows, mixed, or boxsets"})
+		return
+	}
+	if kind != "boxsets" && len(cleanPaths(body.Paths)) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "paths is required"})
 		return
 	}
 	pathsBytes, _ := json.Marshal(cleanPaths(body.Paths))
@@ -313,6 +317,10 @@ func (a *AdminHandler) UpdateLibrary(c *gin.Context) {
 	var body libraryPayload
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if strings.ToLower(strings.TrimSpace(body.Kind)) != "boxsets" && len(cleanPaths(body.Paths)) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "paths is required"})
 		return
 	}
 	pathsBytes, _ := json.Marshal(cleanPaths(body.Paths))
