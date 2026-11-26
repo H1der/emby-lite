@@ -84,13 +84,15 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 	}
 
 	var sources []model.MediaSource
-	if err := s.db.Read().Where("item_id IN ?", itemIDs).Order("id ASC").Find(&sources).Error; err != nil || len(sources) == 0 {
+	if err := s.db.Read().Where("item_id IN ?", itemIDs).Order("height DESC, bitrate DESC, file_size DESC, id ASC").Find(&sources).Error; err != nil || len(sources) == 0 {
 		return result
 	}
 
+	sourceCountByItem := make(map[string]int, len(items))
 	sourceIDs := make([]string, 0, len(sources))
 	for _, src := range sources {
 		sourceIDs = append(sourceIDs, src.ID)
+		sourceCountByItem[src.ItemID]++
 	}
 
 	subsBySource := make(map[string][]model.MediaSubtitle, len(sourceIDs))
@@ -149,6 +151,10 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 		name := item.Name
 		if src.VersionLabel != "" {
 			name = item.Name + " - " + src.VersionLabel
+		} else if sourceCountByItem[item.ID] > 1 {
+			if fallback := fallbackVersionLabel(&src); fallback != "" {
+				name = item.Name + " - " + fallback
+			}
 		}
 
 		runtimeTicks := item.RuntimeTicks
@@ -233,7 +239,7 @@ func (s *Service) Stream(w http.ResponseWriter, r *http.Request, p *auth.Princip
 	if mediaSourceID != "" {
 		q = q.Where("id = ?", mediaSourceID)
 	}
-	if err := q.Order("id ASC").First(&src).Error; err != nil {
+	if err := q.Order("height DESC, bitrate DESC, file_size DESC, id ASC").First(&src).Error; err != nil {
 		writeErr(w, http.StatusNotFound, "media source not found")
 		return
 	}
@@ -390,6 +396,42 @@ func mediaContentType(path string) string {
 	default:
 		return "application/octet-stream"
 	}
+}
+
+func fallbackVersionLabel(src *model.MediaSource) string {
+	if src == nil {
+		return ""
+	}
+	var parts []string
+	if src.Width >= 3800 || src.Height >= 2100 {
+		parts = append(parts, "4K")
+	} else if src.Width >= 1900 || src.Height >= 1000 {
+		parts = append(parts, "1080p")
+	} else if src.Width >= 1200 || src.Height >= 700 {
+		parts = append(parts, "720p")
+	}
+	if src.HDRType != "" && !strings.EqualFold(src.HDRType, "SDR") {
+		parts = append(parts, strings.ToUpper(src.HDRType))
+	}
+	if src.VideoCodec != "" {
+		parts = append(parts, strings.ToUpper(src.VideoCodec))
+	}
+	if src.FileSize > 0 {
+		gb := float64(src.FileSize) / (1024 * 1024 * 1024)
+		if gb >= 1 {
+			parts = append(parts, fmt.Sprintf("%.1fGB", gb))
+		} else {
+			parts = append(parts, fmt.Sprintf("%.0fMB", float64(src.FileSize)/(1024*1024)))
+		}
+	}
+	if len(parts) > 0 {
+		return strings.Join(parts, " · ")
+	}
+	if src.Path != "" {
+		base := filepath.Base(src.Path)
+		return strings.TrimSuffix(base, filepath.Ext(base))
+	}
+	return ""
 }
 
 func writeErr(w http.ResponseWriter, status int, msg string) {

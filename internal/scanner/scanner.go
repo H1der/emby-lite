@@ -31,18 +31,22 @@ type ProgressFunc func(progress, total int, message string)
 
 // ScanStats summarizes the outcome of a library scan.
 type ScanStats struct {
-	LibraryID    string    `json:"library_id"`
-	RunID        string    `json:"run_id"`
-	FilesFound   int       `json:"files_found"`
-	ItemsAdded   int       `json:"items_added"`
-	ItemsUpdated int       `json:"items_updated"`
-	ItemsMoved   int       `json:"items_moved"`
-	ItemsSkipped int       `json:"items_skipped"`
-	ItemsRemoved int       `json:"items_removed"`
-	DurationMs   int64     `json:"duration_ms"`
-	StartedAt    time.Time `json:"started_at"`
-	FinishedAt   time.Time `json:"finished_at"`
-	Error        string    `json:"error,omitempty"`
+	LibraryID      string    `json:"library_id"`
+	RunID          string    `json:"run_id"`
+	FilesFound     int       `json:"files_found"`
+	ItemsAdded     int       `json:"items_added"`
+	ItemsUpdated   int       `json:"items_updated"`
+	ItemsMoved     int       `json:"items_moved"`
+	ItemsSkipped   int       `json:"items_skipped"`
+	ItemsRemoved   int       `json:"items_removed"`
+	SeriesMerged   int       `json:"series_merged"`
+	SeasonsMerged  int       `json:"seasons_merged"`
+	MoviesMerged   int       `json:"movies_merged"`
+	EpisodesMerged int       `json:"episodes_merged"`
+	DurationMs     int64     `json:"duration_ms"`
+	StartedAt      time.Time `json:"started_at"`
+	FinishedAt     time.Time `json:"finished_at"`
+	Error          string    `json:"error,omitempty"`
 }
 
 type Service struct {
@@ -720,11 +724,13 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 		return nil, err
 	}
 
-	if lib.Kind == "boxsets" {
-		return &ScanStats{LibraryID: libraryID, StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}, nil
-	}
 	var paths []string
 	_ = json.Unmarshal([]byte(lib.PathsJSON), &paths)
+	if lib.Kind == "boxsets" {
+		// Collections are materialized by the Emby migration and have no
+		// filesystem paths, so there is nothing to scan.
+		return &ScanStats{LibraryID: libraryID, StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}, nil
+	}
 	if len(paths) == 0 {
 		return nil, errors.New("library has no paths configured")
 	}
@@ -1053,6 +1059,20 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 		stats.ItemsRemoved = removed
 	}
 
+	// Stage 8: Auto-group cross-folder TV series & auto-merge multi-version movies/episodes.
+	mergedTotal := 0
+	if scanErr == nil && (lib.AutoMergeVersions || lib.AutoGroupSeries) && (stats.ItemsAdded > 0 || stats.ItemsUpdated > 0 || stats.ItemsMoved > 0 || stats.ItemsRemoved > 0 || lib.LastScannedAt == nil) {
+		if cStats, cErr := ConsolidateLibrary(s.db, lib.ID); cErr != nil {
+			slog.Warn("library consolidation warning", "library", lib.Name, "err", cErr)
+		} else if cStats != nil {
+			stats.SeriesMerged = cStats.SeriesMerged
+			stats.SeasonsMerged = cStats.SeasonsMerged
+			stats.MoviesMerged = cStats.MoviesMerged
+			stats.EpisodesMerged = cStats.EpisodesMerged
+			mergedTotal = cStats.TotalMerged()
+		}
+	}
+
 	var totalCount int64
 	s.db.Read().Model(&model.Item{}).
 		Where("library_id = ? AND soft_deleted_at IS NULL AND type IN ?", lib.ID, []string{"Movie", "Series"}).
@@ -1074,13 +1094,17 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 	_ = s.db.Gorm.Model(&lib).Updates(updates).Error
 
 	// Only bump library revision if something actually changed or on initial scan.
-	if stats.ItemsAdded > 0 || stats.ItemsUpdated > 0 || stats.ItemsMoved > 0 || stats.ItemsRemoved > 0 || lib.LastScannedAt == nil {
+	if stats.ItemsAdded > 0 || stats.ItemsUpdated > 0 || stats.ItemsMoved > 0 || stats.ItemsRemoved > 0 || mergedTotal > 0 || lib.LastScannedAt == nil {
 		s.db.BumpLibraryRevision()
 	}
 
 	if report != nil {
-		report(len(candidates), len(candidates), fmt.Sprintf("完成 (%dms)：新增 %d，移动 %d，更新 %d，跳过 %d，移除 %d",
-			stats.DurationMs, stats.ItemsAdded, stats.ItemsMoved, stats.ItemsUpdated, stats.ItemsSkipped, stats.ItemsRemoved))
+		msg := fmt.Sprintf("完成 (%dms)：新增 %d，移动 %d，更新 %d，跳过 %d，移除 %d",
+			stats.DurationMs, stats.ItemsAdded, stats.ItemsMoved, stats.ItemsUpdated, stats.ItemsSkipped, stats.ItemsRemoved)
+		if mergedTotal > 0 {
+			msg += fmt.Sprintf("，自动合并 %d", mergedTotal)
+		}
+		report(len(candidates), len(candidates), msg)
 	}
 
 	slog.Info("library scan finished",
@@ -1422,16 +1446,18 @@ func (s *Service) relocateMovedItemTx(tx *gorm.DB, lib *model.Library, oldSF *mo
 	if err := tx.Where("id = ?", oldSF.ItemID).First(&item).Error; err != nil {
 		return false
 	}
+	var srcCount int64
+	tx.Model(&model.MediaSource{}).Where("item_id = ?", item.ID).Count(&srcCount)
 	prefix := "movie"
 	if item.Type == "Episode" {
 		prefix = "episode"
 	}
-	newScanKey := fmt.Sprintf("%s:%s:%s", prefix, lib.ID, filepath.Clean(cand.path))
-	if err := tx.Model(&item).Updates(map[string]any{
-		"scan_key":        newScanKey,
-		"dir_path":        cand.dir,
-		"soft_deleted_at": nil,
-	}).Error; err != nil {
+	updates := map[string]any{"soft_deleted_at": nil}
+	if srcCount <= 1 || item.ScanKey == fmt.Sprintf("%s:%s:%s", prefix, lib.ID, filepath.Clean(oldSF.Path)) {
+		updates["scan_key"] = fmt.Sprintf("%s:%s:%s", prefix, lib.ID, filepath.Clean(cand.path))
+		updates["dir_path"] = cand.dir
+	}
+	if err := tx.Model(&item).Updates(updates).Error; err != nil {
 		return false
 	}
 
@@ -1916,6 +1942,14 @@ func (s *Service) cleanupMissing(lib *model.Library, oldFiles []model.ScanFile, 
 	_ = s.db.Gorm.Transaction(func(tx *gorm.DB) error {
 		for _, sf := range vanished {
 			_ = tx.Where("library_id = ? AND path = ?", lib.ID, sf.Path).Delete(&model.ScanFile{}).Error
+			var deadSrcs []model.MediaSource
+			if tx.Where("path = ?", sf.Path).Find(&deadSrcs).Error == nil && len(deadSrcs) > 0 {
+				deadIDs := make([]string, len(deadSrcs))
+				for i, ds := range deadSrcs {
+					deadIDs[i] = ds.ID
+				}
+				_ = tx.Where("media_source_id IN ?", deadIDs).Delete(&model.MediaSubtitle{}).Error
+			}
 			_ = tx.Where("path = ?", sf.Path).Delete(&model.MediaSource{}).Error
 			if sf.ItemID != "" && !seenItems[sf.ItemID] {
 				_ = tx.Model(&model.Item{}).Where("id = ?", sf.ItemID).Update("soft_deleted_at", now).Error

@@ -114,7 +114,7 @@ emby-lite/
 | | `api_keys` | `id`, `name`, `key_hash`, `created_by`, `created_at`（仅限工具查询与标准管理兼容，不可调用 `/api/admin/*` 与个人写状态） |
 | | `user_devices` | `user_id`, `device_id`, `device_name`, `client`, `ip`, `first_seen_at`, `last_seen_at`, `blocked` |
 | | `user_avatars` | `user_id`, `mime`, `data`（BLOB/BYTEA）, `revision` |
-| **媒体库与虚拟库** | `libraries` | `id`, `name`, `kind`（movies/tvshows/mixed）, `paths_json`（支持多根路径）, `hidden`, `sort_order`, `scan_schedule`, `cover_revision`, `status`, `last_scanned_at` |
+| **媒体库与虚拟库** | `libraries` | `id`, `name`, `kind`（movies/tvshows/mixed/boxsets）, `paths_json`（支持多根路径）, `hidden`, `auto_merge_versions`（多版本自动合并）, `auto_group_series`（跨目录剧集自动合并，对应 Emby `EnableAutomaticSeriesGrouping`）, `sort_order`, `scan_schedule`, `cover_revision`, `status`, `last_scanned_at` |
 | | `virtual_libraries` | `id`, `name`, `rule_json`（按类型/标签/库组合/最近添加等动态规则）, `sort_order`, `enabled`, `cover_revision` |
 | | `library_covers` | `library_id`, `kind`（custom/collage）, `mime`, `data`, `revision`, `source_hash` |
 | **媒体条目与源** | `items` | `id`, `library_id`, `parent_id`, `series_id`, `season_id`, `type`（Movie/Series/Season/Episode/Folder）, `name`, `original_name`, `sort_name`, `pinyin_initials`, `overview`, `year`, `premiere_date`, `season_num`, `episode_num`, `community_rating`, `official_rating`, `runtime_ticks`, `provider_ids_json`, `added_at`, `random_key`, `soft_deleted_at` |
@@ -213,7 +213,7 @@ emby-lite/
 
 1. **增量扫描 v2（零改名接管 Emby 目录）**：
    - 借鉴 `LMBY` 与 `go-emby` 的 `scan_v2`：按 `(path, size, mtime)` 快速跳过未变更文件；目录内 NFO/海报/字幕变更通过 `dep_hash` 精确触发单目录增量刷新；支持通过文件指纹识别「文件移动/重命名」而不丢失观看进度、收藏和人工锁定字段。
-   - 命名解析器兼容常见 Emby/TMM/MoviePilot 目录结构（电影目录、多版本命名、剧集 `Season XX` / `S01E01` / 特别篇 `Season 00` / 合集）。
+   - 命名解析器兼容常见 Emby/TMM/MoviePilot 目录结构（电影目录、多版本命名、剧集 `Season XX` / `第X季` / `第一季` / `S01E01` / 特别篇 `Season 00` / `特别篇` / 合集），并在扫描、刮削与旧库迁移后通过统一合并引擎 `ConsolidateLibrary` 自动合并跨文件夹同剧集（含跨目录分季聚合）及同片/同集多版本源，同时兼容 Emby `POST /Videos/MergeVersions` 与 `DELETE /Videos/:id/AlternateSources` 手动合并/拆分。
 2. **原生媒体探测（`internal/nativeprobe`）**：
    - 纯 Go 解析 MKV/WebM（EBML）与 MP4/MOV（ISO BMFF）容器头，提取时长、分辨率、视频编码、HDR（HDR10/DV/HLG）、音轨语言/声道、内封字幕流。
    - 对 `.strm` 远程链接采用**有界 HTTP Range 请求**（例如仅读头部 + 尾部小块字节）探测，绝不下载整片，且可通过开关关闭或延迟到首次 `PlaybackInfo` 后台异步探测。

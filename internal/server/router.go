@@ -129,6 +129,12 @@ func New(cfg *config.Config, db *database.DB, cacheStore cache.Store) *Server {
 			rep.UsersCreated, rep.UsersExisting, rep.SettingsImported,
 			rep.WatchImported, rep.WatchSkipped,
 		)
+		if merged := rep.SeriesMerged + rep.MoviesMerged + rep.EpisodesMerged; merged > 0 {
+			summary += fmt.Sprintf("，自动合并：剧集 %d、电影 %d、单集 %d", rep.SeriesMerged, rep.MoviesMerged, rep.EpisodesMerged)
+		}
+		if rep.SnapshotDir != "" {
+			summary += fmt.Sprintf("，原始库快照：%s（%d 个文件）", rep.SnapshotDir, len(rep.SnapshotFiles))
+		}
 		if rep.ItemsFailed > 0 || rep.WatchFailed > 0 {
 			// Batched writes report how many rows had to be dropped; surfacing them keeps a
 			// silently lossy migration from looking like a clean one.
@@ -176,6 +182,7 @@ func New(cfg *config.Config, db *database.DB, cacheStore cache.Store) *Server {
 		adminAPI.PUT("/libraries/:id", adminHandler.UpdateLibrary)
 		adminAPI.DELETE("/libraries/:id", adminHandler.DeleteLibrary)
 		adminAPI.POST("/libraries/:id/scan", adminHandler.ScanLibrary)
+		adminAPI.POST("/libraries/:id/consolidate", adminHandler.ConsolidateLibrary)
 		adminAPI.POST("/libraries/:id/probe", adminHandler.ProbeLibrary)
 		adminAPI.POST("/libraries/:id/scrape", adminHandler.ScrapeLibrary)
 		adminAPI.POST("/libraries/:id/cover/generate", adminHandler.GenerateLibraryCover)
@@ -385,6 +392,8 @@ func registerEmbyRoutes(r *gin.Engine, h *emby.Handler) {
 		authed.GET("/scheduledtasks", h.ScheduledTasksCompat)
 		authed.POST("/library/refresh", h.RefreshLibraryCompat)
 		authed.POST("/items/:itemId/refresh", h.RefreshLibraryCompat)
+		authed.POST("/videos/mergeversions", h.MergeVersionsCompat)
+		authed.DELETE("/videos/:itemId/alternatesources", h.SplitVersionsCompat)
 	}
 }
 
@@ -419,6 +428,7 @@ var embyKeywords = map[string]bool{
 	"shows": true, "seasons": true, "episodes": true, "nextup": true,
 	"movies": true, "recommendations": true, "genres": true, "tags": true, "persons": true,
 	"displaypreferences": true, "videos": true, "subtitles": true, "scheduledtasks": true,
+	"mergeversions": true, "alternatesources": true,
 	"stream": true, "original": true, "master.m3u8": true, "main.m3u8": true,
 }
 

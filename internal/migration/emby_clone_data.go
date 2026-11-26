@@ -84,8 +84,9 @@ type embyExtras struct {
 // embyLibraryOptions is the subset of Emby's LibraryOptions extradata that
 // decides how a collection folder is presented and scanned.
 type embyLibraryOptions struct {
-	ContentType        string
-	MinCollectionItems int
+	ContentType                   string
+	MinCollectionItems            int
+	EnableAutomaticSeriesGrouping *bool
 }
 
 // readEmbyLibraryOptions reads the ContentType of every library from
@@ -116,13 +117,15 @@ func readEmbyLibraryOptions(sqlDB *sql.DB) map[string]embyLibraryOptions {
 			continue
 		}
 		var payload struct {
-			ContentType        string `json:"ContentType"`
-			MinCollectionItems int    `json:"MinCollectionItems"`
+			ContentType                   string `json:"ContentType"`
+			MinCollectionItems            int    `json:"MinCollectionItems"`
+			EnableAutomaticSeriesGrouping *bool  `json:"EnableAutomaticSeriesGrouping"`
 		}
 		if json.Unmarshal([]byte(raw), &payload) == nil {
 			out[itemID] = embyLibraryOptions{
-				ContentType:        payload.ContentType,
-				MinCollectionItems: payload.MinCollectionItems,
+				ContentType:                   payload.ContentType,
+				MinCollectionItems:            payload.MinCollectionItems,
+				EnableAutomaticSeriesGrouping: payload.EnableAutomaticSeriesGrouping,
 			}
 		}
 	}

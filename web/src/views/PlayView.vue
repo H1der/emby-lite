@@ -6,12 +6,30 @@
         <n-button size="small" secondary @click="router.back()">← 返回</n-button>
         <h1 class="text-base sm:text-lg font-bold text-ink truncate">{{ itemName }}</h1>
       </div>
-      <div v-if="extPlay" class="flex flex-wrap items-center gap-1.5">
-        <n-button size="small" secondary @click="copyUrl">复制直链</n-button>
-        <n-button size="small" quaternary tag="a" :href="extPlay.players.iina">IINA</n-button>
-        <n-button size="small" quaternary tag="a" :href="extPlay.players.potplayer">PotPlayer</n-button>
-        <n-button size="small" quaternary tag="a" :href="extPlay.players.infuse">Infuse</n-button>
-        <n-button v-if="extPlay.players.vlc" size="small" quaternary tag="a" :href="extPlay.players.vlc">VLC</n-button>
+      <div class="flex flex-wrap items-center gap-1.5">
+        <template v-if="mediaSources.length > 1">
+          <button
+            v-for="(src, idx) in mediaSources"
+            :key="src.Id"
+            type="button"
+            class="px-2.5 py-1 rounded-xl text-xs font-semibold transition"
+            :class="
+              mediaSourceId === src.Id
+                ? 'accent-gradient text-white shadow'
+                : 'glass-pill text-ink-secondary hover:text-sky-600 dark:hover:text-sky-400'
+            "
+            @click="switchSource(src)"
+          >
+            {{ sourceShortLabel(src, idx) }}
+          </button>
+        </template>
+        <template v-if="extPlay">
+          <n-button size="small" secondary @click="copyUrl">复制直链</n-button>
+          <n-button size="small" quaternary tag="a" :href="extPlay.players.iina">IINA</n-button>
+          <n-button size="small" quaternary tag="a" :href="extPlay.players.potplayer">PotPlayer</n-button>
+          <n-button size="small" quaternary tag="a" :href="extPlay.players.infuse">Infuse</n-button>
+          <n-button v-if="extPlay.players.vlc" size="small" quaternary tag="a" :href="extPlay.players.vlc">VLC</n-button>
+        </template>
       </div>
     </div>
 
@@ -82,6 +100,7 @@ const itemName = ref('播放中')
 const streamUrl = ref('')
 const playSessionId = ref('')
 const mediaSourceId = ref('')
+const mediaSources = ref<any[]>([])
 const resumeSeconds = ref(0)
 const extPlay = ref<any>(null)
 const playbackError = ref(false)
@@ -149,19 +168,49 @@ async function copyUrl() {
   message.success('已复制直连地址')
 }
 
+function sourceShortLabel(src: any, idx: number): string {
+  const full = String(src?.Name || '').trim()
+  const prefix = itemName.value + ' - '
+  if (full.startsWith(prefix) && full.length > prefix.length) {
+    return full.slice(prefix.length)
+  }
+  const parts: string[] = []
+  const w = Number(src?.Width || 0)
+  const h = Number(src?.Height || 0)
+  if (w >= 3800 || h >= 2100) parts.push('4K')
+  else if (w >= 1900 || h >= 1000) parts.push('1080P')
+  else if (w >= 1200 || h >= 700) parts.push('720P')
+  if (src?.HDRType && src.HDRType !== 'SDR') parts.push(String(src.HDRType).toUpperCase())
+  if (src?.VideoCodec) parts.push(String(src.VideoCodec).toUpperCase())
+  return parts.length > 0 ? parts.join(' ') : `版本 ${idx + 1}`
+}
+
+async function switchSource(src: any) {
+  if (!src || src.Id === mediaSourceId.value) return
+  if (videoRef.value && Number.isFinite(videoRef.value.currentTime)) {
+    resumeSeconds.value = videoRef.value.currentTime
+  }
+  playbackError.value = false
+  mediaSourceId.value = src.Id
+  streamUrl.value = '/emby' + src.DirectStreamUrl
+  extPlay.value = await apiFetch(`/api/web/external-play/${itemId}?media_source_id=${encodeURIComponent(src.Id)}`).catch(() => extPlay.value)
+}
+
 onMounted(async () => {
   const uid = auth.user?.Id
   if (!uid || !itemId) return
+  const querySourceId = typeof route.query.source === 'string' ? route.query.source : ''
   const [detail, pb, ext, intro] = await Promise.all([
     apiFetch(`/emby/Users/${uid}/Items/${itemId}`),
     apiFetch(`/emby/Items/${itemId}/PlaybackInfo`, { method: 'POST', body: '{}' }),
-    apiFetch(`/api/web/external-play/${itemId}`).catch(() => null),
+    apiFetch(`/api/web/external-play/${itemId}${querySourceId ? `?media_source_id=${encodeURIComponent(querySourceId)}` : ''}`).catch(() => null),
     apiFetch(`/api/web/intro/${itemId}`).catch(() => null),
   ])
   itemName.value = detail?.Name || '播放中'
   resumeSeconds.value = (detail?.UserData?.PlaybackPositionTicks || 0) / 1e7
   playSessionId.value = pb?.PlaySessionId || ''
-  const src = pb?.MediaSources?.[0]
+  mediaSources.value = pb?.MediaSources || []
+  const src = (querySourceId && mediaSources.value.find((s) => s.Id === querySourceId)) || mediaSources.value[0]
   if (src) {
     mediaSourceId.value = src.Id
     streamUrl.value = '/emby' + src.DirectStreamUrl

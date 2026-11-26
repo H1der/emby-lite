@@ -104,13 +104,35 @@
               {{ item.Overview }}
             </p>
 
+            <!-- Multi-Version Selector -->
+            <div v-if="mediaSources.length > 1" class="flex flex-wrap items-center gap-2 pt-1">
+              <span class="text-xs font-semibold text-ink-muted">版本 ({{ mediaSources.length }}):</span>
+              <button
+                v-for="(src, idx) in mediaSources"
+                :key="src.Id"
+                type="button"
+                class="px-3 py-1 rounded-xl text-xs font-semibold transition"
+                :class="
+                  activeSourceId === src.Id
+                    ? 'accent-gradient text-white shadow'
+                    : 'glass-pill text-ink-secondary hover:text-sky-600 dark:hover:text-sky-400'
+                "
+                @click="selectSource(src.Id)"
+              >
+                {{ sourceLabel(src, idx) }}
+              </button>
+              <n-button v-if="auth.isAdmin" size="tiny" quaternary type="warning" @click="splitVersions">
+                拆分版本
+              </n-button>
+            </div>
+
             <!-- Action Buttons -->
             <div class="flex flex-wrap items-center gap-2.5 pt-2">
               <button
                 v-if="item.Type === 'Movie' || item.Type === 'Episode'"
                 type="button"
                 class="px-5 py-2.5 rounded-2xl accent-gradient text-white text-sm font-semibold shadow-lg hover:brightness-110 active:scale-[0.98] transition flex items-center gap-2"
-                @click="router.push({ name: 'play', params: { id: item.Id } })"
+                @click="router.push({ name: 'play', params: { id: item.Id }, query: activeSourceId ? { source: activeSourceId } : undefined })"
               >
                 <span>▶</span>
                 <span>{{ item.UserData?.PlaybackPositionTicks > 0 ? '继续播放' : '网页直出播放' }}</span>
@@ -312,6 +334,7 @@ const episodes = ref<any[]>([])
 const boxsetItems = ref<any[]>([])
 const similarItems = ref<any[]>([])
 const activeSeasonId = ref('')
+const activeSourceId = ref('')
 const externalPlay = ref<any>(null)
 const showMetaEditor = ref(false)
 const showAllPeople = ref(false)
@@ -350,9 +373,58 @@ function formatRuntime(ticks?: number): string {
 
 const runtimeLabel = computed(() => formatRuntime(item.value?.RunTimeTicks))
 
+const mediaSources = computed<any[]>(() => item.value?.MediaSources || [])
+
+const activeSource = computed<any>(() => {
+  if (!mediaSources.value.length) return null
+  return mediaSources.value.find((s) => s.Id === activeSourceId.value) || mediaSources.value[0]
+})
+
+function sourceLabel(src: any, idx: number): string {
+  const full = String(src?.Name || '').trim()
+  const prefix = (item.value?.Name || '') + ' - '
+  if (full.startsWith(prefix) && full.length > prefix.length) {
+    return full.slice(prefix.length)
+  }
+  const parts: string[] = []
+  const w = Number(src?.Width || 0)
+  const h = Number(src?.Height || 0)
+  if (w >= 3800 || h >= 2100) parts.push('4K')
+  else if (w >= 1900 || h >= 1000) parts.push('1080P')
+  else if (w >= 1200 || h >= 700) parts.push('720P')
+  if (src?.HDRType && src.HDRType !== 'SDR') parts.push(String(src.HDRType).toUpperCase())
+  if (src?.VideoCodec) parts.push(String(src.VideoCodec).toUpperCase())
+  if (src?.Size > 0) {
+    const gb = src.Size / (1024 * 1024 * 1024)
+    parts.push(gb >= 1 ? `${gb.toFixed(1)} GB` : `${(src.Size / (1024 * 1024)).toFixed(0)} MB`)
+  }
+  return parts.length > 0 ? parts.join(' · ') : `版本 ${idx + 1}`
+}
+
+async function selectSource(sourceId: string) {
+  if (!item.value || activeSourceId.value === sourceId) return
+  activeSourceId.value = sourceId
+  externalPlay.value = await apiFetch(
+    `/api/web/external-play/${item.value.Id}?media_source_id=${encodeURIComponent(sourceId)}`,
+  ).catch(() => externalPlay.value)
+}
+
+async function splitVersions() {
+  if (!item.value) return
+  try {
+    await apiFetch(`/emby/Videos/${item.value.Id}/AlternateSources`, { method: 'DELETE' })
+    invalidateApiCache('/api/web/home')
+    invalidateApiCache('/emby/')
+    message.success('已将多版本拆分为独立条目')
+    await load()
+  } catch (e: any) {
+    message.error(e.message || '拆分版本失败')
+  }
+}
+
 const mediaSpecs = computed(() => {
   const specs: string[] = []
-  const src = item.value?.MediaSources?.[0]
+  const src = activeSource.value
   if (!src) return specs
   const w = Number(src.Width || 0)
   const h = Number(src.Height || 0)
@@ -423,6 +495,7 @@ async function load() {
       apiFetch(`/emby/Items/${id}/Similar?Limit=12`).catch(() => ({ Items: [] })),
     ])
     item.value = detail
+    activeSourceId.value = detail?.MediaSources?.[0]?.Id || ''
     similarItems.value = simRes?.Items || []
 
     if (detail?.Type === 'Series') {
@@ -435,7 +508,8 @@ async function load() {
       const members = await apiFetch(`/emby/Users/${uid}/Items?ParentId=${encodeURIComponent(id)}&Limit=200`).catch(() => null)
       boxsetItems.value = members?.Items || []
     } else if (detail?.Type === 'Movie' || detail?.Type === 'Episode') {
-      externalPlay.value = await apiFetch(`/api/web/external-play/${id}`).catch(() => null)
+      const q = activeSourceId.value ? `?media_source_id=${encodeURIComponent(activeSourceId.value)}` : ''
+      externalPlay.value = await apiFetch(`/api/web/external-play/${id}${q}`).catch(() => null)
     }
   } finally {
     loading.value = false

@@ -227,6 +227,9 @@ func (s *Service) ScrapeLibrary(ctx context.Context, libraryID string, force boo
 			stats.Skipped++
 		}
 	}
+	if stats.Matched > 0 {
+		_, _ = scanner.ConsolidateLibrary(s.db, libraryID)
+	}
 	if report != nil {
 		report(len(items), len(items), fmt.Sprintf("刮削完成：自动匹配 %d，待人工确认 %d，跳过 %d，失败 %d",
 			stats.Matched, stats.Queued, stats.Skipped, stats.Failed))
@@ -583,6 +586,7 @@ func (s *Service) ResolveManualMatch(ctx context.Context, itemID, mediaType stri
 	_ = s.db.Gorm.Model(&model.ScrapeMatchQueue{}).
 		Where("item_id = ?", itemID).
 		Updates(map[string]any{"status": "resolved", "updated_at": time.Now().UTC()}).Error
+	_, _ = scanner.ConsolidateLibrary(s.db, item.LibraryID)
 	s.db.BumpLibraryRevision()
 	return nil
 }

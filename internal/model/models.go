@@ -89,20 +89,22 @@ type UserAvatar struct {
 
 // Library represents a physical media library with one or more root paths.
 type Library struct {
-	ID            string     `gorm:"primaryKey;size:64" json:"id"`
-	Name          string     `gorm:"size:128;not null" json:"name"`
-	Kind          string     `gorm:"size:32;not null" json:"kind"` // movies | tvshows | mixed | boxsets
-	PathsJSON     string     `gorm:"type:text;not null" json:"-"`
-	Hidden        bool       `gorm:"default:false;not null" json:"hidden"`
-	SortOrder     int        `gorm:"default:0;not null" json:"sort_order"`
-	ScanSchedule  string     `gorm:"size:64" json:"scan_schedule"`
-	CoverRevision string     `gorm:"size:64" json:"cover_revision"`
-	Status        string     `gorm:"size:32;default:idle" json:"status"`
-	LastError     string     `gorm:"type:text" json:"last_error"`
-	ItemCount     int64      `gorm:"default:0" json:"item_count"`
-	LastScannedAt *time.Time `json:"last_scanned_at"`
-	CreatedAt     time.Time  `json:"created_at"`
-	UpdatedAt     time.Time  `json:"updated_at"`
+	ID                string     `gorm:"primaryKey;size:64" json:"id"`
+	Name              string     `gorm:"size:128;not null" json:"name"`
+	Kind              string     `gorm:"size:32;not null" json:"kind"` // movies | tvshows | mixed | boxsets
+	PathsJSON         string     `gorm:"type:text;not null" json:"-"`
+	Hidden            bool       `gorm:"default:false;not null" json:"hidden"`
+	AutoMergeVersions bool       `gorm:"default:true;not null" json:"auto_merge_versions"`
+	AutoGroupSeries   bool       `gorm:"default:true;not null" json:"auto_group_series"`
+	SortOrder         int        `gorm:"default:0;not null" json:"sort_order"`
+	ScanSchedule      string     `gorm:"size:64" json:"scan_schedule"`
+	CoverRevision     string     `gorm:"size:64" json:"cover_revision"`
+	Status            string     `gorm:"size:32;default:idle" json:"status"`
+	LastError         string     `gorm:"type:text" json:"last_error"`
+	ItemCount         int64      `gorm:"default:0" json:"item_count"`
+	LastScannedAt     *time.Time `json:"last_scanned_at"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 type VirtualLibrary struct {
@@ -158,6 +160,7 @@ type Item struct {
 	DirPath                 string     `gorm:"size:1024;index" json:"dir_path"`
 	ScanKey                 string     `gorm:"size:1024;uniqueIndex" json:"scan_key"`
 	RandomKey               string     `gorm:"size:32;index" json:"random_key"`
+	DisableAutoMerge        bool       `gorm:"default:false;not null" json:"disable_auto_merge"`
 	AddedAt                 time.Time  `gorm:"index;not null" json:"added_at"`
 	SoftDeletedAt           *time.Time `gorm:"index" json:"soft_deleted_at"`
 	CreatedAt               time.Time  `json:"created_at"`

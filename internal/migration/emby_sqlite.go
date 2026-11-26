@@ -107,6 +107,10 @@ type ImportReport struct {
 	WatchImported     int      `json:"watch_imported"`
 	WatchSkipped      int      `json:"watch_skipped"`
 	WatchFailed       int      `json:"watch_failed"`
+	SeriesMerged      int      `json:"series_merged"`
+	SeasonsMerged     int      `json:"seasons_merged"`
+	MoviesMerged      int      `json:"movies_merged"`
+	EpisodesMerged    int      `json:"episodes_merged"`
 	Warnings          []string `json:"warnings,omitempty"`
 }
 
@@ -119,10 +123,11 @@ func NewService(db *database.DB) *Service {
 }
 
 type embyLibraryDef struct {
-	EmbyID string
-	Name   string
-	Kind   string // movies | tvshows | mixed | boxsets
-	Paths  []string
+	EmbyID          string
+	Name            string
+	Kind            string // movies | tvshows | mixed | boxsets
+	Paths           []string
+	AutoGroupSeries *bool
 }
 
 type embyItemRow struct {
@@ -461,18 +466,30 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 					_ = s.db.Gorm.Model(&existing).Update("kind", l.Kind).Error
 					existingLibs[lowerName] = existing
 				}
+				if l.AutoGroupSeries != nil && existing.AutoGroupSeries != *l.AutoGroupSeries {
+					existing.AutoGroupSeries = *l.AutoGroupSeries
+					_ = s.db.Gorm.Model(&existing).Update("auto_group_series", existing.AutoGroupSeries).Error
+					existingLibs[lowerName] = existing
+				}
 				report.LibrariesExisting++
 			} else {
 				pathsBytes, _ := json.Marshal(l.Paths)
+				autoGroup := boolOrDefault(l.AutoGroupSeries, true)
 				newLib := model.Library{
-					ID:        strings.ReplaceAll(uuid.NewString(), "-", ""),
-					Name:      strings.TrimSpace(l.Name),
-					Kind:      l.Kind,
-					PathsJSON: string(pathsBytes),
-					SortOrder: idx,
-					Status:    "idle",
+					ID:                strings.ReplaceAll(uuid.NewString(), "-", ""),
+					Name:              strings.TrimSpace(l.Name),
+					Kind:              l.Kind,
+					PathsJSON:         string(pathsBytes),
+					AutoMergeVersions: true,
+					AutoGroupSeries:   autoGroup,
+					SortOrder:         idx,
+					Status:            "idle",
 				}
 				if err := s.db.Gorm.Create(&newLib).Error; err == nil {
+					if !autoGroup {
+						newLib.AutoGroupSeries = autoGroup
+						_ = s.db.Gorm.Model(&model.Library{}).Where("id = ?", newLib.ID).Update("auto_group_series", autoGroup).Error
+					}
 					libID = newLib.ID
 					existingLibs[lowerName] = newLib
 					report.LibrariesCreated++
@@ -1052,6 +1069,32 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 		}
 		report.WatchFailed += writer.flush()
 	}
+	if wantItems && len(items) > 0 {
+		if onProgress != nil {
+			onProgress(totalWork, totalWork, "正在合并多版本影片与跨目录剧集…")
+		}
+		seenLibID := map[string]bool{}
+		for _, ex := range existingLibs {
+			if seenLibID[ex.ID] {
+				continue
+			}
+			seenLibID[ex.ID] = true
+			if cStats, cErr := scanner.ConsolidateLibrary(s.db, ex.ID); cErr == nil && cStats != nil {
+				report.SeriesMerged += cStats.SeriesMerged
+				report.SeasonsMerged += cStats.SeasonsMerged
+				report.MoviesMerged += cStats.MoviesMerged
+				report.EpisodesMerged += cStats.EpisodesMerged
+			}
+		}
+		if fallbackLibID != "" && !seenLibID[fallbackLibID] {
+			if cStats, cErr := scanner.ConsolidateLibrary(s.db, fallbackLibID); cErr == nil && cStats != nil {
+				report.SeriesMerged += cStats.SeriesMerged
+				report.SeasonsMerged += cStats.SeasonsMerged
+				report.MoviesMerged += cStats.MoviesMerged
+				report.EpisodesMerged += cStats.EpisodesMerged
+			}
+		}
+	}
 	if onProgress != nil {
 		onProgress(totalWork, totalWork, "迁移完成，正在刷新媒体库…")
 	}
@@ -1093,6 +1136,9 @@ func (s *Service) readAllEmbyData(resolved ResolvedSources, mappings []PathMappi
 			// Prefer the concrete ContentType over the mixed fallback.
 			if libs[idx].Kind == "" || (libs[idx].Kind == "mixed" && def.Kind != "" && def.Kind != "mixed") {
 				libs[idx].Kind = def.Kind
+			}
+			if libs[idx].AutoGroupSeries == nil && def.AutoGroupSeries != nil {
+				libs[idx].AutoGroupSeries = def.AutoGroupSeries
 			}
 			for _, p := range mapped {
 				found := false
@@ -1260,14 +1306,18 @@ func readEmbyRootDefaultLibraries(rootDefaultDir string) ([]embyLibraryDef, []st
 		// Parse options.xml
 		if raw, err := os.ReadFile(filepath.Join(libDir, "options.xml")); err == nil {
 			var opts struct {
-				ContentType string `xml:"ContentType"`
-				PathInfos   []struct {
+				ContentType                   string `xml:"ContentType"`
+				EnableAutomaticSeriesGrouping *bool  `xml:"EnableAutomaticSeriesGrouping"`
+				PathInfos                     []struct {
 					Path string `xml:"Path"`
 				} `xml:"PathInfos>MediaPathInfo"`
 			}
 			if xml.Unmarshal(raw, &opts) == nil {
 				if opts.ContentType != "" {
 					def.Kind = opts.ContentType
+				}
+				if opts.EnableAutomaticSeriesGrouping != nil {
+					def.AutoGroupSeries = opts.EnableAutomaticSeriesGrouping
 				}
 				for _, pi := range opts.PathInfos {
 					if p := strings.TrimSpace(pi.Path); p != "" {
@@ -1467,16 +1517,19 @@ func readEmbyLibraryItems(sqlDB *sql.DB, mappings []PathMapping) ([]embyLibraryD
 				}
 			}
 			libKind := "mixed"
+			var autoGroup *bool
 			if opts, ok := libOptions[id]; ok {
 				if strings.TrimSpace(opts.ContentType) != "" {
 					libKind = mapEmbyContentType(opts.ContentType)
 				}
+				autoGroup = opts.EnableAutomaticSeriesGrouping
 			}
 			libs = append(libs, embyLibraryDef{
-				EmbyID: id,
-				Name:   name,
-				Kind:   libKind,
-				Paths:  paths,
+				EmbyID:          id,
+				Name:            name,
+				Kind:            libKind,
+				Paths:           paths,
+				AutoGroupSeries: autoGroup,
 			})
 			continue
 		}

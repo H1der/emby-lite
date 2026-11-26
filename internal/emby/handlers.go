@@ -1567,6 +1567,46 @@ func (h *Handler) RefreshLibraryCompat(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+// MergeVersionsCompat implements Emby's POST /Videos/MergeVersions?Ids=a,b.
+func (h *Handler) MergeVersionsCompat(c *gin.Context) {
+	p := getPrincipal(c)
+	if p == nil || (!p.IsAPIKey && (p.User == nil || !p.User.IsAdmin)) {
+		jsonErr(c, http.StatusForbidden, "admin required")
+		return
+	}
+	ids := splitCSV(queryCI(c, "Ids"))
+	if len(ids) == 0 {
+		var body struct {
+			Ids []string `json:"Ids"`
+		}
+		if c.ShouldBindJSON(&body) == nil {
+			ids = body.Ids
+		}
+	}
+	primaryID, err := scanner.MergeItemsManual(h.db, ids)
+	if err != nil {
+		jsonErr(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"Id": primaryID})
+}
+
+// SplitVersionsCompat implements Emby's DELETE /Videos/:itemId/AlternateSources.
+func (h *Handler) SplitVersionsCompat(c *gin.Context) {
+	p := getPrincipal(c)
+	if p == nil || (!p.IsAPIKey && (p.User == nil || !p.User.IsAdmin)) {
+		jsonErr(c, http.StatusForbidden, "admin required")
+		return
+	}
+	itemID := c.Param("itemId")
+	ids, err := scanner.SplitItemVersions(h.db, itemID)
+	if err != nil {
+		jsonErr(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"Ids": ids})
+}
+
 // --- Helpers ---
 
 func (h *Handler) checkUserScope(c *gin.Context, p *auth.Principal, targetUserID string) bool {

@@ -29,13 +29,16 @@ var (
 		".jpg": true, ".jpeg": true, ".png": true, ".webp": true,
 	}
 
-	reSeasonEpisode = regexp.MustCompile(`(?i)[Ss](\d{1,2})[\s._-]*[Ee](\d{1,3})`)
-	reAltEpisode    = regexp.MustCompile(`(?i)\b(\d{1,2})x(\d{1,3})\b`)
-	reEpOnly        = regexp.MustCompile(`(?i)(?:^|[\s._\-\[\(])[Ee][Pp]?(\d{1,3})(?:$|[\s._\-\]\)])`)
-	reSeasonDir     = regexp.MustCompile(`(?i)^(?:season|s)[\s._-]*(\d{1,2})$`)
-	reSpecialsDir   = regexp.MustCompile(`(?i)^specials?$`)
-	reYear          = regexp.MustCompile(`(?:[\(\[\.\s_-]|^)((?:19|20)\d{2})(?:[\)\]\.\s_-]|$)`)
-	reVersionSplit  = regexp.MustCompile(`\s+-\s+`)
+	reSeasonEpisode    = regexp.MustCompile(`(?i)[Ss](\d{1,2})[\s._-]*[Ee](\d{1,3})`)
+	reAltEpisode       = regexp.MustCompile(`(?i)\b(\d{1,2})x(\d{1,3})\b`)
+	reEpOnly           = regexp.MustCompile(`(?i)(?:^|[\s._\-\[\(])[Ee][Pp]?(\d{1,3})(?:$|[\s._\-\]\)])`)
+	reSeasonDir        = regexp.MustCompile(`(?i)^(?:season|s)[\s._-]*(\d{1,2})(?:[\s._\-]+.*)?$`)
+	reChineseSeasonDir = regexp.MustCompile(`^第[\s]*([0-9]{1,2}|[零〇一二三四五六七八九十百两]+)[\s]*[季部](?:[\s._\-（(].*)?$`)
+	reSpecialsDir      = regexp.MustCompile(`(?i)^(?:specials?|sps?|ova|oav|特别篇|番外篇?|特典)(?:[\s._\-（(].*)?$`)
+	reSeasonSuffix     = regexp.MustCompile(`(?i)[\s._\-（(\[]*(?:(?:season|s)[\s._-]*\d{1,2}|第[\s]*(?:[0-9]{1,2}|[零〇一二三四五六七八九十百两]+)[\s]*[季部])[\s._\-）)\]]*$`)
+	reYear             = regexp.MustCompile(`(?:[\(\[\.\s_-]|^)((?:19|20)\d{2})(?:[\)\]\.\s_-]|$)`)
+	reVersionSplit     = regexp.MustCompile(`\s+-\s+`)
+	reQualityHint      = regexp.MustCompile(`(?i)\b(2160p|4k|uhd|1080p|1080i|720p|480p|remux|bluray|blu-ray|bdrip|web-dl|webdl|webrip|hdtv|dv|dovi|dolby[\s._-]*vision|hdr10\+?|hdr|hlg|sdr|hevc|x265|h265|h\.265|avc|x264|h264|h\.264|av1|atmos|truehd|dts-hd|imax|3d|director'?s[\s._-]*cut|extended|unrated|theatrical|60fps|120fps)\b`)
 )
 
 func IsVideoFile(name string) bool {
@@ -139,19 +142,175 @@ func ParseEpisodeName(filename, parentDir string) ParsedEpisode {
 	return ParsedEpisode{}
 }
 
-// ParseSeasonDir returns the season number if dirName matches "Season 01" / "S01" / "Specials", else -1.
+// ParseSeasonDir returns the season number if dirName matches "Season 01" / "S01" / "第1季" / "第一季" / "Specials", else -1.
 func ParseSeasonDir(dirName string) int {
 	name := strings.TrimSpace(dirName)
+	if name == "" {
+		return -1
+	}
 	if reSpecialsDir.MatchString(name) {
 		return 0
 	}
 	if m := reSeasonDir.FindStringSubmatch(name); len(m) == 2 {
-		n, err := strconv.Atoi(m[1])
-		if err == nil {
+		if n, err := strconv.Atoi(m[1]); err == nil {
+			return n
+		}
+	}
+	if m := reChineseSeasonDir.FindStringSubmatch(name); len(m) == 2 {
+		if n := parseSeasonNumberToken(m[1]); n >= 0 {
 			return n
 		}
 	}
 	return -1
+}
+
+// StripSeasonSuffix removes a trailing season indicator (e.g. "第一季", "第2季", "Season 2", "S02")
+// from a series title/directory name and reports whether a season marker was stripped.
+func StripSeasonSuffix(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", false
+	}
+	stripped := strings.TrimSpace(reSeasonSuffix.ReplaceAllString(s, ""))
+	if stripped != "" && stripped != s {
+		return stripped, true
+	}
+	return s, false
+}
+
+// NormalizeMergeTitle produces a punctuation- and case-folded title key for auto-merge matching.
+func NormalizeMergeTitle(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.Is(unicode.Han, r) {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// ExtractVersionBaseAndLabel splits Emby-style "<base> - <version>" filenames (stripping virtual .strm video ext).
+func ExtractVersionBaseAndLabel(filename string) (base, label string, hasSplit bool) {
+	stem := strings.TrimSuffix(filename, filepath.Ext(filename))
+	if strings.EqualFold(filepath.Ext(filename), ".strm") {
+		if innerExt := strings.ToLower(filepath.Ext(stem)); videoExts[innerExt] && innerExt != ".strm" {
+			stem = strings.TrimSuffix(stem, filepath.Ext(stem))
+		}
+	}
+	if parts := reVersionSplit.Split(stem, 2); len(parts) == 2 {
+		b := strings.TrimSpace(parts[0])
+		l := strings.TrimSpace(parts[1])
+		if b != "" && l != "" {
+			return b, l, true
+		}
+	}
+	return strings.TrimSpace(stem), "", false
+}
+
+// InferVersionLabelFromFilename extracts a concise quality/edition label from a filename when
+// explicit Emby " - Version" naming is absent (e.g. scene releases like Movie.2020.2160p.DV.HEVC.mkv).
+func InferVersionLabelFromFilename(filename string) string {
+	if _, label, ok := ExtractVersionBaseAndLabel(filename); ok && label != "" {
+		return label
+	}
+	stem := strings.TrimSuffix(filename, filepath.Ext(filename))
+	if strings.EqualFold(filepath.Ext(filename), ".strm") {
+		if innerExt := strings.ToLower(filepath.Ext(stem)); videoExts[innerExt] && innerExt != ".strm" {
+			stem = strings.TrimSuffix(stem, filepath.Ext(stem))
+		}
+	}
+	matches := reQualityHint.FindAllString(stem, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	seen := make(map[string]bool, len(matches))
+	parts := make([]string, 0, 4)
+	for _, m := range matches {
+		norm := strings.ToUpper(strings.NewReplacer(".", "", "_", " ", "-", "").Replace(m))
+		switch norm {
+		case "2160P", "UHD":
+			norm = "4K"
+		case "DOVI", "DOLBYVISION", "DOLBY VISION":
+			norm = "DV"
+		case "X265", "H265":
+			norm = "HEVC"
+		case "X264", "H264":
+			norm = "H264"
+		case "WEBDL":
+			norm = "WEB-DL"
+		case "BLURAY":
+			norm = "BluRay"
+		}
+		if seen[norm] {
+			continue
+		}
+		seen[norm] = true
+		parts = append(parts, norm)
+		if len(parts) >= 4 {
+			break
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func parseSeasonNumberToken(tok string) int {
+	tok = strings.TrimSpace(tok)
+	if tok == "" {
+		return -1
+	}
+	if n, err := strconv.Atoi(tok); err == nil {
+		return n
+	}
+	digits := map[rune]int{
+		'零': 0, '〇': 0,
+		'一': 1, '二': 2, '两': 2, '三': 3, '四': 4,
+		'五': 5, '六': 6, '七': 7, '八': 8, '九': 9,
+	}
+	runes := []rune(tok)
+	if len(runes) == 1 {
+		if runes[0] == '十' {
+			return 10
+		}
+		if d, ok := digits[runes[0]]; ok {
+			return d
+		}
+		return -1
+	}
+	total := 0
+	cur := 0
+	hasDigit := false
+	for _, r := range runes {
+		if d, ok := digits[r]; ok {
+			cur = d
+			hasDigit = true
+		} else if r == '十' {
+			if !hasDigit || cur == 0 {
+				cur = 1
+			}
+			total += cur * 10
+			cur = 0
+			hasDigit = true
+		} else if r == '百' {
+			if !hasDigit || cur == 0 {
+				cur = 1
+			}
+			total += cur * 100
+			cur = 0
+			hasDigit = true
+		} else {
+			return -1
+		}
+	}
+	total += cur
+	if !hasDigit {
+		return -1
+	}
+	return total
 }
 
 func extractTitleAndYear(raw string) (string, int) {

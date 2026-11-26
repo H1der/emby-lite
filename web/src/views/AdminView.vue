@@ -113,6 +113,8 @@
               <div class="font-semibold text-ink flex items-center flex-wrap gap-1.5">
                 <span>{{ lib.name }}</span>
                 <n-tag size="tiny" type="info">{{ lib.kind }}</n-tag>
+                <n-tag v-if="lib.auto_merge_versions && lib.kind !== 'boxsets'" size="tiny" type="default">多版本合并</n-tag>
+                <n-tag v-if="lib.auto_group_series && (lib.kind === 'tvshows' || lib.kind === 'mixed')" size="tiny" type="default">跨目录剧集合并</n-tag>
                 <n-tag v-if="lib.hidden" size="tiny" type="warning">隐藏</n-tag>
                 <n-tag v-if="lib.scanning" size="tiny" type="success">扫描中</n-tag>
               </div>
@@ -124,6 +126,7 @@
               <n-button size="small" secondary @click="generateLibCover(lib.id)">拼贴封面</n-button>
               <n-button size="small" secondary @click="triggerCoverUpload(lib.id)">传封面</n-button>
               <n-button size="small" secondary @click="openEditLibrary(lib)">编辑</n-button>
+              <n-button v-if="lib.kind !== 'boxsets'" size="small" secondary @click="consolidateLibrary(lib.id)">合并整理</n-button>
               <n-button size="small" secondary @click="probeLibrary(lib.id)">探测</n-button>
               <n-button size="small" type="info" secondary @click="scrapeLibrary(lib.id)">刮削</n-button>
               <n-button size="small" type="primary" @click="scanLibrary(lib.id)">扫描</n-button>
@@ -443,6 +446,22 @@
             </div>
           </div>
         </n-form-item>
+        <n-form-item v-if="libForm.kind !== 'boxsets'" label="自动组合">
+          <div class="w-full space-y-2.5">
+            <div>
+              <n-checkbox v-model:checked="libForm.auto_merge_versions">自动合并多版本影片与单集</n-checkbox>
+              <div class="text-[11px] text-ink-muted pl-6 mt-0.5">
+                同目录多版本命名（如 4K / 1080p）或相同 TMDB/IMDb ID 的影片与同集多版本将自动合并为一个条目。
+              </div>
+            </div>
+            <div v-if="libForm.kind === 'tvshows' || libForm.kind === 'mixed'">
+              <n-checkbox v-model:checked="libForm.auto_group_series">自动合并分布在多个文件夹中的剧集</n-checkbox>
+              <div class="text-[11px] text-ink-muted pl-6 mt-0.5">
+                如果启用，分布在此媒体库中多个文件夹中的剧集（含不同季目录）将自动合并为一部。
+              </div>
+            </div>
+          </div>
+        </n-form-item>
         <n-form-item label="可见性">
           <n-checkbox v-model:checked="libForm.hidden">设为隐藏媒体库（仅管理员或授权用户可见）</n-checkbox>
         </n-form-item>
@@ -568,6 +587,8 @@ const libForm = reactive({
   kind: 'movies',
   paths: [] as string[],
   hidden: false,
+  auto_merge_versions: true,
+  auto_group_series: true,
 })
 const kindOptions = [
   { label: '电影 (movies)', value: 'movies' },
@@ -835,6 +856,8 @@ function openCreateLibrary() {
   libForm.kind = 'movies'
   libForm.paths = []
   libForm.hidden = false
+  libForm.auto_merge_versions = true
+  libForm.auto_group_series = true
   showLibModal.value = true
 }
 
@@ -844,6 +867,8 @@ function openEditLibrary(lib: any) {
   libForm.kind = lib.kind || 'movies'
   libForm.paths = [...(lib.paths || [])]
   libForm.hidden = Boolean(lib.hidden)
+  libForm.auto_merge_versions = lib.auto_merge_versions !== false
+  libForm.auto_group_series = lib.auto_group_series !== false
   showLibModal.value = true
 }
 
@@ -871,10 +896,14 @@ async function saveLibrary() {
     kind: libForm.kind,
     paths: libForm.paths,
     hidden: libForm.hidden,
+    auto_merge_versions: libForm.auto_merge_versions,
+    auto_group_series: libForm.auto_group_series,
   }
   if (editingLibId.value) {
-    await apiFetch(`/api/admin/libraries/${editingLibId.value}`, { method: 'PUT', body: JSON.stringify(payload) })
-    message.success('媒体库已更新')
+    const res = await apiFetch(`/api/admin/libraries/${editingLibId.value}`, { method: 'PUT', body: JSON.stringify(payload) })
+    const c = res?.consolidated
+    const merged = c ? (c.series_merged || 0) + (c.movies_merged || 0) + (c.episodes_merged || 0) : 0
+    message.success(merged > 0 ? `媒体库已更新，并自动合并 ${merged} 个重复项` : '媒体库已更新')
   } else {
     await apiFetch('/api/admin/libraries', { method: 'POST', body: JSON.stringify(payload) })
     message.success('媒体库已创建')
@@ -883,6 +912,23 @@ async function saveLibrary() {
   invalidateApiCache('/api/web/home')
   invalidateApiCache('/emby/')
   await loadLibrariesTab()
+}
+
+async function consolidateLibrary(id: string) {
+  try {
+    const res = await apiFetch(`/api/admin/libraries/${id}/consolidate`, { method: 'POST' })
+    const total = (res?.series_merged || 0) + (res?.seasons_merged || 0) + (res?.movies_merged || 0) + (res?.episodes_merged || 0)
+    invalidateApiCache('/api/web/home')
+    invalidateApiCache('/emby/')
+    if (total > 0) {
+      message.success(`合并整理完成：剧集 ${res.series_merged || 0}，季 ${res.seasons_merged || 0}，电影 ${res.movies_merged || 0}，单集 ${res.episodes_merged || 0}`)
+    } else {
+      message.info('当前媒体库没有可合并的多版本或重复剧集')
+    }
+    await loadLibrariesTab()
+  } catch (e: any) {
+    message.error(e.message || '合并整理失败')
+  }
 }
 
 async function scanLibrary(id: string) {

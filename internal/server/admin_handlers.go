@@ -100,7 +100,7 @@ func (a *AdminHandler) Bootstrap(c *gin.Context) {
 		"initialized": initialized,
 		"server_name": a.db.GetSetting("server_name", a.cfg.Server.ServerName),
 		"server_id":   a.db.GetSetting("server_id", ""),
-		"version":     "0.3.2",
+		"version":     "0.3.3",
 	})
 }
 
@@ -163,12 +163,22 @@ func (a *AdminHandler) ExternalPlay(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no playable source"})
 		return
 	}
-	directURL, _ := sources[0]["Path"].(string)
+	selected := sources[0]
+	if wantSrc := strings.TrimSpace(c.Query("media_source_id")); wantSrc != "" {
+		for _, s := range sources {
+			if id, _ := s["Id"].(string); id == wantSrc {
+				selected = s
+				break
+			}
+		}
+	}
+	directURL, _ := selected["Path"].(string)
 	encoded := url.QueryEscape(directURL)
 	c.JSON(http.StatusOK, gin.H{
-		"item_id":    item.ID,
-		"name":       item.Name,
-		"direct_url": directURL,
+		"item_id":         item.ID,
+		"name":            item.Name,
+		"media_source_id": selected["Id"],
+		"direct_url":      directURL,
 		"players": gin.H{
 			"iina":      "iina://weblink?url=" + encoded,
 			"potplayer": "potplayer://" + directURL,
@@ -237,12 +247,14 @@ func (a *AdminHandler) Dashboard(c *gin.Context) {
 // --- Admin Libraries ---
 
 type libraryPayload struct {
-	Name         string   `json:"name" binding:"required"`
-	Kind         string   `json:"kind" binding:"required"` // movies | tvshows | mixed | boxsets
-	Paths        []string `json:"paths"`
-	Hidden       bool     `json:"hidden"`
-	SortOrder    int      `json:"sort_order"`
-	ScanSchedule string   `json:"scan_schedule"`
+	Name              string   `json:"name" binding:"required"`
+	Kind              string   `json:"kind" binding:"required"` // movies | tvshows | mixed | boxsets
+	Paths             []string `json:"paths"`
+	Hidden            bool     `json:"hidden"`
+	AutoMergeVersions *bool    `json:"auto_merge_versions"`
+	AutoGroupSeries   *bool    `json:"auto_group_series"`
+	SortOrder         int      `json:"sort_order"`
+	ScanSchedule      string   `json:"scan_schedule"`
 }
 
 func (a *AdminHandler) ListLibraries(c *gin.Context) {
@@ -256,18 +268,20 @@ func (a *AdminHandler) ListLibraries(c *gin.Context) {
 		var paths []string
 		_ = json.Unmarshal([]byte(l.PathsJSON), &paths)
 		out = append(out, map[string]any{
-			"id":              l.ID,
-			"name":            l.Name,
-			"kind":            l.Kind,
-			"paths":           paths,
-			"hidden":          l.Hidden,
-			"sort_order":      l.SortOrder,
-			"scan_schedule":   l.ScanSchedule,
-			"status":          l.Status,
-			"last_error":      l.LastError,
-			"item_count":      l.ItemCount,
-			"last_scanned_at": l.LastScannedAt,
-			"scanning":        a.scanner.IsLibraryScanning(l.ID),
+			"id":                  l.ID,
+			"name":                l.Name,
+			"kind":                l.Kind,
+			"paths":               paths,
+			"hidden":              l.Hidden,
+			"auto_merge_versions": l.AutoMergeVersions,
+			"auto_group_series":   l.AutoGroupSeries,
+			"sort_order":          l.SortOrder,
+			"scan_schedule":       l.ScanSchedule,
+			"status":              l.Status,
+			"last_error":          l.LastError,
+			"item_count":          l.ItemCount,
+			"last_scanned_at":     l.LastScannedAt,
+			"scanning":            a.scanner.IsLibraryScanning(l.ID),
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"items": out})
@@ -288,23 +302,48 @@ func (a *AdminHandler) CreateLibrary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "paths is required"})
 		return
 	}
+	autoMerge := true
+	if body.AutoMergeVersions != nil {
+		autoMerge = *body.AutoMergeVersions
+	}
+	autoGroup := true
+	if body.AutoGroupSeries != nil {
+		autoGroup = *body.AutoGroupSeries
+	}
 	pathsBytes, _ := json.Marshal(cleanPaths(body.Paths))
 	lib := model.Library{
-		ID:           strings.ReplaceAll(uuid.NewString(), "-", ""),
-		Name:         strings.TrimSpace(body.Name),
-		Kind:         kind,
-		PathsJSON:    string(pathsBytes),
-		Hidden:       body.Hidden,
-		SortOrder:    body.SortOrder,
-		ScanSchedule: body.ScanSchedule,
-		Status:       "idle",
+		ID:                strings.ReplaceAll(uuid.NewString(), "-", ""),
+		Name:              strings.TrimSpace(body.Name),
+		Kind:              kind,
+		PathsJSON:         string(pathsBytes),
+		Hidden:            body.Hidden,
+		AutoMergeVersions: autoMerge,
+		AutoGroupSeries:   autoGroup,
+		SortOrder:         body.SortOrder,
+		ScanSchedule:      body.ScanSchedule,
+		Status:            "idle",
 	}
 	if err := a.db.Gorm.Create(&lib).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	if !autoMerge || !autoGroup {
+		lib.AutoMergeVersions = autoMerge
+		lib.AutoGroupSeries = autoGroup
+		_ = a.db.Gorm.Model(&model.Library{}).Where("id = ?", lib.ID).Updates(map[string]any{
+			"auto_merge_versions": autoMerge,
+			"auto_group_series":   autoGroup,
+		}).Error
+	}
 	a.db.BumpLibraryRevision()
-	c.JSON(http.StatusCreated, gin.H{"id": lib.ID, "name": lib.Name, "kind": lib.Kind, "paths": cleanPaths(body.Paths)})
+	c.JSON(http.StatusCreated, gin.H{
+		"id":                  lib.ID,
+		"name":                lib.Name,
+		"kind":                lib.Kind,
+		"paths":               cleanPaths(body.Paths),
+		"auto_merge_versions": lib.AutoMergeVersions,
+		"auto_group_series":   lib.AutoGroupSeries,
+	})
 }
 
 func (a *AdminHandler) UpdateLibrary(c *gin.Context) {
@@ -319,23 +358,51 @@ func (a *AdminHandler) UpdateLibrary(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if strings.ToLower(strings.TrimSpace(body.Kind)) != "boxsets" && len(cleanPaths(body.Paths)) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "paths is required"})
-		return
-	}
+	prevMerge := lib.AutoMergeVersions
+	prevGroup := lib.AutoGroupSeries
 	pathsBytes, _ := json.Marshal(cleanPaths(body.Paths))
 	lib.Name = strings.TrimSpace(body.Name)
 	lib.Kind = strings.ToLower(strings.TrimSpace(body.Kind))
+	if lib.Kind != "boxsets" && len(cleanPaths(body.Paths)) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "paths is required"})
+		return
+	}
 	lib.PathsJSON = string(pathsBytes)
 	lib.Hidden = body.Hidden
+	if body.AutoMergeVersions != nil {
+		lib.AutoMergeVersions = *body.AutoMergeVersions
+	}
+	if body.AutoGroupSeries != nil {
+		lib.AutoGroupSeries = *body.AutoGroupSeries
+	}
 	lib.SortOrder = body.SortOrder
 	lib.ScanSchedule = body.ScanSchedule
 	if err := a.db.Gorm.Save(&lib).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	var merged *scanner.ConsolidateStats
+	if (!prevMerge && lib.AutoMergeVersions) || (!prevGroup && lib.AutoGroupSeries) {
+		merged, _ = scanner.ConsolidateLibrary(a.db, lib.ID)
+	}
 	a.db.BumpLibraryRevision()
-	c.JSON(http.StatusOK, gin.H{"id": lib.ID, "name": lib.Name})
+	c.JSON(http.StatusOK, gin.H{
+		"id":                  lib.ID,
+		"name":                lib.Name,
+		"auto_merge_versions": lib.AutoMergeVersions,
+		"auto_group_series":   lib.AutoGroupSeries,
+		"consolidated":        merged,
+	})
+}
+
+func (a *AdminHandler) ConsolidateLibrary(c *gin.Context) {
+	id := c.Param("id")
+	stats, err := scanner.ConsolidateLibrary(a.db, id)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, stats)
 }
 
 func (a *AdminHandler) DeleteLibrary(c *gin.Context) {
