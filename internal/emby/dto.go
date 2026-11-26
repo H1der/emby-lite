@@ -1,8 +1,11 @@
 package emby
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,7 +14,24 @@ import (
 	"emby-lite/internal/model"
 )
 
-const ProtocolVersion = "4.8.0.80"
+const ProtocolVersion = "4.10.2.0"
+
+const (
+	embyLocalAuthProviderID     = "Emby.Server.Implementations.LocalAuthenticationProvider"
+	embyLocalPasswordResetID    = "Emby.Server.Implementations.LocalPasswordResetProvider"
+)
+
+// stableNumericID produces a deterministic positive 52-bit int64 ID for Emby NameLongIdPair
+// objects (GenreItems, Studios, TagItems). Keeping it <= 52 bits guarantees exact representation
+// in both int64 (Kotlin/Java/Go/Swift) and IEEE-754 double (JavaScript) clients.
+func stableNumericID(prefix, name string) int64 {
+	sum := sha256.Sum256([]byte(prefix + ":" + strings.ToLower(strings.TrimSpace(name))))
+	v, err := strconv.ParseInt(hex.EncodeToString(sum[:])[:13], 16, 64)
+	if err != nil || v <= 0 {
+		return 1
+	}
+	return v
+}
 
 func (h *Handler) serverID() string {
 	return h.db.GetSetting("server_id", "emby-lite-server")
@@ -22,45 +42,84 @@ func (h *Handler) serverName() string {
 }
 
 func (h *Handler) userDTO(u *model.User, policy auth.EffectivePolicy) map[string]any {
-	lastLogin := ""
-	if u.LastLoginAt != nil {
-		lastLogin = u.LastLoginAt.UTC().Format(time.RFC3339)
-	}
-	return map[string]any{
-		"Name":                  u.Username,
-		"ServerId":              h.serverID(),
-		"Id":                    u.ID,
-		"HasPassword":           true,
-		"HasConfiguredPassword": true,
-		"LastLoginDate":         lastLogin,
-		"LastActivityDate":      lastLogin,
+	m := map[string]any{
+		"Name":                      u.Username,
+		"ServerId":                  h.serverID(),
+		"ServerName":                h.serverName(),
+		"Id":                        u.ID,
+		"HasPassword":               true,
+		"HasConfiguredPassword":     true,
+		"HasConfiguredEasyPassword": false,
+		"EnableAutoLogin":           false,
 		"Configuration": map[string]any{
 			"PlayDefaultAudioTrack":      true,
+			"DisplayCollectionsView":     true,
 			"DisplayMissingEpisodes":     false,
 			"SubtitleMode":               "Default",
 			"EnableLocalPassword":        false,
 			"OrderedViews":               []string{},
 			"LatestItemsExcludes":        []string{},
 			"MyMediaExcludes":            []string{},
-			"HidePlayedInLatest":         true,
+			"HidePlayedInLatest":         false,
+			"HidePlayedInMoreLikeThis":   false,
+			"HidePlayedInSuggestions":    false,
 			"RememberAudioSelections":    true,
 			"RememberSubtitleSelections": true,
 			"EnableNextEpisodeAutoPlay":  true,
+			"AudioLanguagePreference":    "",
+			"SubtitleLanguagePreference": "",
+			"ResumeRewindSeconds":        0,
+			"IntroSkipMode":              "ShowButton",
 		},
 		"Policy": map[string]any{
-			"IsAdministrator":                u.IsAdmin,
-			"IsHidden":                       false,
-			"IsDisabled":                     u.Disabled,
-			"EnableMediaPlayback":            policy.AllowPlayback,
-			"EnableAudioPlaybackTranscoding": false,
-			"EnableVideoPlaybackTranscoding": false,
-			"EnablePlaybackRemuxing":         false,
-			"EnableContentDownloading":       policy.AllowDownload,
-			"EnableSyncTranscoding":          false,
-			"EnableAllFolders":               u.IsAdmin,
-			"SimultaneousStreamLimit":        policy.MaxConcurrentStreams,
+			"IsAdministrator":                  u.IsAdmin,
+			"IsHidden":                         false,
+			"IsHiddenRemotely":                 false,
+			"IsHiddenFromUnusedDevices":        false,
+			"IsDisabled":                       u.Disabled,
+			"EnableUserPreferenceAccess":       true,
+			"EnableRemoteAccess":               true,
+			"EnableMediaPlayback":              policy.AllowPlayback,
+			"EnableAudioPlaybackTranscoding":   false,
+			"EnableVideoPlaybackTranscoding":   false,
+			"EnablePlaybackRemuxing":           false,
+			"EnableContentDeletion":            u.IsAdmin,
+			"EnableContentDownloading":         policy.AllowDownload,
+			"EnableSubtitleDownloading":        false,
+			"EnableSubtitleManagement":         false,
+			"EnableSyncTranscoding":            false,
+			"EnableMediaConversion":            false,
+			"EnableLiveTvAccess":               false,
+			"EnableLiveTvManagement":           false,
+			"EnablePublicSharing":              false,
+			"EnableCollectionManagement":       u.IsAdmin,
+			"EnableRemoteControlOfOtherUsers":  false,
+			"EnableSharedDeviceControl":        false,
+			"EnableAllChannels":                true,
+			"EnableAllFolders":                 u.IsAdmin,
+			"EnableAllDevices":                 true,
+			"SimultaneousStreamLimit":          policy.MaxConcurrentStreams,
+			"RemoteClientBitrateLimit":         0,
+			"InvalidLoginAttemptCount":         0,
+			"BlockedTags":                      []string{},
+			"IncludeTags":                      []string{},
+			"AccessSchedules":                  []any{},
+			"BlockUnratedItems":                []string{},
+			"EnabledFolders":                   []string{},
+			"EnabledDevices":                   []string{},
+			"EnabledChannels":                  []string{},
+			"ExcludedSubFolders":               []string{},
+			"EnableContentDeletionFromFolders": []string{},
+			"AuthenticationProviderId":         embyLocalAuthProviderID,
+			"PasswordResetProviderId":          embyLocalPasswordResetID,
 		},
 	}
+	if u.LastLoginAt != nil {
+		ts := u.LastLoginAt.UTC().Format(time.RFC3339)
+		m["LastLoginDate"] = ts
+		m["LastActivityDate"] = ts
+	}
+	return m
 }
 
 func (h *Handler) libraryViewDTO(lib *model.Library, p *auth.Principal) map[string]any {
@@ -96,15 +155,40 @@ func (h *Handler) libraryViewDTOWithFallback(lib *model.Library, p *auth.Princip
 	}
 
 	return map[string]any{
-		"Name":           lib.Name,
-		"ServerId":       h.serverID(),
-		"Id":             lib.ID,
-		"Type":           "CollectionFolder",
-		"CollectionType": collectionType,
-		"IsFolder":       true,
-		"ImageTags":      imageTags,
-		"ChildCount":     lib.ItemCount,
-		"DateCreated":    lib.CreatedAt.UTC().Format(time.RFC3339),
+		"Name":                     lib.Name,
+		"SortName":                 strings.ToLower(lib.Name),
+		"ServerId":                 h.serverID(),
+		"Id":                       lib.ID,
+		"ParentId":                 "root",
+		"Type":                     "CollectionFolder",
+		"CollectionType":           collectionType,
+		"IsFolder":                 true,
+		"LocationType":             "Virtual",
+		"DisplayPreferencesId":     lib.ID,
+		"PlayAccess":               "Full",
+		"CanDelete":                false,
+		"CanDownload":              false,
+		"EnableMediaSourceDisplay": true,
+		"PrimaryImageAspectRatio":  16.0 / 9.0,
+		"ImageTags":                imageTags,
+		"BackdropImageTags":        []string{},
+		"Genres":                   []string{},
+		"GenreItems":               []map[string]any{},
+		"Tags":                     []string{},
+		"TagItems":                 []map[string]any{},
+		"Studios":                  []map[string]any{},
+		"ExternalUrls":             []any{},
+		"ProviderIds":              map[string]string{},
+		"ChildCount":               lib.ItemCount,
+		"RecursiveItemCount":       lib.ItemCount,
+		"DateCreated":              lib.CreatedAt.UTC().Format(time.RFC3339),
+		"UserData": map[string]any{
+			"PlaybackPositionTicks": 0,
+			"PlayCount":             0,
+			"IsFavorite":            false,
+			"Played":                false,
+			"Key":                   lib.ID,
+		},
 	}
 }
 
@@ -150,14 +234,38 @@ func (h *Handler) virtualLibraryViewDTO(vl *model.VirtualLibrary, p *auth.Princi
 		imageTags["Primary"] = h.signTag(p, vl.ID, "Primary", vl.CoverRevision)
 	}
 	return map[string]any{
-		"Name":           vl.Name,
-		"ServerId":       h.serverID(),
-		"Id":             vl.ID,
-		"Type":           "CollectionFolder",
-		"CollectionType": "mixed",
-		"IsFolder":       true,
-		"ImageTags":      imageTags,
-		"DateCreated":    vl.CreatedAt.UTC().Format(time.RFC3339),
+		"Name":                     vl.Name,
+		"SortName":                 strings.ToLower(vl.Name),
+		"ServerId":                 h.serverID(),
+		"Id":                       vl.ID,
+		"ParentId":                 "root",
+		"Type":                     "CollectionFolder",
+		"CollectionType":           "mixed",
+		"IsFolder":                 true,
+		"LocationType":             "Virtual",
+		"DisplayPreferencesId":     vl.ID,
+		"PlayAccess":               "Full",
+		"CanDelete":                false,
+		"CanDownload":              false,
+		"EnableMediaSourceDisplay": true,
+		"PrimaryImageAspectRatio":  16.0 / 9.0,
+		"ImageTags":                imageTags,
+		"BackdropImageTags":        []string{},
+		"Genres":                   []string{},
+		"GenreItems":               []map[string]any{},
+		"Tags":                     []string{},
+		"TagItems":                 []map[string]any{},
+		"Studios":                  []map[string]any{},
+		"ExternalUrls":             []any{},
+		"ProviderIds":              map[string]string{},
+		"DateCreated":              vl.CreatedAt.UTC().Format(time.RFC3339),
+		"UserData": map[string]any{
+			"PlaybackPositionTicks": 0,
+			"PlayCount":             0,
+			"IsFavorite":            false,
+			"Played":                false,
+			"Key":                   vl.ID,
+		},
 	}
 }
 
@@ -189,9 +297,7 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 	canDelete := p != nil && p.User != nil && p.User.IsAdmin
 
 	itemIDs := make([]string, 0, len(items))
-	parentIDSet := map[string]bool{}
-	seriesIDSet := map[string]bool{}
-	seasonIDSet := map[string]bool{}
+	parentCandidateSet := map[string]bool{}
 	var playableItems []model.Item
 	var seriesTypeIDs []string
 	var seasonTypeIDs []string
@@ -199,18 +305,23 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 	for i := range items {
 		it := &items[i]
 		itemIDs = append(itemIDs, it.ID)
-		if it.Type == "Season" && it.SeriesID != "" {
-			parentIDSet[it.SeriesID] = true
-			seriesIDSet[it.SeriesID] = true
+		if it.Type == "Season" {
+			if it.SeriesID != "" {
+				parentCandidateSet[it.SeriesID] = true
+			}
+			if it.ParentID != "" {
+				parentCandidateSet[it.ParentID] = true
+			}
 		}
 		if it.Type == "Episode" {
 			if it.SeasonID != "" {
-				parentIDSet[it.SeasonID] = true
-				seasonIDSet[it.SeasonID] = true
+				parentCandidateSet[it.SeasonID] = true
 			}
 			if it.SeriesID != "" {
-				parentIDSet[it.SeriesID] = true
-				seriesIDSet[it.SeriesID] = true
+				parentCandidateSet[it.SeriesID] = true
+			}
+			if it.ParentID != "" {
+				parentCandidateSet[it.ParentID] = true
 			}
 		}
 		if detail {
@@ -226,18 +337,193 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		}
 	}
 
-	// 1. Batch-load images (items + parent series for episode SeriesPrimaryImageTag).
-	imgLookupIDs := make([]string, 0, len(itemIDs)+len(seriesIDSet))
-	imgLookupSet := make(map[string]bool, len(itemIDs)+len(seriesIDSet))
+	// 1. Batch-load parent Series/Season hierarchy first so Episodes/Seasons can recover
+	// missing or dangling SeriesID/SeasonID links and load the right parent artwork.
+	type parentRow struct {
+		ID            string
+		Type          string
+		Name          string
+		SeriesID      string
+		ParentID      string
+		SoftDeletedAt *time.Time
+	}
+	parentRowsByID := make(map[string]parentRow, len(parentCandidateSet))
+	loadParents := func(idSet map[string]bool) {
+		if len(idSet) == 0 {
+			return
+		}
+		pIDs := make([]string, 0, len(idSet))
+		for pid := range idSet {
+			if pid != "" {
+				if _, loaded := parentRowsByID[pid]; !loaded {
+					pIDs = append(pIDs, pid)
+				}
+			}
+		}
+		if len(pIDs) == 0 {
+			return
+		}
+		var rows []parentRow
+		_ = rdb.Table("items").
+			Select("id, type, name, series_id, parent_id, soft_deleted_at").
+			Where("id IN ?", pIDs).
+			Scan(&rows).Error
+		for _, pr := range rows {
+			parentRowsByID[pr.ID] = pr
+		}
+	}
+	loadParents(parentCandidateSet)
+
+	// One optional second-hop batch lookup when an Episode/Season only points to a Season/Folder
+	// whose own SeriesID/ParentID was not in the initial candidate set.
+	secondHopSet := map[string]bool{}
+	for _, pr := range parentRowsByID {
+		if pr.SeriesID != "" {
+			if _, ok := parentRowsByID[pr.SeriesID]; !ok {
+				secondHopSet[pr.SeriesID] = true
+			}
+		}
+		if pr.ParentID != "" && pr.Type != "Series" {
+			if _, ok := parentRowsByID[pr.ParentID]; !ok {
+				secondHopSet[pr.ParentID] = true
+			}
+		}
+	}
+	loadParents(secondHopSet)
+
+	resolveSeriesFor := func(item *model.Item) (string, string) {
+		// Try active Series rows first, then soft-deleted Series rows, then path fallback.
+		candidates := make([]string, 0, 4)
+		addCand := func(id string) {
+			if id == "" {
+				return
+			}
+			for _, existing := range candidates {
+				if existing == id {
+					return
+				}
+			}
+			candidates = append(candidates, id)
+		}
+		addCand(item.SeriesID)
+		if item.SeasonID != "" {
+			if sRow, ok := parentRowsByID[item.SeasonID]; ok {
+				addCand(sRow.SeriesID)
+				if sRow.ParentID != "" {
+					if gRow, ok := parentRowsByID[sRow.ParentID]; ok && gRow.Type == "Series" {
+						addCand(gRow.ID)
+					}
+				}
+			}
+		}
+		if item.ParentID != "" {
+			if pRow, ok := parentRowsByID[item.ParentID]; ok {
+				if pRow.Type == "Series" {
+					addCand(pRow.ID)
+				} else {
+					addCand(pRow.SeriesID)
+					if pRow.ParentID != "" {
+						if gRow, ok := parentRowsByID[pRow.ParentID]; ok && gRow.Type == "Series" {
+							addCand(gRow.ID)
+						}
+					}
+				}
+			}
+		}
+
+		// Pass 1: active Series row with non-empty Name.
+		for _, cid := range candidates {
+			if r, ok := parentRowsByID[cid]; ok && r.SoftDeletedAt == nil && r.Type == "Series" && strings.TrimSpace(r.Name) != "" {
+				return r.ID, strings.TrimSpace(r.Name)
+			}
+		}
+		// Pass 2: any active row matching SeriesID candidate (e.g. legacy custom type).
+		for _, cid := range candidates {
+			if r, ok := parentRowsByID[cid]; ok && r.SoftDeletedAt == nil && r.Type != "Season" && strings.TrimSpace(r.Name) != "" {
+				return r.ID, strings.TrimSpace(r.Name)
+			}
+		}
+		// Pass 3: soft-deleted Series row (still preserves real show title over omitting SeriesName).
+		for _, cid := range candidates {
+			if r, ok := parentRowsByID[cid]; ok && r.Type == "Series" && strings.TrimSpace(r.Name) != "" {
+				return r.ID, strings.TrimSpace(r.Name)
+			}
+		}
+		// Pass 4: directory path fallback (matching MediaStationGo).
+		resolvedID := item.SeriesID
+		if resolvedID == "" && len(candidates) > 0 {
+			resolvedID = candidates[0]
+		}
+		return resolvedID, inferSeriesNameFromDirPath(item.DirPath)
+	}
+
+	resolveSeasonFor := func(item *model.Item) (string, string) {
+		seasonID := item.SeasonID
+		if seasonID == "" && item.ParentID != "" {
+			if pRow, ok := parentRowsByID[item.ParentID]; ok && pRow.Type == "Season" {
+				seasonID = pRow.ID
+			}
+		}
+		if seasonID != "" {
+			if sRow, ok := parentRowsByID[seasonID]; ok && strings.TrimSpace(sRow.Name) != "" {
+				return seasonID, strings.TrimSpace(sRow.Name)
+			}
+		}
+		return seasonID, defaultSeasonName(item.SeasonNum)
+	}
+
+	type resolvedHierarchy struct {
+		seriesID   string
+		seriesName string
+		seasonID   string
+		seasonName string
+	}
+	resolvedByIdx := make([]resolvedHierarchy, len(items))
+	seriesIDSet := map[string]bool{}
+	seasonIDSet := map[string]bool{}
+	for i := range items {
+		it := &items[i]
+		if it.Type == "Season" {
+			sid, sname := resolveSeriesFor(it)
+			resolvedByIdx[i] = resolvedHierarchy{seriesID: sid, seriesName: sname}
+			if sid != "" {
+				seriesIDSet[sid] = true
+			}
+		} else if it.Type == "Episode" {
+			sid, sname := resolveSeriesFor(it)
+			ssnID, ssnName := resolveSeasonFor(it)
+			resolvedByIdx[i] = resolvedHierarchy{
+				seriesID:   sid,
+				seriesName: sname,
+				seasonID:   ssnID,
+				seasonName: ssnName,
+			}
+			if sid != "" {
+				seriesIDSet[sid] = true
+			}
+			if ssnID != "" {
+				seasonIDSet[ssnID] = true
+			}
+		}
+	}
+
+	// 2. Batch-load images (items + resolved parent Series & Seasons for artwork inheritance).
+	imgLookupIDs := make([]string, 0, len(itemIDs)+len(seriesIDSet)+len(seasonIDSet))
+	imgLookupSet := make(map[string]bool, len(itemIDs)+len(seriesIDSet)+len(seasonIDSet))
+	addImgLookup := func(id string) {
+		if id != "" && !imgLookupSet[id] {
+			imgLookupSet[id] = true
+			imgLookupIDs = append(imgLookupIDs, id)
+		}
+	}
 	for _, id := range itemIDs {
-		imgLookupSet[id] = true
-		imgLookupIDs = append(imgLookupIDs, id)
+		addImgLookup(id)
 	}
 	for sid := range seriesIDSet {
-		if !imgLookupSet[sid] {
-			imgLookupSet[sid] = true
-			imgLookupIDs = append(imgLookupIDs, sid)
-		}
+		addImgLookup(sid)
+	}
+	for ssnID := range seasonIDSet {
+		addImgLookup(ssnID)
 	}
 	imagesByItem := make(map[string][]model.ItemImage, len(imgLookupIDs))
 	var allImgs []model.ItemImage
@@ -246,7 +532,7 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		imagesByItem[img.ItemID] = append(imagesByItem[img.ItemID], img)
 	}
 
-	// 2. Batch-load UserData.
+	// 3. Batch-load UserData.
 	userDataByItem := make(map[string]model.UserData, len(itemIDs))
 	if uid != "" {
 		var uds []model.UserData
@@ -256,30 +542,12 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		}
 	}
 
-	// 3. Batch-load Genres.
+	// 4. Batch-load Genres.
 	genresByItem := make(map[string][]string, len(itemIDs))
 	var allGenres []model.ItemGenre
 	_ = rdb.Where("item_id IN ?", itemIDs).Find(&allGenres).Error
 	for _, g := range allGenres {
 		genresByItem[g.ItemID] = append(genresByItem[g.ItemID], g.Genre)
-	}
-
-	// 4. Batch-load parent Series/Season names if needed.
-	parentNames := make(map[string]string, len(parentIDSet))
-	if len(parentIDSet) > 0 {
-		pIDs := make([]string, 0, len(parentIDSet))
-		for pid := range parentIDSet {
-			pIDs = append(pIDs, pid)
-		}
-		type nameRow struct {
-			ID   string
-			Name string
-		}
-		var pRows []nameRow
-		_ = rdb.Table("items").Select("id, name").Where("id IN ? AND soft_deleted_at IS NULL", pIDs).Scan(&pRows).Error
-		for _, pr := range pRows {
-			parentNames[pr.ID] = pr.Name
-		}
 	}
 
 	// 5. Batch-load detail relations when detail == true.
@@ -480,25 +748,42 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		if item.Type == "Movie" || item.Type == "Episode" {
 			mediaType = "Video"
 		}
+		aspectRatio := 2.0 / 3.0
+		if item.Type == "Episode" {
+			aspectRatio = 16.0 / 9.0
+		}
 
 		m := map[string]any{
-			"Name":              item.Name,
-			"OriginalTitle":     item.OriginalName,
-			"SortName":          item.SortName,
-			"ServerId":          serverID,
-			"Id":                item.ID,
-			"ParentId":          item.ParentID,
-			"Type":              item.Type,
-			"IsFolder":          isFolder,
-			"MediaType":         mediaType,
-			"Overview":          item.Overview,
-			"DateCreated":       item.AddedAt.UTC().Format(time.RFC3339),
-			"ImageTags":         imageTags,
-			"BackdropImageTags": backdropTags,
-			"UserData":          userDataMap,
-			"CanDownload":       canDownload,
-			"CanDelete":         canDelete,
-			"LocationType":      "FileSystem",
+			"Name":                    item.Name,
+			"OriginalTitle":           item.OriginalName,
+			"SortName":                item.SortName,
+			"ServerId":                serverID,
+			"Id":                      item.ID,
+			"Etag":                    itemEtag(item),
+			"ParentId":                item.ParentID,
+			"Type":                    item.Type,
+			"IsFolder":                isFolder,
+			"Overview":                item.Overview,
+			"DateCreated":             item.AddedAt.UTC().Format(time.RFC3339),
+			"ImageTags":               imageTags,
+			"BackdropImageTags":       backdropTags,
+			"PrimaryImageAspectRatio": aspectRatio,
+			"UserData":                userDataMap,
+			"CanDownload":             canDownload,
+			"CanDelete":               canDelete,
+			"LocationType":            "FileSystem",
+			"PlayAccess":              "Full",
+			"DisplayPreferencesId":    item.ID,
+			"ExternalUrls":            []any{},
+			"RemoteTrailers":          []any{},
+			"SupportsSync":            false,
+		}
+		if primaryTag := imageTags["Primary"]; primaryTag != "" {
+			m["PrimaryImageItemId"] = item.ID
+			m["PrimaryImageTag"] = primaryTag
+		}
+		if mediaType != "" {
+			m["MediaType"] = mediaType
 		}
 
 		if item.Year > 0 {
@@ -529,8 +814,8 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		if item.Status != "" {
 			m["Status"] = embySeriesStatus(item.Status)
 		}
-		if item.DisplayOrder != 0 {
-			m["DisplayOrder"] = item.DisplayOrder
+		if dispOrder := embyDisplayOrder(item.DisplayOrder); dispOrder != "" {
+			m["DisplayOrder"] = dispOrder
 		}
 		if item.ProductionLocationsJSON != "" {
 			var places []string
@@ -543,28 +828,121 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		}
 
 		if item.Type == "Season" {
+			rh := resolvedByIdx[i]
 			m["IndexNumber"] = item.SeasonNum
-			m["SeriesId"] = item.SeriesID
-			if sn := parentNames[item.SeriesID]; sn != "" {
-				m["SeriesName"] = sn
+			if rh.seriesID != "" {
+				m["SeriesId"] = rh.seriesID
+			}
+			if rh.seriesName != "" {
+				m["SeriesName"] = rh.seriesName
+			}
+			var parentBackdrops []string
+			for _, sImg := range imagesByItem[rh.seriesID] {
+				switch {
+				case strings.EqualFold(sImg.Kind, "Primary"):
+					if _, exists := m["SeriesPrimaryImageTag"]; !exists {
+						tag := h.signTag(p, rh.seriesID, "Primary", sImg.Tag)
+						m["SeriesPrimaryImageTag"] = tag
+						m["ParentPrimaryImageItemId"] = rh.seriesID
+						m["ParentPrimaryImageTag"] = tag
+						if _, hasOwnPrimary := m["PrimaryImageItemId"]; !hasOwnPrimary {
+							m["PrimaryImageItemId"] = rh.seriesID
+							m["PrimaryImageTag"] = tag
+						}
+					}
+				case strings.EqualFold(sImg.Kind, "Backdrop"):
+					parentBackdrops = append(parentBackdrops, h.signTag(p, rh.seriesID, sImg.Kind, sImg.Tag))
+				case strings.EqualFold(sImg.Kind, "Thumb"):
+					if imageTags["Thumb"] == "" {
+						if _, exists := m["ParentThumbImageTag"]; !exists {
+							m["ParentThumbItemId"] = rh.seriesID
+							m["ParentThumbImageTag"] = h.signTag(p, rh.seriesID, "Thumb", sImg.Tag)
+						}
+					}
+				case strings.EqualFold(sImg.Kind, "Logo"):
+					if imageTags["Logo"] == "" {
+						if _, exists := m["ParentLogoImageTag"]; !exists {
+							m["ParentLogoItemId"] = rh.seriesID
+							m["ParentLogoImageTag"] = h.signTag(p, rh.seriesID, "Logo", sImg.Tag)
+						}
+					}
+				}
+			}
+			if len(parentBackdrops) > 0 {
+				m["ParentBackdropItemId"] = rh.seriesID
+				m["ParentBackdropImageTags"] = parentBackdrops
 			}
 		}
 		if item.Type == "Episode" {
+			rh := resolvedByIdx[i]
 			m["IndexNumber"] = item.EpisodeNum
 			m["ParentIndexNumber"] = item.SeasonNum
-			m["SeasonId"] = item.SeasonID
-			m["SeriesId"] = item.SeriesID
-			if sn := parentNames[item.SeasonID]; sn != "" {
-				m["SeasonName"] = sn
+			if rh.seasonID != "" {
+				m["SeasonId"] = rh.seasonID
 			}
-			if sn := parentNames[item.SeriesID]; sn != "" {
-				m["SeriesName"] = sn
+			if rh.seriesID != "" {
+				m["SeriesId"] = rh.seriesID
 			}
-			for _, sImg := range imagesByItem[item.SeriesID] {
-				if sImg.Kind == "Primary" {
-					m["SeriesPrimaryImageTag"] = h.signTag(p, item.SeriesID, "Primary", sImg.Tag)
-					break
+			if rh.seasonName != "" {
+				m["SeasonName"] = rh.seasonName
+			}
+			if rh.seriesName != "" {
+				m["SeriesName"] = rh.seriesName
+			}
+			var seasonPrimaryTag string
+			if rh.seasonID != "" {
+				for _, ssnImg := range imagesByItem[rh.seasonID] {
+					if strings.EqualFold(ssnImg.Kind, "Primary") {
+						seasonPrimaryTag = h.signTag(p, rh.seasonID, "Primary", ssnImg.Tag)
+						break
+					}
 				}
+			}
+			var parentBackdrops []string
+			var seriesPrimaryTag string
+			if rh.seriesID != "" {
+				for _, sImg := range imagesByItem[rh.seriesID] {
+					switch {
+					case strings.EqualFold(sImg.Kind, "Primary"):
+						if seriesPrimaryTag == "" {
+							seriesPrimaryTag = h.signTag(p, rh.seriesID, "Primary", sImg.Tag)
+							m["SeriesPrimaryImageTag"] = seriesPrimaryTag
+						}
+					case strings.EqualFold(sImg.Kind, "Backdrop"):
+						parentBackdrops = append(parentBackdrops, h.signTag(p, rh.seriesID, sImg.Kind, sImg.Tag))
+					case strings.EqualFold(sImg.Kind, "Thumb"):
+						if imageTags["Thumb"] == "" {
+							if _, exists := m["ParentThumbImageTag"]; !exists {
+								m["ParentThumbItemId"] = rh.seriesID
+								m["ParentThumbImageTag"] = h.signTag(p, rh.seriesID, "Thumb", sImg.Tag)
+							}
+						}
+					case strings.EqualFold(sImg.Kind, "Logo"):
+						if imageTags["Logo"] == "" {
+							if _, exists := m["ParentLogoImageTag"]; !exists {
+								m["ParentLogoItemId"] = rh.seriesID
+								m["ParentLogoImageTag"] = h.signTag(p, rh.seriesID, "Logo", sImg.Tag)
+							}
+						}
+					}
+				}
+			}
+			if seasonPrimaryTag != "" {
+				m["ParentPrimaryImageItemId"] = rh.seasonID
+				m["ParentPrimaryImageTag"] = seasonPrimaryTag
+			} else if seriesPrimaryTag != "" {
+				m["ParentPrimaryImageItemId"] = rh.seriesID
+				m["ParentPrimaryImageTag"] = seriesPrimaryTag
+			}
+			if _, hasOwnPrimary := m["PrimaryImageItemId"]; !hasOwnPrimary && rh.seriesID != "" {
+				m["PrimaryImageItemId"] = rh.seriesID
+				if seriesPrimaryTag != "" {
+					m["PrimaryImageTag"] = seriesPrimaryTag
+				}
+			}
+			if len(parentBackdrops) > 0 {
+				m["ParentBackdropItemId"] = rh.seriesID
+				m["ParentBackdropImageTags"] = parentBackdrops
 			}
 		}
 
@@ -578,9 +956,10 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		if gNames == nil {
 			gNames = []string{}
 		}
+		// Emby OpenAPI BaseItemDto.GenreItems is NameLongIdPair[] (Id MUST be int64).
 		genreItems := make([]map[string]any, 0, len(gNames))
 		for _, g := range gNames {
-			genreItems = append(genreItems, map[string]any{"Name": g, "Id": "genre-" + g})
+			genreItems = append(genreItems, map[string]any{"Name": g, "Id": stableNumericID("genre", g)})
 		}
 		m["Genres"] = gNames
 		m["GenreItems"] = genreItems
@@ -590,15 +969,25 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			if tNames == nil {
 				tNames = []string{}
 			}
+			tagItems := make([]map[string]any, 0, len(tNames))
+			for _, t := range tNames {
+				tagItems = append(tagItems, map[string]any{"Name": t, "Id": stableNumericID("tag", t)})
+			}
 			m["Tags"] = tNames
+			m["TagItems"] = tagItems
 
 			var studios []string
 			if item.StudiosJSON != "" {
 				_ = json.Unmarshal([]byte(item.StudiosJSON), &studios)
 			}
+			// Emby OpenAPI BaseItemDto.Studios is NameLongIdPair[] (Id MUST be int64; Yamby enforces numeric IDs).
 			studioObjs := make([]map[string]any, 0, len(studios))
 			for _, st := range studios {
-				studioObjs = append(studioObjs, map[string]any{"Name": st})
+				st = strings.TrimSpace(st)
+				if st == "" {
+					continue
+				}
+				studioObjs = append(studioObjs, map[string]any{"Name": st, "Id": stableNumericID("studio", st)})
 			}
 			m["Studios"] = studioObjs
 
@@ -755,4 +1144,25 @@ func embyChapterMarkerName(markerType int) string {
 	default:
 		return "Chapter"
 	}
+}
+
+func embyDisplayOrder(raw int) string {
+	switch raw {
+	case 1:
+		return "aired"
+	case 2:
+		return "dvd"
+	case 3:
+		return "absolute"
+	default:
+		return ""
+	}
+}
+
+func itemEtag(item *model.Item) string {
+	if item == nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(item.ID + "|" + strconv.FormatInt(item.UpdatedAt.UnixNano(), 10)))
+	return hex.EncodeToString(sum[:8])
 }

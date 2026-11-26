@@ -576,6 +576,7 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 		order := []string{"Series", "Season", "Movie", "Episode", "BoxSet"}
 		now := time.Now().UTC()
 		itemKinds := make(map[string]string, len(items))
+		seasonToSeriesLocal := make(map[string]string)
 		for _, it := range items {
 			itemKinds[it.EmbyID] = it.ItemType
 		}
@@ -709,10 +710,17 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 						// season folder exists; only treat the parent as a season when it is one.
 						if itemKinds[it.ParentID] == "Season" {
 							seasonID = pid
+						} else if itemKinds[it.ParentID] == "Series" && seriesID == "" {
+							seriesID = pid
 						}
 						parentID = pid
 					} else if seriesID != "" {
 						parentID = seriesID
+					}
+					if seriesID == "" && seasonID != "" {
+						if sid := seasonToSeriesLocal[seasonID]; sid != "" {
+							seriesID = sid
+						}
 					}
 				}
 
@@ -725,6 +733,9 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 					localID = existingLocalID
 					if !req.Overwrite {
 						embyItemToLocal[it.EmbyID] = localID
+						if wantType == "Season" && seriesID != "" {
+							seasonToSeriesLocal[localID] = seriesID
+						}
 						if it.UserDataKey != "" {
 							userDataKeyToLocal[it.UserDataKey] = localID
 						}
@@ -910,6 +921,9 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 
 				writer.add(row)
 				embyItemToLocal[it.EmbyID] = rec.ID
+				if wantType == "Season" && seriesID != "" {
+					seasonToSeriesLocal[rec.ID] = seriesID
+				}
 				if it.UserDataKey != "" {
 					userDataKeyToLocal[it.UserDataKey] = rec.ID
 				}

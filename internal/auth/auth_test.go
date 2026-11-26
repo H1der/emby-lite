@@ -36,4 +36,18 @@ func TestExtractClientMeta(t *testing.T) {
 	if meta.Client != "VidHub" || meta.Device != "iPhone" || meta.DeviceID != "ios-99" || meta.Token != "header-tok" {
 		t.Fatalf("unexpected meta: %+v", meta)
 	}
+
+	// Emby 4.10 / Yamby style headers with spaces around '=' and dedicated X-Emby-* headers.
+	req2 := httptest.NewRequest(http.MethodGet, "/emby/Items?x-emby-token=ci-tok", nil)
+	req2.Header.Set("Authorization", `Emby Client = "Yamby", Device = "Pixel 9", DeviceId = "yamby-123", Version = "1.0.9"`)
+	meta2 := ExtractClientMeta(req2)
+	if meta2.Client != "Yamby" || meta2.Device != "Pixel 9" || meta2.DeviceID != "yamby-123" || meta2.Version != "1.0.9" || meta2.Token != "ci-tok" {
+		t.Fatalf("unexpected yamby meta: %+v", meta2)
+	}
+
+	req3 := httptest.NewRequest(http.MethodGet, "/emby/Items?X-Emby-Client=Yamby&X-Emby-Client-Version=1.2.0&X-Emby-Device-Name=AndroidTV&X-Emby-Device-Id=tv-1&ApiKey=tok3", nil)
+	meta3 := ExtractClientMeta(req3)
+	if meta3.Client != "Yamby" || meta3.Version != "1.2.0" || meta3.Device != "AndroidTV" || meta3.DeviceID != "tv-1" || meta3.Token != "tok3" {
+		t.Fatalf("unexpected query-header meta: %+v", meta3)
+	}
 }

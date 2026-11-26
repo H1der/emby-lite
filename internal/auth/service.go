@@ -530,7 +530,31 @@ func (s *Service) ReleaseLease(userID, playSessionID, deviceID, itemID string) {
 	_ = s.db.Gorm.Where("user_id = ? AND device_id = ? AND item_id = ?", userID, deviceID, itemID).Delete(&model.PlaybackLease{}).Error
 }
 
-var authFieldRe = regexp.MustCompile(`([A-Za-z0-9_]+)="([^"]*)"`)
+var authFieldRe = regexp.MustCompile(`([A-Za-z0-9_]+)\s*=\s*(?:"([^"]*)"|([^,\s]+))`)
+
+func queryCI(r *http.Request, key string) string {
+	if r == nil || r.URL == nil {
+		return ""
+	}
+	if v := r.URL.Query().Get(key); v != "" {
+		return v
+	}
+	for k, vals := range r.URL.Query() {
+		if strings.EqualFold(k, key) && len(vals) > 0 && vals[0] != "" {
+			return vals[0]
+		}
+	}
+	return ""
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if t := strings.TrimSpace(v); t != "" {
+			return t
+		}
+	}
+	return ""
+}
 
 // ExtractClientMeta parses Emby's multi-source authentication headers and query parameters.
 func ExtractClientMeta(r *http.Request) ClientMeta {
@@ -538,11 +562,13 @@ func ExtractClientMeta(r *http.Request) ClientMeta {
 		RemoteAddr: clientIP(r),
 	}
 
-	// Parse MediaBrowser auth header (X-Emby-Authorization, Authorization, or query X-Emby-Authorization).
+	// Parse MediaBrowser / Emby auth headers (X-Emby-Authorization, X-MediaBrowser-Authorization, Authorization, or query).
 	authHeaders := []string{
 		r.Header.Get("X-Emby-Authorization"),
+		r.Header.Get("X-MediaBrowser-Authorization"),
 		r.Header.Get("Authorization"),
-		r.URL.Query().Get("X-Emby-Authorization"),
+		queryCI(r, "X-Emby-Authorization"),
+		queryCI(r, "X-MediaBrowser-Authorization"),
 	}
 	var headerAuthToken string
 	for _, h := range authHeaders {
@@ -557,6 +583,9 @@ func ExtractClientMeta(r *http.Request) ClientMeta {
 		for _, m := range authFieldRe.FindAllStringSubmatch(h, -1) {
 			k := strings.ToLower(m[1])
 			v := strings.TrimSpace(m[2])
+			if v == "" {
+				v = strings.TrimSpace(m[3])
+			}
 			switch k {
 			case "client":
 				if meta.Client == "" {
@@ -582,37 +611,81 @@ func ExtractClientMeta(r *http.Request) ClientMeta {
 		}
 	}
 
-	// Fallback device ID from headers / query.
+	// Fallback client/device/version metadata from Emby 4.8–4.10 dedicated headers and query parameters.
+	if meta.Client == "" {
+		meta.Client = firstNonEmpty(
+			r.Header.Get("X-Emby-Client"),
+			r.Header.Get("X-MediaBrowser-Client"),
+			queryCI(r, "X-Emby-Client"),
+			queryCI(r, "Client"),
+		)
+	}
+	if meta.Version == "" {
+		meta.Version = firstNonEmpty(
+			r.Header.Get("X-Emby-Client-Version"),
+			r.Header.Get("X-MediaBrowser-Client-Version"),
+			queryCI(r, "X-Emby-Client-Version"),
+			queryCI(r, "Version"),
+		)
+	}
+	if meta.Device == "" {
+		meta.Device = firstNonEmpty(
+			r.Header.Get("X-Emby-Device-Name"),
+			r.Header.Get("X-Emby-DeviceName"),
+			r.Header.Get("X-MediaBrowser-Device-Name"),
+			queryCI(r, "X-Emby-Device-Name"),
+			queryCI(r, "DeviceName"),
+			queryCI(r, "Device"),
+		)
+	}
 	if meta.DeviceID == "" {
-		for _, v := range []string{
+		meta.DeviceID = firstNonEmpty(
 			r.Header.Get("X-Emby-Device-Id"),
-			r.URL.Query().Get("DeviceId"),
-			r.URL.Query().Get("X-Emby-Device-Id"),
-		} {
-			if t := strings.TrimSpace(v); t != "" {
-				meta.DeviceID = t
-				break
-			}
+			r.Header.Get("X-Emby-DeviceId"),
+			r.Header.Get("X-MediaBrowser-Device-Id"),
+			queryCI(r, "X-Emby-Device-Id"),
+			queryCI(r, "DeviceId"),
+		)
+	}
+
+	// User-Agent fallback for client identification when headers omit Client.
+	if meta.Client == "" {
+		ua := strings.ToLower(strings.TrimSpace(r.Header.Get("User-Agent")))
+		switch {
+		case strings.Contains(ua, "yamby"):
+			meta.Client = "Yamby"
+		case strings.Contains(ua, "infuse"):
+			meta.Client = "Infuse"
+		case strings.Contains(ua, "vidhub"):
+			meta.Client = "VidHub"
+		case strings.Contains(ua, "senplayer"):
+			meta.Client = "SenPlayer"
+		case strings.Contains(ua, "hills"):
+			meta.Client = "Hills"
+		case strings.Contains(ua, "afusekt"):
+			meta.Client = "AfuseKt"
+		case strings.Contains(ua, "fileball"):
+			meta.Client = "Fileball"
+		case strings.Contains(ua, "filmly"):
+			meta.Client = "Filmly"
+		case strings.Contains(ua, "emby"):
+			meta.Client = "Emby"
 		}
 	}
 
-	// Token priority per Emby/go-emby spec.
-	candidates := []string{
+	// Token priority per Emby 4.10 spec (headers first, then query params, case-insensitive).
+	meta.Token = firstNonEmpty(
 		r.Header.Get("X-Emby-Token"),
 		r.Header.Get("X-MediaBrowser-Token"),
 		headerAuthToken,
 		r.Header.Get("X-Emby-Api-Key"),
-		r.URL.Query().Get("api_key"),
-		r.URL.Query().Get("X-Emby-Token"),
-		r.URL.Query().Get("X-MediaBrowser-Token"),
-		r.URL.Query().Get("X-Emby-Api-Key"),
-	}
-	for _, c := range candidates {
-		if t := strings.TrimSpace(c); t != "" {
-			meta.Token = t
-			break
-		}
-	}
+		queryCI(r, "api_key"),
+		queryCI(r, "X-Emby-Token"),
+		queryCI(r, "X-MediaBrowser-Token"),
+		queryCI(r, "X-Emby-Api-Key"),
+		queryCI(r, "ApiKey"),
+		queryCI(r, "Token"),
+	)
 
 	return meta
 }

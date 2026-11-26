@@ -15,6 +15,7 @@ import (
 	"emby-lite/internal/model"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 const hotCacheTTL = 60 * time.Second
@@ -96,49 +97,119 @@ func (h *Handler) buildUserViewsItems(p *auth.Principal, visibleIDs []string) ([
 }
 
 func (h *Handler) buildLatestDTOs(r *http.Request, p *auth.Principal, visibleIDs []string, parentID string, limit int) []map[string]any {
+	return h.buildLatestDTOsWithOpts(r, p, visibleIDs, parentID, limit, nil, "", false)
+}
+
+func (h *Handler) buildLatestDTOsWithOpts(r *http.Request, p *auth.Principal, visibleIDs []string, parentID string, limit int, includeTypes []string, isPlayed string, detail bool) []map[string]any {
 	if len(visibleIDs) == 0 {
 		return []map[string]any{}
 	}
+	types := normalizeItemTypes(includeTypes)
+	if len(types) == 0 {
+		types = []string{"Movie", "Series"}
+	}
 	q := h.db.Read().Model(&model.Item{}).
-		Where("soft_deleted_at IS NULL AND library_id IN ? AND type IN ?", visibleIDs, []string{"Movie", "Series"})
-	if parentID != "" {
+		Where("soft_deleted_at IS NULL AND library_id IN ? AND type IN ?", visibleIDs, types)
+	if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
 		q = q.Where("library_id = ?", parentID)
+	}
+	if p != nil && p.User != nil {
+		if strings.EqualFold(isPlayed, "false") {
+			q = q.Where("id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true)
+		} else if strings.EqualFold(isPlayed, "true") {
+			q = q.Where("id IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true)
+		}
 	}
 	var rows []model.Item
 	_ = q.Order("added_at DESC, id ASC").Limit(limit).Find(&rows).Error
-	return h.itemsToDTOs(r, p, rows, false)
+	return h.itemsToDTOs(r, p, rows, detail)
+}
+
+type resumeQueryOpts struct {
+	ParentID     string
+	IncludeTypes []string
+	ExcludeTypes []string
+	MediaTypes   []string
+	StartIndex   int
+	Limit        int
+	Detail       bool
 }
 
 func (h *Handler) buildResumeDTOs(r *http.Request, p *auth.Principal, visibleIDs []string, limit int) []map[string]any {
+	out, _ := h.buildResumeDTOsWithOpts(r, p, visibleIDs, resumeQueryOpts{Limit: limit})
+	return out
+}
+
+func (h *Handler) buildResumeDTOsPaged(r *http.Request, p *auth.Principal, visibleIDs []string, parentID string, startIndex, limit int, detail bool) ([]map[string]any, int64) {
+	return h.buildResumeDTOsWithOpts(r, p, visibleIDs, resumeQueryOpts{
+		ParentID:   parentID,
+		StartIndex: startIndex,
+		Limit:      limit,
+		Detail:     detail,
+	})
+}
+
+func (h *Handler) buildResumeDTOsWithOpts(r *http.Request, p *auth.Principal, visibleIDs []string, opts resumeQueryOpts) ([]map[string]any, int64) {
 	if p == nil || p.User == nil || len(visibleIDs) == 0 {
-		return []map[string]any{}
+		return []map[string]any{}, 0
 	}
-	var rows []model.Item
-	_ = h.db.Read().Table("items").
+	if len(opts.MediaTypes) > 0 && !containsCI(opts.MediaTypes, "Video") {
+		return []map[string]any{}, 0
+	}
+	base := h.db.Read().Table("items").
 		Joins("JOIN user_data ON user_data.item_id = items.id").
 		Where("items.soft_deleted_at IS NULL AND items.library_id IN ?", visibleIDs).
-		Where("user_data.user_id = ? AND user_data.position_ticks > 0 AND user_data.played = ? AND user_data.hide_from_resume = ?", p.User.ID, false, false).
-		Order("user_data.updated_at DESC").
-		Limit(limit).
+		Where("user_data.user_id = ? AND user_data.position_ticks > 0 AND user_data.played = ? AND user_data.hide_from_resume = ?", p.User.ID, false, false)
+	if opts.ParentID != "" && opts.ParentID != "root" && !strings.HasPrefix(opts.ParentID, "vlib-") {
+		base = base.Where("(items.library_id = ? OR items.parent_id = ? OR items.series_id = ?)", opts.ParentID, opts.ParentID, opts.ParentID)
+	}
+	if len(opts.MediaTypes) > 0 {
+		base = base.Where("items.type IN ?", []string{"Movie", "Episode"})
+	}
+	if inc := normalizeItemTypes(opts.IncludeTypes); len(inc) > 0 {
+		base = base.Where("items.type IN ?", inc)
+	}
+	if exc := normalizeItemTypes(opts.ExcludeTypes); len(exc) > 0 {
+		base = base.Where("items.type NOT IN ?", exc)
+	}
+	var total int64
+	_ = base.Session(&gorm.Session{}).Count(&total).Error
+	var rows []model.Item
+	_ = base.Session(&gorm.Session{}).
+		Select("items.*").
+		Order("COALESCE(user_data.last_played_at, user_data.updated_at) DESC, user_data.updated_at DESC").
+		Offset(opts.StartIndex).Limit(opts.Limit).
 		Find(&rows).Error
-	return h.itemsToDTOs(r, p, rows, false)
+	dtos := h.itemsToDTOs(r, p, rows, opts.Detail)
+	attachResumeSeriesArtwork(dtos)
+	return dtos, total
 }
 
 func (h *Handler) buildNextUpDTOs(r *http.Request, p *auth.Principal, visibleIDs []string, limit int) []map[string]any {
+	out, _ := h.buildNextUpDTOsPaged(r, p, visibleIDs, "", "", 0, limit, false)
+	return out
+}
+
+func (h *Handler) buildNextUpDTOsPaged(r *http.Request, p *auth.Principal, visibleIDs []string, parentID, seriesID string, startIndex, limit int, detail bool) ([]map[string]any, int) {
 	if p == nil || p.User == nil || len(visibleIDs) == 0 {
-		return []map[string]any{}
+		return []map[string]any{}, 0
 	}
-	var playedEps []model.Item
-	_ = h.db.Read().Table("items").
+	q := h.db.Read().Table("items").
+		Select("items.*").
 		Joins("JOIN user_data ON user_data.item_id = items.id").
 		Where("items.soft_deleted_at IS NULL AND items.type = ? AND items.library_id IN ?", "Episode", visibleIDs).
-		Where("user_data.user_id = ? AND user_data.played = ?", p.User.ID, true).
-		Order("user_data.updated_at DESC").
-		Limit(50).
-		Find(&playedEps).Error
+		Where("user_data.user_id = ? AND user_data.played = ?", p.User.ID, true)
+	if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
+		q = q.Where("items.library_id = ?", parentID)
+	}
+	if seriesID != "" {
+		q = q.Where("items.series_id = ?", seriesID)
+	}
+	var playedEps []model.Item
+	_ = q.Order("COALESCE(user_data.last_played_at, user_data.updated_at) DESC, user_data.updated_at DESC").Limit(200).Find(&playedEps).Error
 
 	seenSeries := map[string]bool{}
-	nextRows := make([]model.Item, 0, limit)
+	allNext := make([]model.Item, 0, limit)
 	for _, ep := range playedEps {
 		if ep.SeriesID == "" || seenSeries[ep.SeriesID] {
 			continue
@@ -151,13 +222,18 @@ func (h *Handler) buildNextUpDTOs(r *http.Request, p *auth.Principal, visibleIDs
 			Order("season_num ASC, episode_num ASC").
 			First(&next).Error
 		if err == nil {
-			nextRows = append(nextRows, next)
-			if len(nextRows) >= limit {
-				break
-			}
+			allNext = append(allNext, next)
 		}
 	}
-	return h.itemsToDTOs(r, p, nextRows, false)
+	total := len(allNext)
+	if startIndex >= total {
+		return []map[string]any{}, total
+	}
+	end := startIndex + limit
+	if end > total {
+		end = total
+	}
+	return h.itemsToDTOs(r, p, allNext[startIndex:end], detail), total
 }
 
 func (h *Handler) buildCounts(visibleIDs []string) map[string]int64 {

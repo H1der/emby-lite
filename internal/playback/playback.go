@@ -137,9 +137,12 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 				"Index":                  sub.StreamIndex,
 				"Codec":                  sub.Codec,
 				"Language":               sub.Language,
+				"DisplayLanguage":        sub.Language,
 				"DisplayTitle":           sub.Title,
 				"Title":                  sub.Title,
 				"IsExternal":             sub.IsExternal,
+				"IsExternalUrl":          false,
+				"IsTextSubtitleStream":   true,
 				"IsDefault":              sub.IsDefault,
 				"IsForced":               sub.IsForced,
 				"SupportsExternalStream": true,
@@ -172,20 +175,56 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 		}
 
 		ms := map[string]any{
-			"Id":                    src.ID,
-			"Name":                  name,
-			"Protocol":              "Http",
-			"Type":                  "Default",
-			"Container":             ext,
-			"Size":                  src.FileSize,
-			"Path":                  pathVal,
-			"DirectStreamUrl":       relURL,
-			"SupportsDirectPlay":    true,
-			"SupportsDirectStream":  true,
-			"SupportsTranscoding":   false,
-			"IsRemote":              src.SourceType == "strm",
-			"ReadAtNativeFramerate": false,
-			"MediaStreams":          streams,
+			"Id":                         src.ID,
+			"Name":                       name,
+			"Protocol":                   "Http",
+			"Type":                       "Default",
+			"Container":                  ext,
+			"Size":                       src.FileSize,
+			"Path":                       pathVal,
+			"DirectStreamUrl":            relURL,
+			"SupportsDirectPlay":         true,
+			"SupportsDirectStream":       true,
+			"SupportsTranscoding":        false,
+			"SupportsProbing":            true,
+			"IsRemote":                   src.SourceType == "strm",
+			"IsInfiniteStream":           false,
+			"RequiresOpening":            false,
+			"RequiresClosing":            false,
+			"IgnoreDts":                  false,
+			"IgnoreIndex":                false,
+			"GenPtsInput":                false,
+			"ReadAtNativeFramerate":      false,
+			"AddApiKeyToDirectStreamUrl": false,
+			"MediaStreams":               streams,
+		}
+		// Advertise default audio / subtitle stream indices when available.
+		defaultAudioIdx := -1
+		firstAudioIdx := -1
+		defaultSubIdx := -1
+		for _, st := range streams {
+			stType, _ := st["Type"].(string)
+			idxVal := streamIndexInt(st["Index"])
+			isDef, _ := st["IsDefault"].(bool)
+			if strings.EqualFold(stType, "Audio") && idxVal >= 0 {
+				if firstAudioIdx < 0 {
+					firstAudioIdx = idxVal
+				}
+				if isDef && defaultAudioIdx < 0 {
+					defaultAudioIdx = idxVal
+				}
+			}
+			if strings.EqualFold(stType, "Subtitle") && idxVal >= 0 && isDef && defaultSubIdx < 0 {
+				defaultSubIdx = idxVal
+			}
+		}
+		if defaultAudioIdx >= 0 {
+			ms["DefaultAudioStreamIndex"] = defaultAudioIdx
+		} else if firstAudioIdx >= 0 {
+			ms["DefaultAudioStreamIndex"] = firstAudioIdx
+		}
+		if defaultSubIdx >= 0 {
+			ms["DefaultSubtitleStreamIndex"] = defaultSubIdx
 		}
 		if src.Width > 0 {
 			ms["Width"] = src.Width
@@ -210,11 +249,42 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 	return result
 }
 
+func streamIndexInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	default:
+		return -1
+	}
+}
+
 // BuildPlaybackInfo builds the full Emby PlaybackInfo JSON payload.
 func (s *Service) BuildPlaybackInfo(r *http.Request, p *auth.Principal, item *model.Item) map[string]any {
+	return s.BuildPlaybackInfoWithSource(r, p, item, "")
+}
+
+// BuildPlaybackInfoWithSource builds Emby PlaybackInfo, prioritizing preferredSourceID when specified.
+func (s *Service) BuildPlaybackInfoWithSource(r *http.Request, p *auth.Principal, item *model.Item, preferredSourceID string) map[string]any {
 	playSessionID := strings.ReplaceAll(uuid.NewString(), "-", "")
+	sources := s.BuildMediaSources(r, p, item)
+	if preferredSourceID != "" && len(sources) > 1 {
+		for i, src := range sources {
+			if id, _ := src["Id"].(string); id == preferredSourceID && i > 0 {
+				reordered := make([]map[string]any, 0, len(sources))
+				reordered = append(reordered, sources[i])
+				reordered = append(reordered, sources[:i]...)
+				reordered = append(reordered, sources[i+1:]...)
+				sources = reordered
+				break
+			}
+		}
+	}
 	return map[string]any{
-		"MediaSources":  s.BuildMediaSources(r, p, item),
+		"MediaSources":  sources,
 		"PlaySessionId": playSessionID,
 	}
 }
