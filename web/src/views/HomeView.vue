@@ -134,21 +134,33 @@
               <span class="px-2 py-0.5 rounded-full glass-pill">{{ counts.SeriesCount || 0 }} 部剧集</span>
             </div>
           </div>
-          <router-link
-            v-if="auth.isAdmin"
-            to="/admin?tab=libraries"
-            class="text-xs font-medium text-sky-600 dark:text-sky-400 hover:underline"
-          >
-            管理媒体库 →
-          </router-link>
+          <div class="flex items-center gap-3">
+            <button
+              type="button"
+              class="text-xs font-medium px-2.5 py-1 rounded-xl glass-pill text-ink-secondary hover:text-sky-600 dark:hover:text-sky-400 transition"
+              @click="showHomeSettings = true"
+            >
+              ⚙ 主屏幕设置
+            </button>
+            <router-link
+              v-if="auth.isAdmin"
+              to="/admin?tab=libraries"
+              class="text-xs font-medium text-sky-600 dark:text-sky-400 hover:underline"
+            >
+              管理媒体库 →
+            </router-link>
+          </div>
         </div>
 
         <div v-if="views.length === 0" class="glass-panel rounded-3xl p-10 text-center space-y-3">
           <div class="text-3xl">📂</div>
-          <p class="text-sm text-ink-secondary">还没有可见媒体库，添加目录并扫描即可点亮海报墙。</p>
-          <n-button v-if="auth.isAdmin" type="primary" @click="router.push('/admin?tab=libraries')">
-            前往后台新建媒体库
-          </n-button>
+          <p class="text-sm text-ink-secondary">当前「我的媒体库」暂无展示项，可在主屏幕设置中调整显示或新建媒体库。</p>
+          <div class="flex items-center justify-center gap-2">
+            <n-button secondary @click="showHomeSettings = true">主屏幕设置</n-button>
+            <n-button v-if="auth.isAdmin" type="primary" @click="router.push('/admin?tab=libraries')">
+              前往后台新建媒体库
+            </n-button>
+          </div>
         </div>
 
         <div v-else class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 3xl:grid-cols-6 gap-4">
@@ -170,19 +182,8 @@
               class="absolute inset-0 bg-gradient-to-br from-sky-400/35 via-indigo-400/25 to-teal-400/30"
             ></div>
             <div class="absolute inset-0 bg-gradient-to-t from-slate-950/80 via-slate-900/25 to-transparent"></div>
-            <div class="relative z-10 flex items-end justify-between gap-2">
-              <div class="min-w-0">
-                <div class="text-base font-bold text-white truncate drop-shadow-sm">{{ lib.Name }}</div>
-                <div class="text-[11px] text-slate-200/90 mt-0.5">
-                  {{ lib.Id.startsWith('vlib-') ? '智能虚拟库' : kindLabel(lib.CollectionType) }}
-                </div>
-              </div>
-              <span
-                v-if="lib.ChildCount !== undefined"
-                class="shrink-0 px-2 py-0.5 rounded-lg bg-white/20 backdrop-blur-md border border-white/25 text-white text-xs font-semibold"
-              >
-                {{ lib.ChildCount }}
-              </span>
+            <div class="relative z-10 min-w-0">
+              <div class="text-base font-bold text-white truncate drop-shadow-sm">{{ lib.Name }}</div>
             </div>
           </router-link>
         </div>
@@ -240,6 +241,8 @@
         </div>
       </section>
     </template>
+
+    <HomeScreenSettingsModal v-model:show="showHomeSettings" @saved="refreshHome" />
   </div>
 </template>
 
@@ -251,6 +254,7 @@ import { apiFetchCached, getCachedData, itemImageUrl } from '../api/client'
 import { useAuthStore } from '../stores/auth'
 import PosterCard from '../components/PosterCard.vue'
 import PosterSkeleton from '../components/PosterSkeleton.vue'
+import HomeScreenSettingsModal from '../components/HomeScreenSettingsModal.vue'
 
 interface WebHomePayload {
   views: any[]
@@ -271,6 +275,7 @@ const latestItems = ref<any[]>([])
 const featured = ref<any[]>([])
 const counts = ref<WebHomePayload['counts'] | null>(null)
 const initialLoading = ref(true)
+const showHomeSettings = ref(false)
 
 const heroIndex = ref(0)
 const heroPaused = ref(false)
@@ -293,13 +298,6 @@ const heroBackdropUrl = computed(() => {
   }
   return ''
 })
-
-function kindLabel(k: string) {
-  if (k === 'movies') return '电影库'
-  if (k === 'tvshows') return '剧集库'
-  if (k === 'boxsets') return '合集库'
-  return '混合媒体库'
-}
 
 function stepHero(delta: number) {
   if (featured.value.length <= 1) return
@@ -332,6 +330,15 @@ function applyHomeData(data: WebHomePayload) {
   }
 }
 
+async function refreshHome() {
+  try {
+    const fresh = await apiFetchCached<WebHomePayload>('/api/web/home', { force: true })
+    applyHomeData(fresh)
+  } catch {
+    // ignore refresh error
+  }
+}
+
 onMounted(async () => {
   const cached = getCachedData<WebHomePayload>('/api/web/home')
   if (cached) {
@@ -348,6 +355,7 @@ onMounted(async () => {
     initialLoading.value = false
   }
 
+  window.addEventListener('emby-lite:home-settings-updated', refreshHome)
   heroTimer = window.setInterval(() => {
     if (!heroPaused.value && featured.value.length > 1) {
       stepHero(1)
@@ -356,6 +364,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('emby-lite:home-settings-updated', refreshHome)
   if (heroTimer) window.clearInterval(heroTimer)
 })
 </script>

@@ -186,10 +186,10 @@
             <router-link
               v-if="auth.isAdmin && activeTask"
               to="/admin?tab=tasks"
-              class="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-xl bg-sky-500/12 border border-sky-400/30 text-sky-700 dark:text-sky-300 text-xs font-medium hover:bg-sky-500/20 transition max-w-[240px]"
+              class="hidden sm:flex items-center gap-2 px-3 py-1.5 rounded-xl bg-sky-500/12 border border-sky-400/30 text-sky-700 dark:text-sky-300 text-xs font-medium hover:bg-sky-500/20 transition max-w-[260px]"
             >
               <span class="w-2 h-2 rounded-full bg-sky-500 animate-pulse shrink-0"></span>
-              <span class="truncate">{{ activeTask.message || '后台任务执行中' }}</span>
+              <span class="truncate">{{ formatActiveTaskLabel(activeTask) }}</span>
               <span v-if="activeTask.total > 0" class="font-mono shrink-0">
                 {{ Math.min(100, Math.round((activeTask.progress / activeTask.total) * 100)) }}%
               </span>
@@ -345,12 +345,22 @@ function libraryIcon(lib: any) {
   return '🗂️'
 }
 
-async function loadLibraries() {
+function formatActiveTaskLabel(t: any): string {
+  const msg = String(t?.message || '后台任务执行中')
+  const libName = String(t?.library_name || '').trim()
+  if (libName && !msg.includes(libName)) {
+    return `[${libName}] ${msg}`
+  }
+  return msg
+}
+
+async function loadLibraries(force = false) {
   const uid = auth.user?.Id
   if (!uid) return
   try {
-    const res = await apiFetchCached(`/emby/Users/${uid}/Views`, {
+    const res = await apiFetchCached(`/emby/Users/${uid}/Views?IncludeHidden=true`, {
       ttlMs: 30000,
+      force,
       onUpdate: (fresh) => {
         libraries.value = fresh?.Items || []
       },
@@ -359,6 +369,10 @@ async function loadLibraries() {
   } catch {
     // ignore sidebar load error
   }
+}
+
+function onHomeSettingsUpdated() {
+  loadLibraries(true)
 }
 
 function connectGlobalSSE() {
@@ -401,10 +415,12 @@ onMounted(() => {
   loadLibraries()
   connectGlobalSSE()
   window.addEventListener('keydown', onKeyDown)
+  window.addEventListener('emby-lite:home-settings-updated', onHomeSettingsUpdated)
 })
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown)
+  window.removeEventListener('emby-lite:home-settings-updated', onHomeSettingsUpdated)
   sse?.close()
 })
 </script>

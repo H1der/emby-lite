@@ -402,6 +402,26 @@ func (h *Handler) GetUserImage(c *gin.Context) {
 // --- Standard Emby Public / Compatibility Endpoints ---
 
 func (h *Handler) SaveDisplayPreferences(c *gin.Context) {
+	if p, err := h.auth.AuthenticateRequest(c.Request); err == nil && p != nil && p.User != nil {
+		dpID := c.Param("id")
+		uid := queryCI(c, "userId")
+		if uid == "" || (!p.User.IsAdmin && uid != p.User.ID) {
+			uid = p.User.ID
+		}
+		if raw, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20)); err == nil && len(strings.TrimSpace(string(raw))) > 0 {
+			var payload map[string]any
+			if json.Unmarshal(raw, &payload) == nil {
+				if encoded, err := json.Marshal(payload); err == nil {
+					_ = h.db.Gorm.Save(&model.UserSetting{
+						UserID:    uid,
+						Key:       "dp:" + strings.ToLower(dpID),
+						Value:     string(encoded),
+						UpdatedAt: time.Now().UTC(),
+					}).Error
+				}
+			}
+		}
+	}
 	c.Status(http.StatusNoContent)
 }
 

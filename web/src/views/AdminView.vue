@@ -100,40 +100,67 @@
 
     <!-- Tab: Libraries -->
     <div v-if="activeTab === 'libraries'" class="space-y-4">
-      <div class="flex justify-end">
+      <div class="flex flex-wrap items-center justify-between gap-2">
+        <span class="text-xs text-ink-muted">拖动媒体库卡片或点击上下箭头可调整全局默认排序（同时生效于 Web 端与 Emby 客户端）</span>
         <n-button type="primary" size="small" @click="openCreateLibrary">+ 新建媒体库</n-button>
       </div>
       <div v-if="libraries.length === 0" class="glass-panel rounded-2xl p-10 text-center text-sm text-ink-muted">
         暂无媒体库，点击右上角创建。
       </div>
       <div v-else class="space-y-3">
-        <n-card v-for="lib in libraries" :key="lib.id" size="small">
-          <div class="flex flex-wrap items-center justify-between gap-3">
-            <div class="min-w-0">
-              <div class="font-semibold text-ink flex items-center flex-wrap gap-1.5">
-                <span>{{ lib.name }}</span>
-                <n-tag size="tiny" type="info">{{ lib.kind }}</n-tag>
-                <n-tag v-if="lib.auto_merge_versions && lib.kind !== 'boxsets'" size="tiny" type="default">多版本合并</n-tag>
-                <n-tag v-if="lib.auto_group_series && (lib.kind === 'tvshows' || lib.kind === 'mixed')" size="tiny" type="default">跨目录剧集合并</n-tag>
-                <n-tag v-if="lib.hidden" size="tiny" type="warning">隐藏</n-tag>
-                <n-tag v-if="lib.scanning" size="tiny" type="success">扫描中</n-tag>
+        <div
+          v-for="(lib, idx) in libraries"
+          :key="lib.id"
+          draggable="true"
+          class="rounded-2xl transition border-2"
+          :class="libDragOverIdx === idx ? 'border-sky-400/70' : 'border-transparent'"
+          @dragstart="onLibDragStart(idx)"
+          @dragover.prevent="libDragOverIdx = idx"
+          @dragleave="onLibDragLeave(idx)"
+          @drop.prevent="onLibDrop(idx)"
+          @dragend="onLibDragEnd"
+        >
+          <n-card size="small">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div class="flex items-start gap-2.5 min-w-0">
+                <div class="flex flex-col items-center gap-0.5 pt-0.5 shrink-0">
+                  <span class="text-ink-muted select-none cursor-grab active:cursor-grabbing text-sm leading-none" title="拖动排序">⠿</span>
+                  <div class="flex items-center gap-0.5 mt-1">
+                    <n-button size="tiny" quaternary :disabled="idx === 0 || reorderingLibs" title="上移" @click="moveLibrary(idx, -1)">↑</n-button>
+                    <n-button size="tiny" quaternary :disabled="idx === libraries.length - 1 || reorderingLibs" title="下移" @click="moveLibrary(idx, 1)">↓</n-button>
+                  </div>
+                </div>
+                <div class="min-w-0">
+                  <div class="font-semibold text-ink flex items-center flex-wrap gap-1.5">
+                    <span>{{ lib.name }}</span>
+                    <n-tag size="tiny" type="info">{{ lib.kind }}</n-tag>
+                    <n-tag v-if="lib.auto_merge_versions && lib.kind !== 'boxsets'" size="tiny" type="default">多版本合并</n-tag>
+                    <n-tag v-if="lib.auto_group_series && (lib.kind === 'tvshows' || lib.kind === 'mixed')" size="tiny" type="default">跨目录剧集合并</n-tag>
+                    <n-tag v-if="lib.hidden" size="tiny" type="warning">隐藏</n-tag>
+                    <n-tag v-if="lib.show_in_my_media === false" size="tiny" type="warning">不显示:我的媒体库</n-tag>
+                    <n-tag v-if="lib.show_in_resume === false" size="tiny" type="warning">不显示:继续观看</n-tag>
+                    <n-tag v-if="lib.show_in_next_up === false" size="tiny" type="warning">不显示:正在观看</n-tag>
+                    <n-tag v-if="lib.show_in_latest === false" size="tiny" type="warning">不显示:最近添加</n-tag>
+                    <n-tag v-if="lib.scanning" size="tiny" type="success">扫描中</n-tag>
+                  </div>
+                  <div class="text-xs text-ink-muted mt-1 break-all">
+                    路径：{{ (lib.paths || []).join(' ; ') }} · {{ lib.item_count }} 项 · 状态：{{ lib.scanning ? '扫描中' : lib.status }}
+                  </div>
+                </div>
               </div>
-              <div class="text-xs text-ink-muted mt-1 break-all">
-                路径：{{ (lib.paths || []).join(' ; ') }} · {{ lib.item_count }} 项 · 状态：{{ lib.scanning ? '扫描中' : lib.status }}
+              <div class="flex flex-wrap items-center gap-1.5">
+                <n-button size="small" secondary @click="generateLibCover(lib.id)">拼贴封面</n-button>
+                <n-button size="small" secondary @click="triggerCoverUpload(lib.id)">传封面</n-button>
+                <n-button size="small" secondary @click="openEditLibrary(lib)">编辑</n-button>
+                <n-button v-if="lib.kind !== 'boxsets'" size="small" secondary @click="consolidateLibrary(lib.id)">合并整理</n-button>
+                <n-button size="small" secondary @click="probeLibrary(lib.id)">探测</n-button>
+                <n-button size="small" type="info" secondary @click="scrapeLibrary(lib.id)">刮削</n-button>
+                <n-button size="small" type="primary" @click="scanLibrary(lib.id)">扫描</n-button>
+                <n-button size="small" type="error" quaternary @click="deleteLibrary(lib.id)">删除</n-button>
               </div>
             </div>
-            <div class="flex flex-wrap items-center gap-1.5">
-              <n-button size="small" secondary @click="generateLibCover(lib.id)">拼贴封面</n-button>
-              <n-button size="small" secondary @click="triggerCoverUpload(lib.id)">传封面</n-button>
-              <n-button size="small" secondary @click="openEditLibrary(lib)">编辑</n-button>
-              <n-button v-if="lib.kind !== 'boxsets'" size="small" secondary @click="consolidateLibrary(lib.id)">合并整理</n-button>
-              <n-button size="small" secondary @click="probeLibrary(lib.id)">探测</n-button>
-              <n-button size="small" type="info" secondary @click="scrapeLibrary(lib.id)">刮削</n-button>
-              <n-button size="small" type="primary" @click="scanLibrary(lib.id)">扫描</n-button>
-              <n-button size="small" type="error" quaternary @click="deleteLibrary(lib.id)">删除</n-button>
-            </div>
-          </div>
-        </n-card>
+          </n-card>
+        </div>
       </div>
     </div>
 
@@ -263,13 +290,19 @@
         <n-card v-for="t in tasks" :key="t.id" size="small">
           <div class="space-y-2">
             <div class="flex flex-wrap items-center justify-between gap-2">
-              <div class="flex items-center gap-2 flex-wrap">
+              <div class="flex items-center gap-2 flex-wrap min-w-0">
                 <n-tag size="tiny" :type="taskStatusType(t.status)">{{ taskStatusLabel(t.status) }}</n-tag>
                 <span class="text-sm font-semibold text-ink">{{ taskTypeLabel(t.type) }}</span>
-                <span class="text-xs text-ink-secondary">{{ t.message }}</span>
+                <n-tag v-if="taskLibraryName(t)" size="tiny" type="info">{{ taskLibraryName(t) }}</n-tag>
+                <span class="text-xs text-ink-secondary">{{ formatTaskMessage(t) }}</span>
               </div>
-              <div class="flex items-center gap-2">
-                <span class="text-xs text-ink-muted">{{ formatTime(t.created_at) }}</span>
+              <div class="flex items-center gap-2 flex-wrap shrink-0">
+                <n-tag v-if="taskDurationLabel(t)" size="tiny" type="default">
+                  耗时 {{ taskDurationLabel(t) }}
+                </n-tag>
+                <span class="text-xs text-ink-muted">
+                  {{ t.finished_at ? `完成于 ${formatTime(t.finished_at)}` : `创建于 ${formatTime(t.created_at)}` }}
+                </span>
                 <n-button
                   v-if="t.status === 'pending' || t.status === 'running'"
                   size="tiny"
@@ -314,6 +347,9 @@
               </div>
             </div>
             <div class="flex items-center gap-2">
+              <n-button size="small" secondary @click="openUserHomeSettings(u)">
+                主屏幕设置
+              </n-button>
               <n-button v-if="!u.is_primary_admin" size="small" secondary @click="openEditUser(u)">
                 编辑权限
               </n-button>
@@ -462,6 +498,19 @@
             </div>
           </div>
         </n-form-item>
+        <n-form-item label="首页展示范围（全局默认）">
+          <div class="w-full space-y-1.5">
+            <div class="grid grid-cols-2 gap-2">
+              <n-checkbox v-model:checked="libForm.show_in_my_media">在「我的媒体库」中展示</n-checkbox>
+              <n-checkbox v-model:checked="libForm.show_in_resume">在「继续观看」中展示</n-checkbox>
+              <n-checkbox v-model:checked="libForm.show_in_next_up">在「正在观看」中展示</n-checkbox>
+              <n-checkbox v-model:checked="libForm.show_in_latest">在「最近添加」中展示</n-checkbox>
+            </div>
+            <div class="text-[11px] text-ink-muted">
+              关闭后该媒体库将不会在对应首页板块出现；用户也可以在各自的主屏幕设置中单独隐藏。
+            </div>
+          </div>
+        </n-form-item>
         <n-form-item label="可见性">
           <n-checkbox v-model:checked="libForm.hidden">设为隐藏媒体库（仅管理员或授权用户可见）</n-checkbox>
         </n-form-item>
@@ -502,6 +551,12 @@
       </n-form>
     </n-modal>
 
+    <HomeScreenSettingsModal
+      v-model:show="showUserHomeSettings"
+      :user-id="homeSettingsUser?.id"
+      :username="homeSettingsUser?.username"
+    />
+
     <input ref="coverFileInput" type="file" accept="image/*" class="hidden" @change="onCoverFileSelected" />
   </div>
 </template>
@@ -519,6 +574,7 @@ import AdminVirtualAndIntro from '../components/AdminVirtualAndIntro.vue'
 import AdminAccessPanel from '../components/AdminAccessPanel.vue'
 import AdminFilesPanel from '../components/AdminFilesPanel.vue'
 import AdminOpsPanel from '../components/AdminOpsPanel.vue'
+import HomeScreenSettingsModal from '../components/HomeScreenSettingsModal.vue'
 
 const tabs = [
   { key: 'dashboard', label: '概览', icon: '📊' },
@@ -582,11 +638,18 @@ const searchingManual = ref(false)
 const showLibModal = ref(false)
 const showDirPicker = ref(false)
 const editingLibId = ref('')
+const libDragIdx = ref(-1)
+const libDragOverIdx = ref(-1)
+const reorderingLibs = ref(false)
 const libForm = reactive({
   name: '',
   kind: 'movies',
   paths: [] as string[],
   hidden: false,
+  show_in_my_media: true,
+  show_in_resume: true,
+  show_in_next_up: true,
+  show_in_latest: true,
   auto_merge_versions: true,
   auto_group_series: true,
 })
@@ -598,6 +661,8 @@ const kindOptions = [
 ]
 
 const showUserModal = ref(false)
+const showUserHomeSettings = ref(false)
+const homeSettingsUser = ref<{ id: string; username: string } | null>(null)
 const editingUserId = ref('')
 const permissionGroups = ref<any[]>([])
 const userForm = reactive({
@@ -621,8 +686,75 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
 }
 
-function formatTime(iso: string): string {
-  return iso ? new Date(iso).toLocaleString() : ''
+function formatTime(iso?: string): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0ms'
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  if (ms < 10000) {
+    const tenths = Math.round(ms / 100)
+    return tenths % 10 === 0 ? `${tenths / 10}秒` : `${(tenths / 10).toFixed(1)}秒`
+  }
+  const totalSecs = Math.floor(ms / 1000)
+  if (totalSecs < 60) return `${totalSecs}秒`
+  const hours = Math.floor(totalSecs / 3600)
+  const mins = Math.floor((totalSecs % 3600) / 60)
+  const secs = totalSecs % 60
+  if (hours === 0) {
+    return secs === 0 ? `${mins}分` : `${mins}分${secs}秒`
+  }
+  if (mins === 0 && secs === 0) return `${hours}小时`
+  if (secs === 0) return `${hours}小时${mins}分`
+  return `${hours}小时${mins}分${secs}秒`
+}
+
+function taskLibraryName(t: any): string {
+  if (t?.library_name) return String(t.library_name)
+  let lid = t?.library_id ? String(t.library_id) : ''
+  if (!lid && t?.payload_json) {
+    try {
+      const parsed = JSON.parse(t.payload_json)
+      if (parsed?.library_id) lid = String(parsed.library_id)
+    } catch {
+      // ignore invalid payload json
+    }
+  }
+  if (lid) {
+    const matched = libraries.value.find((l) => l.id === lid)
+    if (matched?.name) return matched.name
+  }
+  return ''
+}
+
+function taskDurationLabel(t: any): string {
+  if (typeof t?.duration_ms === 'number' && t.duration_ms > 0) {
+    return formatDuration(t.duration_ms)
+  }
+  if (t?.finished_at) {
+    const startIso = t.started_at || t.created_at
+    if (startIso) {
+      const diff = new Date(t.finished_at).getTime() - new Date(startIso).getTime()
+      if (diff >= 0) return formatDuration(diff)
+    }
+  }
+  return ''
+}
+
+function formatTaskMessage(t: any): string {
+  let msg = String(t?.message || '')
+  const libName = taskLibraryName(t)
+  if (libName && msg.startsWith(`【${libName}】`)) {
+    msg = msg.slice(libName.length + 2)
+  }
+  // Format legacy historical scan completion messages like "完成 (4523000ms)：..."
+  msg = msg.replace(/完成\s*\((\d+)ms\)/g, (_m, msStr) => `完成（耗时 ${formatDuration(Number(msStr))}）`)
+  return msg
 }
 
 function taskTypeLabel(tp: string): string {
@@ -856,6 +988,10 @@ function openCreateLibrary() {
   libForm.kind = 'movies'
   libForm.paths = []
   libForm.hidden = false
+  libForm.show_in_my_media = true
+  libForm.show_in_resume = true
+  libForm.show_in_next_up = true
+  libForm.show_in_latest = true
   libForm.auto_merge_versions = true
   libForm.auto_group_series = true
   showLibModal.value = true
@@ -867,9 +1003,73 @@ function openEditLibrary(lib: any) {
   libForm.kind = lib.kind || 'movies'
   libForm.paths = [...(lib.paths || [])]
   libForm.hidden = Boolean(lib.hidden)
+  libForm.show_in_my_media = lib.show_in_my_media !== false
+  libForm.show_in_resume = lib.show_in_resume !== false
+  libForm.show_in_next_up = lib.show_in_next_up !== false
+  libForm.show_in_latest = lib.show_in_latest !== false
   libForm.auto_merge_versions = lib.auto_merge_versions !== false
   libForm.auto_group_series = lib.auto_group_series !== false
   showLibModal.value = true
+}
+
+function onLibDragStart(idx: number) {
+  libDragIdx.value = idx
+}
+
+function onLibDragLeave(idx: number) {
+  if (libDragOverIdx.value === idx) {
+    libDragOverIdx.value = -1
+  }
+}
+
+function onLibDragEnd() {
+  libDragIdx.value = -1
+  libDragOverIdx.value = -1
+}
+
+async function onLibDrop(targetIdx: number) {
+  const from = libDragIdx.value
+  onLibDragEnd()
+  if (from < 0 || from === targetIdx || reorderingLibs.value) return
+  const arr = [...libraries.value]
+  const [moved] = arr.splice(from, 1)
+  arr.splice(targetIdx, 0, moved)
+  await persistLibraryOrder(arr)
+}
+
+async function moveLibrary(idx: number, delta: number) {
+  const target = idx + delta
+  if (target < 0 || target >= libraries.value.length || reorderingLibs.value) return
+  const arr = [...libraries.value]
+  const [moved] = arr.splice(idx, 1)
+  arr.splice(target, 0, moved)
+  await persistLibraryOrder(arr)
+}
+
+async function persistLibraryOrder(nextLibs: any[]) {
+  const prev = libraries.value
+  libraries.value = nextLibs
+  reorderingLibs.value = true
+  try {
+    await apiFetch('/api/admin/libraries/reorder', {
+      method: 'PUT',
+      body: JSON.stringify({ library_ids: nextLibs.map((l) => l.id) }),
+    })
+    invalidateApiCache('/api/web/home')
+    invalidateApiCache('/emby/')
+    window.dispatchEvent(new CustomEvent('emby-lite:home-settings-updated'))
+    message.success('媒体库排序已保存')
+  } catch (e: any) {
+    libraries.value = prev
+    message.error(e.message || '保存排序失败')
+  } finally {
+    reorderingLibs.value = false
+  }
+}
+
+function openUserHomeSettings(u: any) {
+  homeSettingsUser.value = { id: u.id, username: u.username }
+  showUserHomeSettings.value = true
 }
 
 function addLibPath(path: string) {
@@ -896,6 +1096,10 @@ async function saveLibrary() {
     kind: libForm.kind,
     paths: libForm.paths,
     hidden: libForm.hidden,
+    show_in_my_media: libForm.show_in_my_media,
+    show_in_resume: libForm.show_in_resume,
+    show_in_next_up: libForm.show_in_next_up,
+    show_in_latest: libForm.show_in_latest,
     auto_merge_versions: libForm.auto_merge_versions,
     auto_group_series: libForm.auto_group_series,
   }
@@ -911,6 +1115,7 @@ async function saveLibrary() {
   showLibModal.value = false
   invalidateApiCache('/api/web/home')
   invalidateApiCache('/emby/')
+  window.dispatchEvent(new CustomEvent('emby-lite:home-settings-updated'))
   await loadLibrariesTab()
 }
 

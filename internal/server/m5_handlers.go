@@ -313,7 +313,7 @@ func (a *AdminHandler) GetTask(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "任务不存在"})
 		return
 	}
-	c.JSON(http.StatusOK, t)
+	c.JSON(http.StatusOK, a.enrichTask(*t))
 }
 
 // --- API Keys & Audit Logs ---

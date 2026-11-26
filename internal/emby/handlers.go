@@ -334,9 +334,11 @@ func (h *Handler) UserViews(c *gin.Context) {
 	if p != nil && p.User != nil {
 		uid = p.User.ID
 	}
-	cacheKey := "views:" + h.db.GetLibraryRevision() + ":" + uid + ":" + visibleIDsHash(visibleIDs)
+	includeHidden := strings.EqualFold(queryCI(c, "IncludeHidden"), "true") || strings.EqualFold(c.Request.URL.Path, "/library/mediafolders")
+	userRev := h.getUserDataRev(c.Request.Context(), uid)
+	cacheKey := "views:" + h.db.GetLibraryRevision() + ":" + userRev + ":" + uid + ":" + visibleIDsHash(visibleIDs) + ":" + strconv.FormatBool(includeHidden)
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
-		items, err := h.buildUserViewsItems(p, visibleIDs)
+		items, err := h.buildUserViewsItems(p, visibleIDs, includeHidden)
 		if err != nil {
 			return nil, err
 		}
@@ -484,7 +486,8 @@ func (h *Handler) GetItems(c *gin.Context) {
 		wantsViews = true
 	}
 	if wantsViews && idsParam == "" && searchTerm == "" {
-		items, err := h.buildUserViewsItems(p, visibleIDs)
+		includeHidden := strings.EqualFold(queryCI(c, "IncludeHidden"), "true")
+		items, err := h.buildUserViewsItems(p, visibleIDs, includeHidden)
 		if err != nil {
 			jsonErr(c, http.StatusInternalServerError, err.Error())
 			return
@@ -772,6 +775,14 @@ func (h *Handler) GetItems(c *gin.Context) {
 			q = q.Where("items.id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", uid, true)
 		}
 		if wantResumable {
+			if parentID == "" || parentID == "root" {
+				resumeLibIDs := h.filterLibraryIDsForSection(p, visibleIDs, "resume")
+				if len(resumeLibIDs) == 0 {
+					q = q.Where("1 = 0")
+				} else {
+					q = q.Where("items.library_id IN ?", resumeLibIDs)
+				}
+			}
 			q = q.Where("items.id IN (SELECT item_id FROM user_data WHERE user_id = ? AND position_ticks > 0 AND played = ? AND hide_from_resume = ?)", uid, false, false)
 		}
 	}
@@ -1291,13 +1302,38 @@ func (h *Handler) GetFilters(c *gin.Context) {
 }
 
 func (h *Handler) DisplayPreferences(c *gin.Context) {
-	c.JSON(http.StatusOK, gin.H{
-		"Id":          c.Param("id"),
+	dpID := c.Param("id")
+	resp := map[string]any{
+		"Id":          dpID,
 		"SortBy":      "SortName",
 		"SortOrder":   "Ascending",
-		"CustomPrefs": gin.H{},
+		"CustomPrefs": map[string]any{},
 		"Client":      queryCI(c, "client"),
-	})
+	}
+	if p, err := h.auth.AuthenticateRequest(c.Request); err == nil && p != nil && p.User != nil {
+		uid := queryCI(c, "userId")
+		if uid == "" || (!p.User.IsAdmin && uid != p.User.ID) {
+			uid = p.User.ID
+		}
+		var row model.UserSetting
+		if err := h.db.Read().Where("user_id = ? AND key = ?", uid, "dp:"+strings.ToLower(dpID)).First(&row).Error; err == nil && row.Value != "" {
+			var saved map[string]any
+			if json.Unmarshal([]byte(row.Value), &saved) == nil {
+				for k, v := range saved {
+					resp[k] = v
+				}
+				resp["Id"] = dpID
+			}
+		} else if strings.EqualFold(dpID, "usersettings") {
+			if err := h.db.Read().Where("user_id = ? AND key = ?", uid, "usersettings").First(&row).Error; err == nil && row.Value != "" {
+				var custom map[string]any
+				if json.Unmarshal([]byte(row.Value), &custom) == nil {
+					resp["CustomPrefs"] = custom
+				}
+			}
+		}
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 func (h *Handler) EmptyArray(c *gin.Context) {

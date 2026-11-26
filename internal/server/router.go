@@ -168,6 +168,8 @@ func New(cfg *config.Config, db *database.DB, cacheStore cache.Store) *Server {
 		webAPI.GET("/bootstrap", adminHandler.Bootstrap)
 		webAPI.POST("/setup", adminHandler.Setup)
 		webAPI.GET("/home", embyHandler.RequireAuth(), embyHandler.WebHome)
+		webAPI.GET("/home-settings", embyHandler.RequireAuth(), embyHandler.GetWebHomeSettings)
+		webAPI.PUT("/home-settings", embyHandler.RequireAuth(), embyHandler.UpdateWebHomeSettings)
 		webAPI.GET("/external-play/:itemId", adminHandler.ExternalPlay)
 		webAPI.GET("/intro/:itemId", adminHandler.GetItemIntroWeb)
 	}
@@ -179,6 +181,7 @@ func New(cfg *config.Config, db *database.DB, cacheStore cache.Store) *Server {
 		adminAPI.GET("/directories", adminHandler.BrowseDirectories)
 		adminAPI.GET("/libraries", adminHandler.ListLibraries)
 		adminAPI.POST("/libraries", adminHandler.CreateLibrary)
+		adminAPI.PUT("/libraries/reorder", adminHandler.ReorderLibraries)
 		adminAPI.PUT("/libraries/:id", adminHandler.UpdateLibrary)
 		adminAPI.DELETE("/libraries/:id", adminHandler.DeleteLibrary)
 		adminAPI.POST("/libraries/:id/scan", adminHandler.ScanLibrary)
@@ -353,7 +356,7 @@ func registerEmbyRoutes(r *gin.Engine, h *emby.Handler) {
 		authed.GET("/web/configurationpages", h.EmptyArray)
 		authed.GET("/users/me", h.UserMe)
 		authed.GET("/users/:userId", h.GetUser)
-		authed.POST("/users/:userId/configuration", h.NoContent)
+		authed.POST("/users/:userId/configuration", h.UpdateUserConfiguration)
 		authed.POST("/sessions/logout", h.Logout)
 
 		// Libraries, Views & Emby 4.10 Home Sections

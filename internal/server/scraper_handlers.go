@@ -50,15 +50,19 @@ func (a *AdminHandler) ScrapeLibrary(c *gin.Context) {
 		c.JSON(http.StatusOK, stats)
 		return
 	}
+	msg := "等待 TMDB 刮削"
+	if libName := a.libraryNameByID(id); libName != "" {
+		msg = "等待 TMDB 刮削：" + libName
+	}
 	t, created, err := a.tasks.Enqueue("scrape", 8, map[string]any{
 		"library_id": id,
 		"force":      force,
-	}, "等待 TMDB 刮削")
+	}, msg)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{"started": created, "library_id": id, "task": t})
+	c.JSON(http.StatusAccepted, gin.H{"started": created, "library_id": id, "task": a.enrichTask(*t)})
 }
 
 func (a *AdminHandler) ScrapeSingleItem(c *gin.Context) {

@@ -173,8 +173,52 @@ func (s *Service) ScanAllAsync() int {
 	return started
 }
 
+// FormatDuration formats a task/scan duration in human-readable Chinese units up to hours.
+func FormatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0ms"
+	}
+	if d < time.Second {
+		return fmt.Sprintf("%dms", d.Milliseconds())
+	}
+	if d < 10*time.Second {
+		tenths := (d.Milliseconds() + 50) / 100
+		if tenths%10 == 0 {
+			return fmt.Sprintf("%d秒", tenths/10)
+		}
+		return fmt.Sprintf("%d.%d秒", tenths/10, tenths%10)
+	}
+	totalSecs := int64(d.Seconds())
+	if totalSecs < 60 {
+		return fmt.Sprintf("%d秒", totalSecs)
+	}
+	hours := totalSecs / 3600
+	mins := (totalSecs % 3600) / 60
+	secs := totalSecs % 60
+	if hours == 0 {
+		if secs == 0 {
+			return fmt.Sprintf("%d分", mins)
+		}
+		return fmt.Sprintf("%d分%d秒", mins, secs)
+	}
+	if mins == 0 && secs == 0 {
+		return fmt.Sprintf("%d小时", hours)
+	}
+	if secs == 0 {
+		return fmt.Sprintf("%d小时%d分", hours, mins)
+	}
+	return fmt.Sprintf("%d小时%d分%d秒", hours, mins, secs)
+}
+
 // ProbeLibrarySources probes unprobed MediaSources (local + optional STRM via bounded HTTP Range) concurrently.
 func (s *Service) ProbeLibrarySources(ctx context.Context, libraryID string, includeSTRM bool, report ProgressFunc) (int, error) {
+	startedAt := time.Now()
+	libPrefix := ""
+	var lib model.Library
+	if err := s.db.Read().Select("name").Where("id = ?", libraryID).First(&lib).Error; err == nil && strings.TrimSpace(lib.Name) != "" {
+		libPrefix = fmt.Sprintf("【%s】", strings.TrimSpace(lib.Name))
+	}
+
 	var sources []model.MediaSource
 	q := s.db.Read().Table("media_sources").
 		Joins("JOIN items ON items.id = media_sources.item_id").
@@ -188,7 +232,7 @@ func (s *Service) ProbeLibrarySources(ctx context.Context, libraryID string, inc
 	total := len(sources)
 	if total == 0 {
 		if report != nil {
-			report(0, 0, "探测完成：无待探测条目")
+			report(0, 0, libPrefix+"探测完成：无待探测条目")
 		}
 		return 0, nil
 	}
@@ -221,7 +265,7 @@ func (s *Service) ProbeLibrarySources(ctx context.Context, libraryID string, inc
 				res := s.probeSourceOnly(ctx, &src)
 				n := int(doneCount.Add(1))
 				if report != nil && (n == 1 || n%5 == 0 || n == total) {
-					report(n, total, fmt.Sprintf("正在探测 (%d/%d): %s", n, total, filepath.Base(src.Path)))
+					report(n, total, fmt.Sprintf("%s正在探测 (%d/%d): %s", libPrefix, n, total, filepath.Base(src.Path)))
 				}
 				if res != nil {
 					results <- probeOutcome{src: src, res: res}
@@ -279,7 +323,7 @@ func (s *Service) ProbeLibrarySources(ctx context.Context, libraryID string, inc
 	}
 
 	if report != nil {
-		report(total, total, fmt.Sprintf("探测完成：成功 %d / %d", probed, total))
+		report(total, total, fmt.Sprintf("%s探测完成（耗时 %s）：成功 %d / %d", libPrefix, FormatDuration(time.Since(startedAt)), probed, total))
 	}
 	return probed, ctx.Err()
 }
@@ -878,7 +922,7 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 	}
 
 	if report != nil && stats.ItemsSkipped > 0 {
-		report(stats.ItemsSkipped, len(candidates), fmt.Sprintf("快速跳过 %d 个未变更文件，准备处理 %d 个变更...", stats.ItemsSkipped, len(toMove)+len(toIngest)))
+		report(stats.ItemsSkipped, len(candidates), fmt.Sprintf("【%s】快速跳过 %d 个未变更文件，准备处理 %d 个变更...", lib.Name, stats.ItemsSkipped, len(toMove)+len(toIngest)))
 	}
 
 	// Stage 4: Relocate moved items in a single transaction.
@@ -1099,8 +1143,9 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 	}
 
 	if report != nil {
-		msg := fmt.Sprintf("完成 (%dms)：新增 %d，移动 %d，更新 %d，跳过 %d，移除 %d",
-			stats.DurationMs, stats.ItemsAdded, stats.ItemsMoved, stats.ItemsUpdated, stats.ItemsSkipped, stats.ItemsRemoved)
+		msg := fmt.Sprintf("【%s】扫描完成（耗时 %s）：新增 %d，移动 %d，更新 %d，跳过 %d，移除 %d",
+			lib.Name, FormatDuration(time.Duration(stats.DurationMs)*time.Millisecond),
+			stats.ItemsAdded, stats.ItemsMoved, stats.ItemsUpdated, stats.ItemsSkipped, stats.ItemsRemoved)
 		if mergedTotal > 0 {
 			msg += fmt.Sprintf("，自动合并 %d", mergedTotal)
 		}

@@ -100,7 +100,7 @@ func (a *AdminHandler) Bootstrap(c *gin.Context) {
 		"initialized": initialized,
 		"server_name": a.db.GetSetting("server_name", a.cfg.Server.ServerName),
 		"server_id":   a.db.GetSetting("server_id", ""),
-		"version":     "0.3.6",
+		"version":     "0.3.8",
 	})
 }
 
@@ -251,9 +251,13 @@ type libraryPayload struct {
 	Kind              string   `json:"kind" binding:"required"` // movies | tvshows | mixed | boxsets
 	Paths             []string `json:"paths"`
 	Hidden            bool     `json:"hidden"`
+	ShowInMyMedia     *bool    `json:"show_in_my_media"`
+	ShowInResume      *bool    `json:"show_in_resume"`
+	ShowInNextUp      *bool    `json:"show_in_next_up"`
+	ShowInLatest      *bool    `json:"show_in_latest"`
 	AutoMergeVersions *bool    `json:"auto_merge_versions"`
 	AutoGroupSeries   *bool    `json:"auto_group_series"`
-	SortOrder         int      `json:"sort_order"`
+	SortOrder         *int     `json:"sort_order"`
 	ScanSchedule      string   `json:"scan_schedule"`
 }
 
@@ -273,6 +277,10 @@ func (a *AdminHandler) ListLibraries(c *gin.Context) {
 			"kind":                l.Kind,
 			"paths":               paths,
 			"hidden":              l.Hidden,
+			"show_in_my_media":    l.ShowInMyMedia,
+			"show_in_resume":      l.ShowInResume,
+			"show_in_next_up":     l.ShowInNextUp,
+			"show_in_latest":      l.ShowInLatest,
 			"auto_merge_versions": l.AutoMergeVersions,
 			"auto_group_series":   l.AutoGroupSeries,
 			"sort_order":          l.SortOrder,
@@ -310,6 +318,34 @@ func (a *AdminHandler) CreateLibrary(c *gin.Context) {
 	if body.AutoGroupSeries != nil {
 		autoGroup = *body.AutoGroupSeries
 	}
+	showMyMedia := true
+	if body.ShowInMyMedia != nil {
+		showMyMedia = *body.ShowInMyMedia
+	}
+	showResume := true
+	if body.ShowInResume != nil {
+		showResume = *body.ShowInResume
+	}
+	showNextUp := true
+	if body.ShowInNextUp != nil {
+		showNextUp = *body.ShowInNextUp
+	}
+	showLatest := true
+	if body.ShowInLatest != nil {
+		showLatest = *body.ShowInLatest
+	}
+	sortOrder := 0
+	if body.SortOrder != nil {
+		sortOrder = *body.SortOrder
+	} else {
+		var count int64
+		_ = a.db.Gorm.Model(&model.Library{}).Count(&count).Error
+		if count > 0 {
+			var maxOrder int
+			_ = a.db.Gorm.Model(&model.Library{}).Select("COALESCE(MAX(sort_order), 0)").Scan(&maxOrder).Error
+			sortOrder = maxOrder + 1
+		}
+	}
 	pathsBytes, _ := json.Marshal(cleanPaths(body.Paths))
 	lib := model.Library{
 		ID:                strings.ReplaceAll(uuid.NewString(), "-", ""),
@@ -317,9 +353,13 @@ func (a *AdminHandler) CreateLibrary(c *gin.Context) {
 		Kind:              kind,
 		PathsJSON:         string(pathsBytes),
 		Hidden:            body.Hidden,
+		ShowInMyMedia:     showMyMedia,
+		ShowInResume:      showResume,
+		ShowInNextUp:      showNextUp,
+		ShowInLatest:      showLatest,
 		AutoMergeVersions: autoMerge,
 		AutoGroupSeries:   autoGroup,
-		SortOrder:         body.SortOrder,
+		SortOrder:         sortOrder,
 		ScanSchedule:      body.ScanSchedule,
 		Status:            "idle",
 	}
@@ -327,12 +367,20 @@ func (a *AdminHandler) CreateLibrary(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if !autoMerge || !autoGroup {
+	if !autoMerge || !autoGroup || !showMyMedia || !showResume || !showNextUp || !showLatest {
 		lib.AutoMergeVersions = autoMerge
 		lib.AutoGroupSeries = autoGroup
+		lib.ShowInMyMedia = showMyMedia
+		lib.ShowInResume = showResume
+		lib.ShowInNextUp = showNextUp
+		lib.ShowInLatest = showLatest
 		_ = a.db.Gorm.Model(&model.Library{}).Where("id = ?", lib.ID).Updates(map[string]any{
 			"auto_merge_versions": autoMerge,
 			"auto_group_series":   autoGroup,
+			"show_in_my_media":    showMyMedia,
+			"show_in_resume":      showResume,
+			"show_in_next_up":     showNextUp,
+			"show_in_latest":      showLatest,
 		}).Error
 	}
 	a.db.BumpLibraryRevision()
@@ -341,6 +389,11 @@ func (a *AdminHandler) CreateLibrary(c *gin.Context) {
 		"name":                lib.Name,
 		"kind":                lib.Kind,
 		"paths":               cleanPaths(body.Paths),
+		"sort_order":          lib.SortOrder,
+		"show_in_my_media":    lib.ShowInMyMedia,
+		"show_in_resume":      lib.ShowInResume,
+		"show_in_next_up":     lib.ShowInNextUp,
+		"show_in_latest":      lib.ShowInLatest,
 		"auto_merge_versions": lib.AutoMergeVersions,
 		"auto_group_series":   lib.AutoGroupSeries,
 	})
@@ -369,13 +422,27 @@ func (a *AdminHandler) UpdateLibrary(c *gin.Context) {
 	}
 	lib.PathsJSON = string(pathsBytes)
 	lib.Hidden = body.Hidden
+	if body.ShowInMyMedia != nil {
+		lib.ShowInMyMedia = *body.ShowInMyMedia
+	}
+	if body.ShowInResume != nil {
+		lib.ShowInResume = *body.ShowInResume
+	}
+	if body.ShowInNextUp != nil {
+		lib.ShowInNextUp = *body.ShowInNextUp
+	}
+	if body.ShowInLatest != nil {
+		lib.ShowInLatest = *body.ShowInLatest
+	}
 	if body.AutoMergeVersions != nil {
 		lib.AutoMergeVersions = *body.AutoMergeVersions
 	}
 	if body.AutoGroupSeries != nil {
 		lib.AutoGroupSeries = *body.AutoGroupSeries
 	}
-	lib.SortOrder = body.SortOrder
+	if body.SortOrder != nil {
+		lib.SortOrder = *body.SortOrder
+	}
 	lib.ScanSchedule = body.ScanSchedule
 	if err := a.db.Gorm.Save(&lib).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -389,10 +456,43 @@ func (a *AdminHandler) UpdateLibrary(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"id":                  lib.ID,
 		"name":                lib.Name,
+		"sort_order":          lib.SortOrder,
+		"show_in_my_media":    lib.ShowInMyMedia,
+		"show_in_resume":      lib.ShowInResume,
+		"show_in_next_up":     lib.ShowInNextUp,
+		"show_in_latest":      lib.ShowInLatest,
 		"auto_merge_versions": lib.AutoMergeVersions,
 		"auto_group_series":   lib.AutoGroupSeries,
 		"consolidated":        merged,
 	})
+}
+
+func (a *AdminHandler) ReorderLibraries(c *gin.Context) {
+	var body struct {
+		LibraryIDs []string `json:"library_ids" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	tx := a.db.Gorm.Begin()
+	for idx, rawID := range body.LibraryIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if err := tx.Model(&model.Library{}).Where("id = ?", id).Update("sort_order", idx).Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if err := tx.Commit().Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	a.db.BumpLibraryRevision()
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 func (a *AdminHandler) ConsolidateLibrary(c *gin.Context) {
@@ -419,6 +519,92 @@ func (a *AdminHandler) DeleteLibrary(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
+func (a *AdminHandler) libraryNameByID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	var lib model.Library
+	if err := a.db.Read().Select("name").Where("id = ?", id).First(&lib).Error; err == nil {
+		return strings.TrimSpace(lib.Name)
+	}
+	return ""
+}
+
+type taskView struct {
+	model.BackgroundTask
+	LibraryID   string `json:"library_id,omitempty"`
+	LibraryName string `json:"library_name,omitempty"`
+	DurationMs  int64  `json:"duration_ms,omitempty"`
+}
+
+func extractTaskLibraryID(payloadJSON string) string {
+	if strings.TrimSpace(payloadJSON) == "" {
+		return ""
+	}
+	var p struct {
+		LibraryID string `json:"library_id"`
+	}
+	if json.Unmarshal([]byte(payloadJSON), &p) == nil {
+		return strings.TrimSpace(p.LibraryID)
+	}
+	return ""
+}
+
+func computeTaskDurationMs(t model.BackgroundTask) int64 {
+	if t.FinishedAt == nil {
+		return 0
+	}
+	start := t.CreatedAt
+	if t.StartedAt != nil {
+		start = *t.StartedAt
+	}
+	ms := t.FinishedAt.Sub(start).Milliseconds()
+	if ms < 0 {
+		return 0
+	}
+	return ms
+}
+
+func (a *AdminHandler) enrichTasks(tasks []model.BackgroundTask) []taskView {
+	out := make([]taskView, len(tasks))
+	libIDSet := make(map[string]struct{})
+	for i, t := range tasks {
+		lid := extractTaskLibraryID(t.PayloadJSON)
+		out[i] = taskView{
+			BackgroundTask: t,
+			LibraryID:      lid,
+			DurationMs:     computeTaskDurationMs(t),
+		}
+		if lid != "" {
+			libIDSet[lid] = struct{}{}
+		}
+	}
+	if len(libIDSet) > 0 {
+		ids := make([]string, 0, len(libIDSet))
+		for lid := range libIDSet {
+			ids = append(ids, lid)
+		}
+		var libs []model.Library
+		_ = a.db.Read().Select("id, name").Where("id IN ?", ids).Find(&libs).Error
+		nameByID := make(map[string]string, len(libs))
+		for _, l := range libs {
+			nameByID[l.ID] = strings.TrimSpace(l.Name)
+		}
+		for i := range out {
+			if out[i].LibraryID != "" {
+				out[i].LibraryName = nameByID[out[i].LibraryID]
+			}
+		}
+	}
+	return out
+}
+
+func (a *AdminHandler) enrichTask(t model.BackgroundTask) taskView {
+	views := a.enrichTasks([]model.BackgroundTask{t})
+	return views[0]
+}
+
 func (a *AdminHandler) ScanLibrary(c *gin.Context) {
 	id := c.Param("id")
 	if c.Query("sync") == "true" {
@@ -431,12 +617,16 @@ func (a *AdminHandler) ScanLibrary(c *gin.Context) {
 		return
 	}
 	if a.tasks != nil {
-		t, created, err := a.tasks.Enqueue("scan", 10, map[string]string{"library_id": id}, "等待扫描媒体库")
+		msg := "等待扫描媒体库"
+		if libName := a.libraryNameByID(id); libName != "" {
+			msg = "等待扫描：" + libName
+		}
+		t, created, err := a.tasks.Enqueue("scan", 10, map[string]string{"library_id": id}, msg)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
-		c.JSON(http.StatusAccepted, gin.H{"started": created, "library_id": id, "task": t})
+		c.JSON(http.StatusAccepted, gin.H{"started": created, "library_id": id, "task": a.enrichTask(*t)})
 		return
 	}
 	started := a.scanner.ScanLibraryAsync(id)
@@ -455,15 +645,19 @@ func (a *AdminHandler) ProbeLibrary(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"probed": n, "library_id": id})
 		return
 	}
+	msg := "等待探测媒体信息"
+	if libName := a.libraryNameByID(id); libName != "" {
+		msg = "等待探测：" + libName
+	}
 	t, created, err := a.tasks.Enqueue("probe", 5, map[string]any{
 		"library_id":   id,
 		"include_strm": includeSTRM,
-	}, "等待探测媒体信息")
+	}, msg)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusAccepted, gin.H{"started": created, "library_id": id, "task": t})
+	c.JSON(http.StatusAccepted, gin.H{"started": created, "library_id": id, "task": a.enrichTask(*t)})
 }
 
 func (a *AdminHandler) ScanAll(c *gin.Context) {
@@ -491,7 +685,7 @@ func (a *AdminHandler) ListTasks(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"items": tasks})
+	c.JSON(http.StatusOK, gin.H{"items": a.enrichTasks(tasks)})
 }
 
 func (a *AdminHandler) CancelTask(c *gin.Context) {
@@ -534,7 +728,10 @@ func (a *AdminHandler) TaskEventsSSE(c *gin.Context) {
 			if !open {
 				return
 			}
-			b, err := json.Marshal(ev)
+			b, err := json.Marshal(gin.H{
+				"event": ev.EventType,
+				"task":  a.enrichTask(ev.Task),
+			})
 			if err != nil {
 				continue
 			}

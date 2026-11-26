@@ -188,9 +188,16 @@ type ScrapeStats struct {
 
 // ScrapeLibrary scrapes Movies & Series in a library via TMDB (respecting local priority & field locks).
 func (s *Service) ScrapeLibrary(ctx context.Context, libraryID string, force bool, report ProgressFunc) (*ScrapeStats, error) {
+	startedAt := time.Now()
 	client := s.Client()
 	if !client.HasCredentials() {
 		return nil, errors.New("请先在后台配置 TMDB API Key 或 Read Access Token")
+	}
+
+	libPrefix := ""
+	var lib model.Library
+	if err := s.db.Read().Select("name").Where("id = ?", libraryID).First(&lib).Error; err == nil && strings.TrimSpace(lib.Name) != "" {
+		libPrefix = fmt.Sprintf("【%s】", strings.TrimSpace(lib.Name))
 	}
 
 	var items []model.Item
@@ -206,7 +213,7 @@ func (s *Service) ScrapeLibrary(ctx context.Context, libraryID string, force boo
 		}
 		it := &items[i]
 		if report != nil {
-			report(i, len(items), fmt.Sprintf("刮削 (%d/%d): %s", i+1, len(items), it.Name))
+			report(i, len(items), fmt.Sprintf("%s刮削 (%d/%d): %s", libPrefix, i+1, len(items), it.Name))
 		}
 		// Skip already-matched items with overview & poster unless force=true.
 		if !force && s.hasCompleteMetadata(it) {
@@ -231,8 +238,8 @@ func (s *Service) ScrapeLibrary(ctx context.Context, libraryID string, force boo
 		_, _ = scanner.ConsolidateLibrary(s.db, libraryID)
 	}
 	if report != nil {
-		report(len(items), len(items), fmt.Sprintf("刮削完成：自动匹配 %d，待人工确认 %d，跳过 %d，失败 %d",
-			stats.Matched, stats.Queued, stats.Skipped, stats.Failed))
+		report(len(items), len(items), fmt.Sprintf("%s刮削完成（耗时 %s）：自动匹配 %d，待人工确认 %d，跳过 %d，失败 %d",
+			libPrefix, scanner.FormatDuration(time.Since(startedAt)), stats.Matched, stats.Queued, stats.Skipped, stats.Failed))
 	}
 	s.db.BumpLibraryRevision()
 	return stats, nil

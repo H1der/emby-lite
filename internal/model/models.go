@@ -94,6 +94,10 @@ type Library struct {
 	Kind              string     `gorm:"size:32;not null" json:"kind"` // movies | tvshows | mixed | boxsets
 	PathsJSON         string     `gorm:"type:text;not null" json:"-"`
 	Hidden            bool       `gorm:"default:false;not null" json:"hidden"`
+	ShowInMyMedia     bool       `gorm:"default:true;not null" json:"show_in_my_media"`
+	ShowInResume      bool       `gorm:"default:true;not null" json:"show_in_resume"`
+	ShowInNextUp      bool       `gorm:"default:true;not null" json:"show_in_next_up"`
+	ShowInLatest      bool       `gorm:"default:true;not null" json:"show_in_latest"`
 	AutoMergeVersions bool       `gorm:"default:true;not null" json:"auto_merge_versions"`
 	AutoGroupSeries   bool       `gorm:"default:true;not null" json:"auto_group_series"`
 	SortOrder         int        `gorm:"default:0;not null" json:"sort_order"`

@@ -77,22 +77,43 @@ func (h *Handler) writeCachedJSON(c *gin.Context, key string, ttl time.Duration,
 	c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
 }
 
-func (h *Handler) buildUserViewsItems(p *auth.Principal, visibleIDs []string) ([]map[string]any, error) {
+func (h *Handler) buildUserViewsItems(p *auth.Principal, visibleIDs []string, includeHidden bool) ([]map[string]any, error) {
 	if len(visibleIDs) == 0 {
 		return []map[string]any{}, nil
 	}
-	var libs []model.Library
-	if err := h.db.Read().Where("id IN ?", visibleIDs).Order("sort_order ASC, name ASC").Find(&libs).Error; err != nil {
-		return nil, err
+	var cfg UserConfiguration
+	if p != nil && p.User != nil {
+		cfg = h.loadUserConfig(p.User.ID)
 	}
-	items := h.libraryViewsDTOs(libs, p)
+	myMediaExc := idSliceToSet(cfg.MyMediaExcludes)
+
+	filteredIDs := visibleIDs
+	if !includeHidden {
+		filteredIDs = h.filterLibraryIDsForSection(p, visibleIDs, "mymedia")
+	}
+
+	var items []map[string]any
+	if len(filteredIDs) > 0 {
+		var libs []model.Library
+		if err := h.db.Read().Where("id IN ?", filteredIDs).Order("sort_order ASC, name ASC").Find(&libs).Error; err != nil {
+			return nil, err
+		}
+		items = h.libraryViewsDTOs(libs, p)
+	} else {
+		items = []map[string]any{}
+	}
 
 	var vlibs []model.VirtualLibrary
 	if err := h.db.Read().Where("enabled = ?", true).Order("sort_order ASC, name ASC").Find(&vlibs).Error; err == nil {
 		for i := range vlibs {
+			if !includeHidden && myMediaExc[vlibs[i].ID] {
+				continue
+			}
 			items = append(items, h.virtualLibraryViewDTO(&vlibs[i], p))
 		}
 	}
+
+	sortViewsByOrderedViews(items, cfg.OrderedViews)
 	return items, nil
 }
 
@@ -104,17 +125,25 @@ func (h *Handler) buildLatestDTOsWithOpts(r *http.Request, p *auth.Principal, vi
 	if len(visibleIDs) == 0 {
 		return []map[string]any{}
 	}
+	effectiveIDs := visibleIDs
+	if parentID == "" || parentID == "root" {
+		effectiveIDs = h.filterLibraryIDsForSection(p, visibleIDs, "latest")
+		if len(effectiveIDs) == 0 {
+			return []map[string]any{}
+		}
+	}
 	types := normalizeItemTypes(includeTypes)
 	if len(types) == 0 {
 		types = []string{"Movie", "Series"}
 	}
 	q := h.db.Read().Model(&model.Item{}).
-		Where("soft_deleted_at IS NULL AND library_id IN ? AND type IN ?", visibleIDs, types)
+		Where("soft_deleted_at IS NULL AND library_id IN ? AND type IN ?", effectiveIDs, types)
 	if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
 		q = q.Where("library_id = ?", parentID)
 	}
 	if p != nil && p.User != nil {
-		if strings.EqualFold(isPlayed, "false") {
+		hidePlayed := isPlayed == "" && h.loadUserConfig(p.User.ID).HidePlayedInLatest
+		if strings.EqualFold(isPlayed, "false") || hidePlayed {
 			q = q.Where("id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true)
 		} else if strings.EqualFold(isPlayed, "true") {
 			q = q.Where("id IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true)
@@ -156,9 +185,16 @@ func (h *Handler) buildResumeDTOsWithOpts(r *http.Request, p *auth.Principal, vi
 	if len(opts.MediaTypes) > 0 && !containsCI(opts.MediaTypes, "Video") {
 		return []map[string]any{}, 0
 	}
+	effectiveIDs := visibleIDs
+	if opts.ParentID == "" || opts.ParentID == "root" {
+		effectiveIDs = h.filterLibraryIDsForSection(p, visibleIDs, "resume")
+		if len(effectiveIDs) == 0 {
+			return []map[string]any{}, 0
+		}
+	}
 	base := h.db.Read().Table("items").
 		Joins("JOIN user_data ON user_data.item_id = items.id").
-		Where("items.soft_deleted_at IS NULL AND items.library_id IN ?", visibleIDs).
+		Where("items.soft_deleted_at IS NULL AND items.library_id IN ?", effectiveIDs).
 		Where("user_data.user_id = ? AND user_data.position_ticks > 0 AND user_data.played = ? AND user_data.hide_from_resume = ?", p.User.ID, false, false)
 	if opts.ParentID != "" && opts.ParentID != "root" && !strings.HasPrefix(opts.ParentID, "vlib-") {
 		base = base.Where("(items.library_id = ? OR items.parent_id = ? OR items.series_id = ?)", opts.ParentID, opts.ParentID, opts.ParentID)
@@ -245,10 +281,17 @@ func (h *Handler) buildNextUpDTOsPaged(r *http.Request, p *auth.Principal, visib
 	if p == nil || p.User == nil || len(visibleIDs) == 0 {
 		return []map[string]any{}, 0
 	}
+	effectiveIDs := visibleIDs
+	if (parentID == "" || parentID == "root") && seriesID == "" {
+		effectiveIDs = h.filterLibraryIDsForSection(p, visibleIDs, "nextup")
+		if len(effectiveIDs) == 0 {
+			return []map[string]any{}, 0
+		}
+	}
 	q := h.db.Read().Table("items").
 		Select("items.*").
 		Joins("JOIN user_data ON user_data.item_id = items.id").
-		Where("items.soft_deleted_at IS NULL AND items.type = ? AND items.library_id IN ?", "Episode", visibleIDs).
+		Where("items.soft_deleted_at IS NULL AND items.type = ? AND items.library_id IN ?", "Episode", effectiveIDs).
 		Where("user_data.user_id = ? AND user_data.played = ?", p.User.ID, true)
 	if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
 		q = q.Where("items.library_id = ?", parentID)
@@ -338,7 +381,7 @@ func (h *Handler) WebHome(c *gin.Context) {
 	cacheKey := fmt.Sprintf("webhome:%s:%s:%s:%s", libRev, userRev, uid, visHash)
 
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
-		views, err := h.buildUserViewsItems(p, visibleIDs)
+		views, err := h.buildUserViewsItems(p, visibleIDs, false)
 		if err != nil {
 			return nil, err
 		}
