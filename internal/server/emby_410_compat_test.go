@@ -491,3 +491,248 @@ func TestEpisodeMultiVersionMediaSourceName(t *testing.T) {
 		}
 	}
 }
+
+func TestEmbyRestAPISchemaAlignment(t *testing.T) {
+	srv, tmp := setupTestServer(t)
+	h := srv.Handler
+
+	rec := doJSON(t, h, http.MethodPost, "/api/web/setup", "", map[string]any{
+		"username":    "admin",
+		"password":    "SecretPass123!",
+		"server_name": "EmbyLite SpecAudit",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup failed: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, h, http.MethodPost, "/emby/Users/AuthenticateByName", "", map[string]any{
+		"Username": "admin",
+		"Pw":       "SecretPass123!",
+	})
+	var login struct {
+		AccessToken string `json:"AccessToken"`
+		User        struct {
+			ID string `json:"Id"`
+		} `json:"User"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &login)
+	tok := login.AccessToken
+	uid := login.User.ID
+
+	mediaDir := filepath.Join(tmp, "spec")
+	_ = os.MkdirAll(mediaDir, 0o755)
+	rec = doJSON(t, h, http.MethodPost, "/api/admin/libraries", tok, map[string]any{
+		"name":  "综合库",
+		"kind":  "mixed",
+		"paths": []string{mediaDir},
+	})
+	var libResp struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &libResp)
+
+	now := time.Now().UTC()
+	movie1 := model.Item{
+		ID: "spec-mov-1", LibraryID: libResp.ID, ParentID: libResp.ID, Type: "Movie",
+		Name: "电影A", SortName: "a", RuntimeTicks: 7200 * 1e7, ScanKey: "spec:m1", RandomKey: "r1",
+		AddedAt: now.Add(-2 * time.Hour), CreatedAt: now, UpdatedAt: now,
+	}
+	movie2 := model.Item{
+		ID: "spec-mov-2", LibraryID: libResp.ID, ParentID: libResp.ID, Type: "Movie",
+		Name: "电影B", SortName: "b", RuntimeTicks: 7200 * 1e7, ScanKey: "spec:m2", RandomKey: "r2",
+		AddedAt: now.Add(-1 * time.Hour), CreatedAt: now, UpdatedAt: now,
+	}
+	series := model.Item{
+		ID: "spec-ser-1", LibraryID: libResp.ID, ParentID: libResp.ID, Type: "Series",
+		Name: "剧集S", SortName: "s", IsFolder: true, ScanKey: "spec:s1", RandomKey: "r3",
+		AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	season := model.Item{
+		ID: "spec-sea-1", LibraryID: libResp.ID, ParentID: series.ID, SeriesID: series.ID, Type: "Season",
+		Name: "第 1 季", SortName: "s01", SeasonNum: 1, IsFolder: true, ScanKey: "spec:sea1", RandomKey: "r4",
+		AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	ep1 := model.Item{
+		ID: "spec-ep-1", LibraryID: libResp.ID, ParentID: season.ID, SeriesID: series.ID, SeasonID: season.ID, Type: "Episode",
+		Name: "E01", SortName: "s01e01", SeasonNum: 1, EpisodeNum: 1, RuntimeTicks: 3000 * 1e7, ScanKey: "spec:ep1", RandomKey: "r5",
+		AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	ep2 := model.Item{
+		ID: "spec-ep-2", LibraryID: libResp.ID, ParentID: season.ID, SeriesID: series.ID, SeasonID: season.ID, Type: "Episode",
+		Name: "E02", SortName: "s01e02", SeasonNum: 1, EpisodeNum: 2, RuntimeTicks: 3000 * 1e7, ScanKey: "spec:ep2", RandomKey: "r6",
+		AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	for _, it := range []*model.Item{&movie1, &movie2, &series, &season, &ep1, &ep2} {
+		if err := srv.DB.Gorm.Create(it).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Legacy migrated ProbeJSON containing empty TimeBase, typo ExtendedVideoSubtype, and missing DisplayTitle/Protocol.
+	_ = srv.DB.Gorm.Create(&model.MediaSource{
+		ID: "spec-src-1", ItemID: movie1.ID, SourceType: "strm", StrmURL: "https://cdn.example.com/a.mkv",
+		Path: filepath.Join(mediaDir, "a.strm"), Container: "mkv", FileSize: 0, Width: 3840, Height: 2160, VideoCodec: "hevc", HDRType: "HDR10",
+		ProbeJSON: `[{"Type":"Video","Index":0,"Codec":"hevc","Width":3840,"Height":2160,"VideoRange":"HDR10","TimeBase":"","CodecTag":"","ExtendedVideoSubtype":"DoviProfile8"},{"Type":"Audio","Index":1,"Codec":"eac3","Language":"chi","Channels":6,"IsDefault":true},{"Type":"Subtitle","Index":2,"Codec":"srt","Language":"chi"}]`,
+	}).Error
+	_ = srv.DB.Gorm.Create(&model.IntroMarker{
+		ID: "spec-intro-1", ItemID: movie1.ID, IntroStartTicks: 10 * 1e7, IntroEndTicks: 90 * 1e7, CreditsStartTicks: 6900 * 1e7,
+	}).Error
+
+	// 1. Verify MediaSourceInfo & MediaStream & BaseItemDto & ChapterInfo & UserData fields.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/"+movie1.ID, tok, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("item detail failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var itemDetail map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &itemDetail); err != nil {
+		t.Fatalf("unmarshal item detail: %v", err)
+	}
+	if itemDetail["Width"] != float64(3840) || itemDetail["Height"] != float64(2160) || itemDetail["IsHD"] != true || itemDetail["HasSubtitles"] != true {
+		t.Fatalf("BaseItemDto media summary mismatch: Width=%v Height=%v IsHD=%v HasSubtitles=%v", itemDetail["Width"], itemDetail["Height"], itemDetail["IsHD"], itemDetail["HasSubtitles"])
+	}
+	udMap, _ := itemDetail["UserData"].(map[string]any)
+	if udMap["ItemId"] != movie1.ID {
+		t.Fatalf("UserData.ItemId = %v, want %s", udMap["ItemId"], movie1.ID)
+	}
+	chapters, _ := itemDetail["Chapters"].([]any)
+	if len(chapters) != 3 {
+		t.Fatalf("expected 3 chapters, got %d", len(chapters))
+	}
+	for i, rawCh := range chapters {
+		ch := rawCh.(map[string]any)
+		if ch["ChapterIndex"] != float64(i) {
+			t.Fatalf("chapter[%d].ChapterIndex = %v, want %d", i, ch["ChapterIndex"], i)
+		}
+	}
+	sources, _ := itemDetail["MediaSources"].([]any)
+	ms0 := sources[0].(map[string]any)
+	if ms0["ItemId"] != movie1.ID {
+		t.Fatalf("MediaSourceInfo.ItemId = %v, want %s", ms0["ItemId"], movie1.ID)
+	}
+	if _, hasZeroSize := ms0["Size"]; hasZeroSize {
+		t.Fatalf("unprobed STRM MediaSourceInfo with FileSize=0 must omit Size, got %v", ms0["Size"])
+	}
+	for _, key := range []string{"Formats", "RequiredHttpHeaders", "MediaAttachments", "RequiresLooping", "HasSegments"} {
+		if _, exists := ms0[key]; !exists {
+			t.Fatalf("MediaSourceInfo missing standard Emby field %q", key)
+		}
+	}
+	streams := ms0["MediaStreams"].([]any)
+	v0 := streams[0].(map[string]any)
+	if v0["Protocol"] != "Http" || v0["ExtendedVideoType"] != "Hdr10" || v0["ExtendedVideoSubType"] != "DoviProfile8" {
+		t.Fatalf("video stream alignment mismatch: %#v", v0)
+	}
+	if _, hasTypo := v0["ExtendedVideoSubtype"]; hasTypo {
+		t.Fatalf("legacy typo key ExtendedVideoSubtype must be removed: %#v", v0)
+	}
+	if _, hasEmptyTB := v0["TimeBase"]; hasEmptyTB {
+		t.Fatalf("empty TimeBase should be omitted: %#v", v0)
+	}
+	if dt, _ := v0["DisplayTitle"].(string); !strings.Contains(dt, "4K") || !strings.Contains(dt, "HEVC") {
+		t.Fatalf("video stream missing generated DisplayTitle: %q", dt)
+	}
+	sub2 := streams[2].(map[string]any)
+	if sub2["DeliveryMethod"] != "Embed" || sub2["IsTextSubtitleStream"] != true {
+		t.Fatalf("embedded subtitle alignment mismatch: %#v", sub2)
+	}
+
+	// 2. Series & Season UnplayedItemCount + updating after marking ep1 played.
+	rec = doJSON(t, h, http.MethodPost, "/emby/Users/"+uid+"/PlayedItems/"+ep1.ID, tok, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("mark ep1 played failed: %d", rec.Code)
+	}
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?ParentId="+libResp.ID+"&IncludeItemTypes=Series", tok, nil)
+	var seriesList struct {
+		Items []struct {
+			ID       string `json:"Id"`
+			UserData struct {
+				UnplayedItemCount *int `json:"UnplayedItemCount"`
+				ItemID            string `json:"ItemId"`
+			} `json:"UserData"`
+		} `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &seriesList)
+	if len(seriesList.Items) != 1 || seriesList.Items[0].UserData.UnplayedItemCount == nil || *seriesList.Items[0].UserData.UnplayedItemCount != 1 {
+		t.Fatalf("expected Series UnplayedItemCount=1, got %s", rec.Body.String())
+	}
+
+	// 3. Rewatching an already-played movie clears Played so it reappears in Continue Watching.
+	rec = doJSON(t, h, http.MethodPost, "/emby/Users/"+uid+"/PlayedItems/"+movie1.ID, tok, nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"Played":true`) {
+		t.Fatalf("mark movie1 played failed: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, h, http.MethodPost, "/emby/Sessions/Playing/Progress", tok, map[string]any{
+		"ItemId":        movie1.ID,
+		"PositionTicks": int64(1800 * 1e7), // 25% of 7200s
+		"IsPaused":      false,
+	})
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("rewatch progress failed: %d", rec.Code)
+	}
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/Resume?Fields=MediaSources", tok, nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), movie1.ID) {
+		t.Fatalf("rewatched movie1 missing from Resume: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 4. Resume cache isolates distinct request Host/Origin when Fields=MediaSources is requested.
+	reqLan := httptest.NewRequest(http.MethodGet, "/emby/Users/"+uid+"/Items/Resume?Fields=MediaSources", nil)
+	reqLan.Host = "192.168.1.10:8096"
+	reqLan.Header.Set("X-Emby-Token", tok)
+	recLan := httptest.NewRecorder()
+	h.ServeHTTP(recLan, reqLan)
+	if !strings.Contains(recLan.Body.String(), "http://192.168.1.10:8096/emby/Videos/") {
+		t.Fatalf("LAN resume missing LAN origin: %s", recLan.Body.String())
+	}
+	reqWan := httptest.NewRequest(http.MethodGet, "/emby/Users/"+uid+"/Items/Resume?Fields=MediaSources", nil)
+	reqWan.Host = "emby.example.com"
+	reqWan.Header.Set("X-Forwarded-Proto", "https")
+	reqWan.Header.Set("X-Emby-Token", tok)
+	recWan := httptest.NewRecorder()
+	h.ServeHTTP(recWan, reqWan)
+	if !strings.Contains(recWan.Body.String(), "https://emby.example.com/emby/Videos/") {
+		t.Fatalf("WAN resume polluted by LAN cached origin: %s", recWan.Body.String())
+	}
+
+	// 5. SortBy=DatePlayed orders by actual user_data.last_played_at rather than items.added_at.
+	tOld := now.Add(-1 * time.Hour)
+	tNew := now.Add(-5 * time.Minute)
+	_ = srv.DB.Gorm.Save(&model.UserData{UserID: uid, ItemID: movie1.ID, Played: true, LastPlayedAt: &tNew, UpdatedAt: tNew}).Error
+	_ = srv.DB.Gorm.Save(&model.UserData{UserID: uid, ItemID: movie2.ID, Played: true, LastPlayedAt: &tOld, UpdatedAt: tOld}).Error
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?Recursive=true&IncludeItemTypes=Movie&SortBy=DatePlayed&SortOrder=Descending", tok, nil)
+	var playedOrder struct {
+		Items []struct {
+			ID string `json:"Id"`
+		} `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &playedOrder)
+	if len(playedOrder.Items) != 2 || playedOrder.Items[0].ID != movie1.ID {
+		t.Fatalf("SortBy=DatePlayed DESC expected movie1 first (more recently played despite older added_at), got %+v", playedOrder.Items)
+	}
+
+	// 6. Full ItemCounts schema + user-scoped alias routes.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Items/Counts", tok, nil)
+	var counts map[string]int64
+	if err := json.Unmarshal(rec.Body.Bytes(), &counts); err != nil {
+		t.Fatalf("decode /Items/Counts: %v", err)
+	}
+	for _, k := range []string{"MovieCount", "SeriesCount", "EpisodeCount", "BoxSetCount", "SongCount", "AlbumCount", "ArtistCount", "MusicVideoCount", "BookCount", "TrailerCount", "ItemCount"} {
+		if _, ok := counts[k]; !ok {
+			t.Fatalf("/Items/Counts missing standard field %q: %+v", k, counts)
+		}
+	}
+	if counts["MovieCount"] != 2 || counts["SeriesCount"] != 1 || counts["EpisodeCount"] != 2 || counts["ItemCount"] != 5 {
+		t.Fatalf("unexpected counts: %+v", counts)
+	}
+
+	for _, aliasPath := range []string{
+		"/emby/Users/" + uid + "/Items/" + movie1.ID + "/Images",
+		"/emby/Users/" + uid + "/Items/" + movie1.ID + "/ThemeMedia",
+		"/emby/Users/" + uid + "/Items/" + movie1.ID + "/ThemeSongs",
+		"/emby/Users/" + uid + "/Items/" + movie1.ID + "/ThemeVideos",
+		"/emby/Users/" + uid + "/Items/" + movie1.ID + "/ThumbnailSet",
+		"/emby/Users/" + uid + "/MediaSegments/" + movie1.ID,
+	} {
+		rec = doJSON(t, h, http.MethodGet, aliasPath, tok, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s failed: %d %s", aliasPath, rec.Code, rec.Body.String())
+		}
+	}
+}

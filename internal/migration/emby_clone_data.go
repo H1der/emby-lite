@@ -405,8 +405,10 @@ func embyProbeJSON(streams []embyStreamRow, mappings []PathMapping) string {
 		}
 		m := map[string]any{
 			"Type": embyStreamTypeNames[s.StreamType], "Index": s.Index, "Codec": s.Codec,
-			"Language": s.Language, "TimeBase": "", "IsExternal": false,
+			"Language": s.Language, "IsExternal": false,
 			"IsDefault": s.IsDefault, "IsForced": s.IsForced,
+			"IsInterlaced": s.IsInterlaced, "IsHearingImpaired": false,
+			"SupportsExternalStream": false,
 		}
 		if s.Title != "" {
 			m["Title"] = s.Title
@@ -414,7 +416,7 @@ func embyProbeJSON(streams []embyStreamRow, mappings []PathMapping) string {
 		} else if s.Language != "" {
 			m["DisplayTitle"] = strings.ToUpper(s.Language)
 		}
-		if s.Codec != "" {
+		if s.CodecTag != "" {
 			m["CodecTag"] = s.CodecTag
 		}
 		if s.Profile != "" {
@@ -463,10 +465,7 @@ func embyProbeJSON(streams []embyStreamRow, mappings []PathMapping) string {
 			m["ExtendedVideoType"] = s.ExtendedVideoType
 		}
 		if s.ExtendedVideoSub != "" {
-			m["ExtendedVideoSubtype"] = s.ExtendedVideoSub
-		}
-		if s.IsInterlaced {
-			m["IsInterlaced"] = true
+			m["ExtendedVideoSubType"] = s.ExtendedVideoSub
 		}
 		if s.IsAnamorphic {
 			m["IsAnamorphic"] = true

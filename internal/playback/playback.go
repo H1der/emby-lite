@@ -120,6 +120,11 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 			relURL += "&api_key=" + url.QueryEscape(p.Token)
 		}
 
+		streamProto := "File"
+		if src.SourceType == "strm" {
+			streamProto = "Http"
+		}
+
 		// Collect embedded + external subtitles.
 		streams := []map[string]any{}
 		if src.ProbeJSON != "" && src.ProbeJSON != "null" {
@@ -129,7 +134,7 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 					if st == nil {
 						continue
 					}
-					streams = append(streams, normalizeMediaStream(st, len(streams)))
+					streams = append(streams, normalizeMediaStream(st, len(streams), streamProto))
 				}
 			}
 		}
@@ -139,7 +144,7 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 			if p != nil && p.Token != "" {
 				subURL += "?api_key=" + url.QueryEscape(p.Token)
 			}
-			streams = append(streams, map[string]any{
+			subStream := map[string]any{
 				"Type":                   "Subtitle",
 				"Index":                  sub.StreamIndex,
 				"Codec":                  sub.Codec,
@@ -147,6 +152,7 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 				"DisplayLanguage":        sub.Language,
 				"DisplayTitle":           sub.Title,
 				"Title":                  sub.Title,
+				"Protocol":               "File",
 				"IsExternal":             sub.IsExternal,
 				"IsExternalUrl":          false,
 				"IsInterlaced":           false,
@@ -157,7 +163,11 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 				"SupportsExternalStream": true,
 				"DeliveryMethod":         "External",
 				"DeliveryUrl":            subURL,
-			})
+			}
+			if strings.TrimSpace(sub.Title) == "" {
+				subStream["DisplayTitle"] = buildMediaStreamDisplayTitle(subStream)
+			}
+			streams = append(streams, subStream)
 		}
 
 		name := formatMediaSourceName(item, seriesNamesByItem[item.ID], &src, sourceCountByItem[item.ID])
@@ -168,21 +178,23 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 		}
 
 		pathVal := origin + "/emby" + relURL
+		msProto := "Http"
 		if p != nil && p.IsAPIKey {
 			if src.SourceType == "strm" && src.StrmURL != "" {
 				pathVal = src.StrmURL
 			} else {
 				pathVal = src.Path
+				msProto = "File"
 			}
 		}
 
 		ms := map[string]any{
 			"Id":                         src.ID,
+			"ItemId":                     item.ID,
 			"Name":                       name,
-			"Protocol":                   "Http",
+			"Protocol":                   msProto,
 			"Type":                       "Default",
 			"Container":                  ext,
-			"Size":                       src.FileSize,
 			"Path":                       pathVal,
 			"DirectStreamUrl":            relURL,
 			"SupportsDirectPlay":         true,
@@ -193,12 +205,20 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 			"IsInfiniteStream":           false,
 			"RequiresOpening":            false,
 			"RequiresClosing":            false,
+			"RequiresLooping":            false,
+			"HasSegments":                false,
 			"IgnoreDts":                  false,
 			"IgnoreIndex":                false,
 			"GenPtsInput":                false,
 			"ReadAtNativeFramerate":      false,
 			"AddApiKeyToDirectStreamUrl": false,
+			"Formats":                    []string{},
+			"RequiredHttpHeaders":        map[string]string{},
+			"MediaAttachments":           []any{},
 			"MediaStreams":               streams,
+		}
+		if src.FileSize > 0 {
+			ms["Size"] = src.FileSize
 		}
 		// Advertise default audio / subtitle stream indices when available.
 		defaultAudioIdx := -1
@@ -436,7 +456,7 @@ func formatMediaSourceName(item *model.Item, seriesName string, src *model.Media
 	return item.Name
 }
 
-func normalizeMediaStream(st map[string]any, fallbackIndex int) map[string]any {
+func normalizeMediaStream(st map[string]any, fallbackIndex int, defaultProtocol string) map[string]any {
 	streamType, _ := st["Type"].(string)
 	if strings.TrimSpace(streamType) == "" {
 		streamType = "Unknown"
@@ -458,6 +478,9 @@ func normalizeMediaStream(st map[string]any, fallbackIndex int) map[string]any {
 		isExternal = false
 		st["IsExternal"] = false
 	}
+	if _, ok := st["IsExternalUrl"].(bool); !ok {
+		st["IsExternalUrl"] = false
+	}
 	if _, ok := st["IsInterlaced"].(bool); !ok {
 		st["IsInterlaced"] = false
 	}
@@ -475,7 +498,171 @@ func normalizeMediaStream(st map[string]any, fallbackIndex int) map[string]any {
 	if _, ok := st["SupportsExternalStream"].(bool); !ok {
 		st["SupportsExternalStream"] = isExternal
 	}
+	if proto, _ := st["Protocol"].(string); strings.TrimSpace(proto) == "" {
+		if defaultProtocol == "" {
+			defaultProtocol = "File"
+		}
+		st["Protocol"] = defaultProtocol
+	}
+	// Strip empty placeholder strings emitted by older migrations.
+	if tb, ok := st["TimeBase"].(string); ok && strings.TrimSpace(tb) == "" {
+		delete(st, "TimeBase")
+	}
+	if ct, ok := st["CodecTag"].(string); ok && strings.TrimSpace(ct) == "" {
+		delete(st, "CodecTag")
+	}
+	// Normalize legacy lowercase typo key ExtendedVideoSubtype -> Emby OpenAPI ExtendedVideoSubType.
+	if legacySub, ok := st["ExtendedVideoSubtype"]; ok {
+		if _, hasCanonical := st["ExtendedVideoSubType"]; !hasCanonical {
+			if s, ok := legacySub.(string); ok && strings.TrimSpace(s) != "" {
+				st["ExtendedVideoSubType"] = s
+			}
+		}
+		delete(st, "ExtendedVideoSubtype")
+	}
+	if strings.EqualFold(streamType, "Video") {
+		if evt, _ := st["ExtendedVideoType"].(string); strings.TrimSpace(evt) == "" {
+			vr, _ := st["VideoRange"].(string)
+			st["ExtendedVideoType"] = mapVideoRangeToExtendedType(vr)
+		}
+	}
+	if strings.EqualFold(streamType, "Subtitle") && !isExternal {
+		if dm, _ := st["DeliveryMethod"].(string); strings.TrimSpace(dm) == "" {
+			st["DeliveryMethod"] = "Embed"
+		}
+	}
+	if dt, _ := st["DisplayTitle"].(string); strings.TrimSpace(dt) == "" {
+		if generated := buildMediaStreamDisplayTitle(st); generated != "" {
+			st["DisplayTitle"] = generated
+		}
+	}
 	return st
+}
+
+func mapVideoRangeToExtendedType(videoRange string) string {
+	switch strings.ToUpper(strings.TrimSpace(videoRange)) {
+	case "HDR10+", "HDR10PLUS":
+		return "Hdr10Plus"
+	case "HDR10", "HDR":
+		return "Hdr10"
+	case "HLG", "HYPERLOGGAMMA":
+		return "HyperLogGamma"
+	case "DOVI", "DV", "DOLBY VISION", "DOLBYVISION":
+		return "DolbyVision"
+	default:
+		return "None"
+	}
+}
+
+func buildMediaStreamDisplayTitle(st map[string]any) string {
+	streamType, _ := st["Type"].(string)
+	codec, _ := st["Codec"].(string)
+	lang, _ := st["Language"].(string)
+	title, _ := st["Title"].(string)
+	isDefault, _ := st["IsDefault"].(bool)
+	isForced, _ := st["IsForced"].(bool)
+	isExternal, _ := st["IsExternal"].(bool)
+	isInterlaced, _ := st["IsInterlaced"].(bool)
+
+	var parts []string
+	switch strings.ToLower(strings.TrimSpace(streamType)) {
+	case "video":
+		w := streamIndexInt(st["Width"])
+		h := streamIndexInt(st["Height"])
+		suffix := "p"
+		if isInterlaced {
+			suffix = "i"
+		}
+		switch {
+		case w >= 7600 || h >= 4200:
+			parts = append(parts, "8K")
+		case w >= 3800 || h >= 2100:
+			parts = append(parts, "4K")
+		case w >= 2500 || h >= 1400:
+			parts = append(parts, "1440"+suffix)
+		case w >= 1900 || h >= 1000:
+			parts = append(parts, "1080"+suffix)
+		case w >= 1200 || h >= 700:
+			parts = append(parts, "720"+suffix)
+		case h >= 400:
+			parts = append(parts, "480"+suffix)
+		}
+		if c := strings.ToUpper(strings.TrimSpace(codec)); c != "" {
+			parts = append(parts, c)
+		}
+		if vr := strings.TrimSpace(fmt.Sprint(st["VideoRange"])); vr != "" && vr != "<nil>" && !strings.EqualFold(vr, "SDR") && !strings.EqualFold(vr, "Unknown") {
+			if strings.EqualFold(vr, "DOVI") || strings.EqualFold(vr, "DV") {
+				parts = append(parts, "Dolby Vision")
+			} else {
+				parts = append(parts, strings.ToUpper(vr))
+			}
+		} else if evt, _ := st["ExtendedVideoType"].(string); evt != "" && !strings.EqualFold(evt, "None") {
+			parts = append(parts, evt)
+		}
+		res := strings.Join(parts, " ")
+		if t := strings.TrimSpace(title); t != "" {
+			if res == "" {
+				return t
+			}
+			return t + " - " + res
+		}
+		return res
+	case "audio":
+		if l := strings.TrimSpace(lang); l != "" && !strings.EqualFold(l, "und") {
+			parts = append(parts, strings.ToUpper(l))
+		}
+		if c := strings.ToUpper(strings.TrimSpace(codec)); c != "" {
+			parts = append(parts, c)
+		}
+		if cl, _ := st["ChannelLayout"].(string); strings.TrimSpace(cl) != "" {
+			parts = append(parts, strings.TrimSpace(cl))
+		} else if ch := streamIndexInt(st["Channels"]); ch > 0 {
+			switch ch {
+			case 2:
+				parts = append(parts, "stereo")
+			case 6:
+				parts = append(parts, "5.1")
+			case 8:
+				parts = append(parts, "7.1")
+			default:
+				parts = append(parts, fmt.Sprintf("%d ch", ch))
+			}
+		}
+		if isDefault {
+			parts = append(parts, "Default")
+		}
+		res := strings.Join(parts, " - ")
+		if t := strings.TrimSpace(title); t != "" {
+			if res == "" {
+				return t
+			}
+			return t + " - " + res
+		}
+		return res
+	case "subtitle":
+		if t := strings.TrimSpace(title); t != "" {
+			parts = append(parts, t)
+		} else if l := strings.TrimSpace(lang); l != "" {
+			parts = append(parts, strings.ToUpper(l))
+		} else {
+			parts = append(parts, "Und")
+		}
+		if c := strings.ToUpper(strings.TrimSpace(codec)); c != "" {
+			parts = append(parts, c)
+		}
+		if isDefault {
+			parts = append(parts, "Default")
+		}
+		if isForced {
+			parts = append(parts, "Forced")
+		}
+		if isExternal {
+			parts = append(parts, "External")
+		}
+		return strings.Join(parts, " - ")
+	default:
+		return strings.TrimSpace(title)
+	}
 }
 
 func isTextSubtitleCodec(codec string, isExternal bool) bool {

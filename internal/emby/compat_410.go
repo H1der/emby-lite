@@ -299,7 +299,7 @@ func (h *Handler) GetStudios(c *gin.Context) {
 	p := getPrincipal(c)
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
 	parentID := queryCI(c, "ParentId")
-	cacheKey := "studios:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
+	cacheKey := dtoCacheVersion + ":studios:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		names := h.collectStudioNames(visibleIDs, parentID)
 		sid := h.serverID()
@@ -697,7 +697,7 @@ func fieldsNeedDetail(fieldsRaw string) bool {
 		return false
 	}
 	f := strings.ToLower(fieldsRaw)
-	for _, kw := range []string{"mediasources", "mediastreams", "people", "studios", "tags", "chapters", "taglines"} {
+	for _, kw := range []string{"mediasources", "mediastreams", "people", "studios", "tags", "chapters", "taglines", "childcount", "recursiveitemcount", "container", "path", "itemcounts"} {
 		if strings.Contains(f, kw) {
 			return true
 		}

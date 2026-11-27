@@ -1380,7 +1380,7 @@ func (s *Service) prepareMediaSource(ctx context.Context, filePath, versionLabel
 		sd := nfo.FileInfo.StreamDetails
 		var probeStreams []map[string]any
 		idx := 0
-		for _, v := range sd.Video {
+		for i, v := range sd.Video {
 			if ms.videoCodec == "" {
 				ms.videoCodec = v.Codec
 				ms.width = v.Width
@@ -1391,21 +1391,30 @@ func (s *Service) prepareMediaSource(ctx context.Context, filePath, versionLabel
 			}
 			probeStreams = append(probeStreams, map[string]any{
 				"Type": "Video", "Index": idx, "Codec": v.Codec,
-				"Width": v.Width, "Height": v.Height, "AspectRatio": v.Aspect, "IsExternal": false,
+				"Width": v.Width, "Height": v.Height, "AspectRatio": v.Aspect,
+				"IsDefault": i == 0, "IsForced": false, "IsExternal": false,
+				"IsInterlaced": false, "IsHearingImpaired": false,
+				"IsTextSubtitleStream": false, "SupportsExternalStream": false,
 			})
 			idx++
 		}
-		for _, a := range sd.Audio {
+		for i, a := range sd.Audio {
 			probeStreams = append(probeStreams, map[string]any{
 				"Type": "Audio", "Index": idx, "Codec": a.Codec,
-				"Language": a.Language, "Channels": a.Channels, "IsExternal": false,
+				"Language": a.Language, "Channels": a.Channels,
+				"IsDefault": i == 0, "IsForced": false, "IsExternal": false,
+				"IsInterlaced": false, "IsHearingImpaired": false,
+				"IsTextSubtitleStream": false, "SupportsExternalStream": false,
 			})
 			idx++
 		}
 		for _, sub := range sd.Subtitle {
 			probeStreams = append(probeStreams, map[string]any{
 				"Type": "Subtitle", "Index": idx, "Codec": sub.Codec,
-				"Language": sub.Language, "IsExternal": false,
+				"Language": sub.Language,
+				"IsDefault": false, "IsForced": false, "IsExternal": false,
+				"IsInterlaced": false, "IsHearingImpaired": false,
+				"IsTextSubtitleStream": true, "SupportsExternalStream": false,
 			})
 			idx++
 		}

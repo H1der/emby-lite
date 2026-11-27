@@ -336,7 +336,7 @@ func (h *Handler) UserViews(c *gin.Context) {
 	}
 	includeHidden := strings.EqualFold(queryCI(c, "IncludeHidden"), "true") || strings.EqualFold(c.Request.URL.Path, "/library/mediafolders")
 	userRev := h.getUserDataRev(c.Request.Context(), uid)
-	cacheKey := "views:" + h.db.GetLibraryRevision() + ":" + userRev + ":" + uid + ":" + visibleIDsHash(visibleIDs) + ":" + strconv.FormatBool(includeHidden)
+	cacheKey := dtoCacheVersion + ":views:" + h.db.GetLibraryRevision() + ":" + userRev + ":" + uid + ":" + visibleIDsHash(visibleIDs) + ":" + strconv.FormatBool(includeHidden)
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		items, err := h.buildUserViewsItems(p, visibleIDs, includeHidden)
 		if err != nil {
@@ -422,6 +422,7 @@ func (h *Handler) RootItem(c *gin.Context) {
 			"IsFavorite":            false,
 			"Played":                false,
 			"Key":                   "root",
+			"ItemId":                "root",
 		},
 	})
 }
@@ -799,9 +800,14 @@ func (h *Handler) GetItems(c *gin.Context) {
 	if sortByParam == "" && defaultVirtualSort != "" {
 		sortByParam = defaultVirtualSort
 	}
-	orderClause := buildOrderClause(sortByParam, queryCI(c, "SortOrder"))
+	useUserDataSort := uid != "" && containsCI(splitCSV(sortByParam), "DatePlayed")
+	orderClause := buildOrderClauseWithUserData(sortByParam, queryCI(c, "SortOrder"), useUserDataSort)
+	listQ := q
+	if useUserDataSort {
+		listQ = q.Select("items.*").Joins("LEFT JOIN user_data AS ud_sort ON ud_sort.item_id = items.id AND ud_sort.user_id = ?", uid)
+	}
 	var rows []model.Item
-	if err := q.Order(orderClause).Offset(startIndex).Limit(limit).Find(&rows).Error; err != nil {
+	if err := listQ.Order(orderClause).Offset(startIndex).Limit(limit).Find(&rows).Error; err != nil {
 		jsonErr(c, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -964,7 +970,11 @@ func (h *Handler) GetLatest(c *gin.Context) {
 	if p != nil && p.User != nil {
 		uid = p.User.ID
 	}
-	cacheKey := "latest:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), uid) + ":" + uid + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.Itoa(limit) + ":" + includeTypesRaw + ":" + isPlayed + ":" + strconv.FormatBool(needDetail)
+	originSuffix := ""
+	if needDetail {
+		originSuffix = ":" + playback.PublicOrigin(c.Request, h.cfg.Server.PublicURL)
+	}
+	cacheKey := dtoCacheVersion + ":latest:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), uid) + ":" + uid + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.Itoa(limit) + ":" + includeTypesRaw + ":" + isPlayed + ":" + strconv.FormatBool(needDetail) + originSuffix
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		// Per Emby spec, /Items/Latest returns a plain JSON array.
 		return h.buildLatestDTOsWithOpts(c.Request, p, visibleIDs, parentID, limit, splitCSV(includeTypesRaw), isPlayed, needDetail), nil
@@ -1004,7 +1014,11 @@ func (h *Handler) GetResume(c *gin.Context) {
 	needDetail := fieldsNeedDetail(queryCI(c, "Fields"))
 	filmlyMode := isFilmlyRequest(c, p)
 
-	cacheKey := "resume:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), p.User.ID) + ":" + p.User.ID + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.Itoa(startIndex) + ":" + strconv.Itoa(limit) + ":" + includeTypesRaw + ":" + excludeTypesRaw + ":" + mediaTypesRaw + ":" + strconv.FormatBool(needDetail) + ":" + strconv.FormatBool(filmlyMode)
+	originSuffix := ""
+	if needDetail {
+		originSuffix = ":" + playback.PublicOrigin(c.Request, h.cfg.Server.PublicURL)
+	}
+	cacheKey := dtoCacheVersion + ":resume:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), p.User.ID) + ":" + p.User.ID + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.Itoa(startIndex) + ":" + strconv.Itoa(limit) + ":" + includeTypesRaw + ":" + excludeTypesRaw + ":" + mediaTypesRaw + ":" + strconv.FormatBool(needDetail) + ":" + strconv.FormatBool(filmlyMode) + originSuffix
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		out, total := h.buildResumeDTOsWithOpts(c.Request, p, visibleIDs, resumeQueryOpts{
 			ParentID:     parentID,
@@ -1128,7 +1142,11 @@ func (h *Handler) GetNextUp(c *gin.Context) {
 	}
 	needDetail := fieldsNeedDetail(queryCI(c, "Fields"))
 
-	cacheKey := "nextup:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), p.User.ID) + ":" + p.User.ID + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + seriesID + ":" + strconv.Itoa(startIndex) + ":" + strconv.Itoa(limit) + ":" + strconv.FormatBool(needDetail)
+	originSuffix := ""
+	if needDetail {
+		originSuffix = ":" + playback.PublicOrigin(c.Request, h.cfg.Server.PublicURL)
+	}
+	cacheKey := dtoCacheVersion + ":nextup:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), p.User.ID) + ":" + p.User.ID + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + seriesID + ":" + strconv.Itoa(startIndex) + ":" + strconv.Itoa(limit) + ":" + strconv.FormatBool(needDetail) + originSuffix
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		out, total := h.buildNextUpDTOsPaged(c.Request, p, visibleIDs, parentID, seriesID, startIndex, limit, needDetail)
 		return gin.H{"Items": out, "TotalRecordCount": total, "StartIndex": startIndex}, nil
@@ -1153,7 +1171,7 @@ func (h *Handler) GetSimilar(c *gin.Context) {
 func (h *Handler) GetCounts(c *gin.Context) {
 	p := getPrincipal(c)
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
-	cacheKey := "counts:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs)
+	cacheKey := dtoCacheVersion + ":counts:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs)
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		return h.buildCounts(visibleIDs), nil
 	})
@@ -1163,7 +1181,7 @@ func (h *Handler) GetGenres(c *gin.Context) {
 	p := getPrincipal(c)
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
 	parentID := queryCI(c, "ParentId")
-	cacheKey := "genres:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
+	cacheKey := dtoCacheVersion + ":genres:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		var names []string
 		if len(visibleIDs) > 0 {
@@ -1196,7 +1214,7 @@ func (h *Handler) GetTags(c *gin.Context) {
 	p := getPrincipal(c)
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
 	parentID := queryCI(c, "ParentId")
-	cacheKey := "tags:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
+	cacheKey := dtoCacheVersion + ":tags:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		var names []string
 		if len(visibleIDs) > 0 {
@@ -1230,7 +1248,7 @@ func (h *Handler) GetFilters(c *gin.Context) {
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
 	parentID := queryCI(c, "ParentId")
 	isV2 := strings.HasSuffix(strings.ToLower(c.Request.URL.Path), "filters2")
-	cacheKey := "filters:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.FormatBool(isV2)
+	cacheKey := dtoCacheVersion + ":filters:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.FormatBool(isV2)
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		var genres []string
 		var tags []string
@@ -1835,13 +1853,15 @@ func (h *Handler) handlePlaybackEvent(c *gin.Context, kind string) {
 		} else if item := h.getItemByID(body.ItemID); item != nil {
 			runtime = item.RuntimeTicks
 		}
-		// Mark played when reaching >= 90% of runtime.
+		// Mark played when reaching >= 90% of runtime; otherwise re-watching clears Played so Resume tracks it.
 		if runtime > 0 && float64(pos)/float64(runtime) >= 0.90 {
 			ud.Played = true
 			ud.PositionTicks = 0
 			if ud.PlayCount == 0 {
 				ud.PlayCount = 1
 			}
+		} else if pos > 0 {
+			ud.Played = false
 		}
 	}
 	_ = h.db.Gorm.Save(&ud).Error
@@ -2176,6 +2196,7 @@ func userDataResponse(itemID string, ud *model.UserData) map[string]any {
 		"IsFavorite":            ud.IsFavorite,
 		"Played":                ud.Played,
 		"Key":                   itemID,
+		"ItemId":                itemID,
 	}
 	if ud.LastPlayedAt != nil {
 		m["LastPlayedDate"] = ud.LastPlayedAt.UTC().Format(time.RFC3339)
@@ -2261,6 +2282,10 @@ func normalizeImageKind(raw string) string {
 }
 
 func buildOrderClause(sortBy, sortOrder string) string {
+	return buildOrderClauseWithUserData(sortBy, sortOrder, false)
+}
+
+func buildOrderClauseWithUserData(sortBy, sortOrder string, hasUserDataJoin bool) string {
 	orders := splitCSV(sortOrder)
 	dirFor := func(i int) string {
 		raw := ""
@@ -2286,8 +2311,14 @@ func buildOrderClause(sortBy, sortOrder string) string {
 			clauses = append(clauses, "items.sort_name "+dir)
 		case "productionyear":
 			clauses = append(clauses, "items.year "+dir)
-		case "datecreated", "latestadded", "datelastcontentadded", "seriesdatelastcontentadded", "dateplayed":
+		case "datecreated", "latestadded", "datelastcontentadded", "seriesdatelastcontentadded":
 			clauses = append(clauses, "items.added_at "+dir)
+		case "dateplayed":
+			if hasUserDataJoin {
+				clauses = append(clauses, "CASE WHEN ud_sort.last_played_at IS NULL AND ud_sort.updated_at IS NULL THEN 1 ELSE 0 END ASC, COALESCE(ud_sort.last_played_at, ud_sort.updated_at) "+dir)
+			} else {
+				clauses = append(clauses, "items.added_at "+dir)
+			}
 		case "premieredate", "seriesdatelastreleased":
 			clauses = append(clauses, "items.premiere_date "+dir)
 		case "communityrating":

@@ -385,6 +385,7 @@ func registerEmbyRoutes(r *gin.Engine, h *emby.Handler) {
 		authed.GET("/items/:itemId", h.GetItemDetail)
 		authed.GET("/users/:userId/items/:itemId", h.GetItemDetail)
 		authed.GET("/items/:itemId/images", h.GetItemImagesList)
+		authed.GET("/users/:userId/items/:itemId/images", h.GetItemImagesList)
 		authed.GET("/items/:itemId/similar", h.GetSimilar)
 		authed.GET("/users/:userId/items/:itemId/similar", h.GetSimilar)
 		authed.GET("/items/:itemId/specialfeatures", h.EmptyArray)
@@ -394,10 +395,15 @@ func registerEmbyRoutes(r *gin.Engine, h *emby.Handler) {
 		authed.GET("/items/:itemId/localtrailers", h.EmptyArray)
 		authed.GET("/users/:userId/items/:itemId/localtrailers", h.EmptyArray)
 		authed.GET("/items/:itemId/thememedia", h.GetThemeMedia)
+		authed.GET("/users/:userId/items/:itemId/thememedia", h.GetThemeMedia)
 		authed.GET("/items/:itemId/themesongs", h.EmptyItemsResult)
+		authed.GET("/users/:userId/items/:itemId/themesongs", h.EmptyItemsResult)
 		authed.GET("/items/:itemId/themevideos", h.EmptyItemsResult)
+		authed.GET("/users/:userId/items/:itemId/themevideos", h.EmptyItemsResult)
 		authed.GET("/items/:itemId/thumbnailset", h.EmptyItemsResult)
+		authed.GET("/users/:userId/items/:itemId/thumbnailset", h.EmptyItemsResult)
 		authed.GET("/mediasegments/:itemId", h.GetMediaSegments)
+		authed.GET("/users/:userId/mediasegments/:itemId", h.GetMediaSegments)
 		authed.GET("/search/hints", h.SearchHints)
 
 		// TV Shows, Genres, Tags, Studios, Persons

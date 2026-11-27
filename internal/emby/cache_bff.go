@@ -18,7 +18,10 @@ import (
 	"gorm.io/gorm"
 )
 
-const hotCacheTTL = 60 * time.Second
+const (
+	hotCacheTTL     = 60 * time.Second
+	dtoCacheVersion = "v2"
+)
 
 func (h *Handler) userDataRevKey(uid string) string {
 	return "udrev:" + uid
@@ -332,9 +335,20 @@ func (h *Handler) buildNextUpDTOsPaged(r *http.Request, p *auth.Principal, visib
 
 func (h *Handler) buildCounts(visibleIDs []string) map[string]int64 {
 	counts := map[string]int64{
-		"MovieCount":   0,
-		"SeriesCount":  0,
-		"EpisodeCount": 0,
+		"MovieCount":      0,
+		"SeriesCount":     0,
+		"EpisodeCount":    0,
+		"GameCount":       0,
+		"ArtistCount":     0,
+		"ProgramCount":    0,
+		"GameSystemCount": 0,
+		"TrailerCount":    0,
+		"SongCount":       0,
+		"AlbumCount":      0,
+		"MusicVideoCount": 0,
+		"BoxSetCount":     0,
+		"BookCount":       0,
+		"ItemCount":       0,
 	}
 	if len(visibleIDs) == 0 {
 		return counts
@@ -346,19 +360,27 @@ func (h *Handler) buildCounts(visibleIDs []string) map[string]int64 {
 	var rows []cntRow
 	_ = h.db.Read().Table("items").
 		Select("type, COUNT(*) AS cnt").
-		Where("library_id IN ? AND soft_deleted_at IS NULL AND type IN ?", visibleIDs, []string{"Movie", "Series", "Episode"}).
+		Where("library_id IN ? AND soft_deleted_at IS NULL AND type IN ?", visibleIDs, []string{"Movie", "Series", "Episode", "BoxSet"}).
 		Group("type").
 		Scan(&rows).Error
+	var total int64
 	for _, r := range rows {
 		switch r.Type {
 		case "Movie":
 			counts["MovieCount"] = r.Cnt
+			total += r.Cnt
 		case "Series":
 			counts["SeriesCount"] = r.Cnt
+			total += r.Cnt
 		case "Episode":
 			counts["EpisodeCount"] = r.Cnt
+			total += r.Cnt
+		case "BoxSet":
+			counts["BoxSetCount"] = r.Cnt
+			total += r.Cnt
 		}
 	}
+	counts["ItemCount"] = total
 	return counts
 }
 
@@ -378,7 +400,7 @@ func (h *Handler) WebHome(c *gin.Context) {
 	libRev := h.db.GetLibraryRevision()
 	userRev := h.getUserDataRev(c.Request.Context(), uid)
 	visHash := visibleIDsHash(visibleIDs)
-	cacheKey := fmt.Sprintf("webhome:%s:%s:%s:%s", libRev, userRev, uid, visHash)
+	cacheKey := fmt.Sprintf("%s:webhome:%s:%s:%s:%s", dtoCacheVersion, libRev, userRev, uid, visHash)
 
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		views, err := h.buildUserViewsItems(p, visibleIDs, false)

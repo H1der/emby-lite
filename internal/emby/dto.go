@@ -169,6 +169,7 @@ func (h *Handler) libraryViewDTOWithFallback(lib *model.Library, p *auth.Princip
 			"IsFavorite":            false,
 			"Played":                false,
 			"Key":                   lib.ID,
+			"ItemId":                lib.ID,
 		},
 	}
 }
@@ -246,6 +247,7 @@ func (h *Handler) virtualLibraryViewDTO(vl *model.VirtualLibrary, p *auth.Princi
 			"IsFavorite":            false,
 			"Played":                false,
 			"Key":                   vl.ID,
+			"ItemId":                vl.ID,
 		},
 	}
 }
@@ -280,12 +282,19 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 	itemIDs := make([]string, 0, len(items))
 	parentCandidateSet := map[string]bool{}
 	var playableItems []model.Item
+	var allSeriesIDs []string
+	var allSeasonIDs []string
 	var seriesTypeIDs []string
 	var seasonTypeIDs []string
 	var boxsetTypeIDs []string
 	for i := range items {
 		it := &items[i]
 		itemIDs = append(itemIDs, it.ID)
+		if it.Type == "Series" {
+			allSeriesIDs = append(allSeriesIDs, it.ID)
+		} else if it.Type == "Season" {
+			allSeasonIDs = append(allSeasonIDs, it.ID)
+		}
 		if it.Type == "Season" {
 			if it.SeriesID != "" {
 				parentCandidateSet[it.SeriesID] = true
@@ -513,13 +522,49 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		imagesByItem[img.ItemID] = append(imagesByItem[img.ItemID], img)
 	}
 
-	// 3. Batch-load UserData.
+	// 3. Batch-load UserData + Series/Season UnplayedItemCount.
 	userDataByItem := make(map[string]model.UserData, len(itemIDs))
 	if uid != "" {
 		var uds []model.UserData
 		_ = rdb.Where("user_id = ? AND item_id IN ?", uid, itemIDs).Find(&uds).Error
 		for _, ud := range uds {
 			userDataByItem[ud.ItemID] = ud
+		}
+	}
+	unplayedBySeries := make(map[string]int64, len(allSeriesIDs))
+	if len(allSeriesIDs) > 0 {
+		type unplayedRow struct {
+			OwnerID string
+			Cnt     int64
+		}
+		var rows []unplayedRow
+		uq := rdb.Table("items").
+			Select("series_id AS owner_id, COUNT(*) AS cnt").
+			Where("series_id IN ? AND type = ? AND soft_deleted_at IS NULL", allSeriesIDs, "Episode")
+		if uid != "" {
+			uq = uq.Where("id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", uid, true)
+		}
+		_ = uq.Group("series_id").Scan(&rows).Error
+		for _, ur := range rows {
+			unplayedBySeries[ur.OwnerID] = ur.Cnt
+		}
+	}
+	unplayedBySeason := make(map[string]int64, len(allSeasonIDs))
+	if len(allSeasonIDs) > 0 {
+		type unplayedRow struct {
+			OwnerID string
+			Cnt     int64
+		}
+		var rows []unplayedRow
+		uq := rdb.Table("items").
+			Select("season_id AS owner_id, COUNT(*) AS cnt").
+			Where("season_id IN ? AND type = ? AND soft_deleted_at IS NULL", allSeasonIDs, "Episode")
+		if uid != "" {
+			uq = uq.Where("id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", uid, true)
+		}
+		_ = uq.Group("season_id").Scan(&rows).Error
+		for _, ur := range rows {
+			unplayedBySeason[ur.OwnerID] = ur.Cnt
 		}
 	}
 
@@ -712,6 +757,12 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			"IsFavorite":            ud.IsFavorite,
 			"Played":                ud.Played,
 			"Key":                   item.ID,
+			"ItemId":                item.ID,
+		}
+		if item.Type == "Series" {
+			userDataMap["UnplayedItemCount"] = unplayedBySeries[item.ID]
+		} else if item.Type == "Season" {
+			userDataMap["UnplayedItemCount"] = unplayedBySeason[item.ID]
 		}
 		if ud.LastPlayedAt != nil {
 			userDataMap["LastPlayedDate"] = ud.LastPlayedAt.UTC().Format(time.RFC3339)
@@ -988,18 +1039,44 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 				if len(sources) > 0 {
 					if streams, ok := sources[0]["MediaStreams"]; ok {
 						m["MediaStreams"] = streams
+						hasSubs := false
+						if sList, ok := streams.([]map[string]any); ok {
+							for _, st := range sList {
+								if stType, _ := st["Type"].(string); strings.EqualFold(stType, "Subtitle") {
+									hasSubs = true
+									break
+								}
+							}
+						}
+						m["HasSubtitles"] = hasSubs
 					}
 					if container, ok := sources[0]["Container"]; ok {
 						m["Container"] = container
 					}
+					w, _ := sources[0]["Width"].(int)
+					h, _ := sources[0]["Height"].(int)
+					if w > 0 {
+						m["Width"] = w
+					}
+					if h > 0 {
+						m["Height"] = h
+					}
+					if w > 0 || h > 0 {
+						m["IsHD"] = w >= 1280 || h >= 720
+					}
 				}
 				if cs := chaptersByItem[item.ID]; len(cs) > 0 {
 					chapters := make([]map[string]any, 0, len(cs))
-					for _, c := range cs {
+					for idx, c := range cs {
+						chIdx := c.IndexNum
+						if chIdx < 0 {
+							chIdx = idx
+						}
 						chapters = append(chapters, map[string]any{
 							"StartPositionTicks": c.StartTicks,
 							"Name":               c.Name,
 							"MarkerType":         embyChapterMarkerName(c.MarkerType),
+							"ChapterIndex":       chIdx,
 						})
 					}
 					m["Chapters"] = chapters
@@ -1085,11 +1162,13 @@ func introMarkerToChapters(marker *model.IntroMarker) []map[string]any {
 				"StartPositionTicks": marker.IntroStartTicks,
 				"Name":               "Intro Start",
 				"MarkerType":         "IntroStart",
+				"ChapterIndex":       len(chapters),
 			},
 			map[string]any{
 				"StartPositionTicks": marker.IntroEndTicks,
 				"Name":               "Intro End",
 				"MarkerType":         "IntroEnd",
+				"ChapterIndex":       len(chapters) + 1,
 			},
 		)
 	}
@@ -1098,6 +1177,7 @@ func introMarkerToChapters(marker *model.IntroMarker) []map[string]any {
 			"StartPositionTicks": marker.CreditsStartTicks,
 			"Name":               "Credits",
 			"MarkerType":         "CreditsStart",
+			"ChapterIndex":       len(chapters),
 		})
 	}
 	return chapters
