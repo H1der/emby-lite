@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/mozillazg/go-pinyin"
 )
@@ -334,26 +335,63 @@ func cleanTitle(raw string) string {
 	return strings.Join(fields, " ")
 }
 
+// SanitizeUTF8 removes invalid UTF-8 byte sequences and NUL bytes that PostgreSQL rejects.
+func SanitizeUTF8(s string) string {
+	if s == "" {
+		return ""
+	}
+	if !utf8.ValidString(s) {
+		s = strings.ToValidUTF8(s, "")
+	}
+	if strings.IndexByte(s, 0) >= 0 {
+		s = strings.ReplaceAll(s, "\x00", "")
+	}
+	return s
+}
+
+// TruncateRunes sanitizes UTF-8 and truncates s to at most maxRunes Unicode code points
+// without splitting multi-byte UTF-8 characters.
+func TruncateRunes(s string, maxRunes int) string {
+	s = SanitizeUTF8(s)
+	if maxRunes <= 0 || len(s) <= maxRunes {
+		return s
+	}
+	n := 0
+	for i := range s {
+		if n == maxRunes {
+			return s[:i]
+		}
+		n++
+	}
+	return s
+}
+
 // PinyinInitials computes lowercase ASCII + Chinese pinyin initials for fast search and sorting.
 func PinyinInitials(text string) string {
+	const maxInitialsRunes = 240
 	args := pinyin.NewArgs()
 	args.Style = pinyin.FirstLetter
 	var b strings.Builder
-	for _, r := range text {
+	written := 0
+	for _, r := range SanitizeUTF8(text) {
+		if written >= maxInitialsRunes {
+			break
+		}
 		if unicode.Is(unicode.Han, r) {
 			res := pinyin.SinglePinyin(r, args)
 			if len(res) > 0 && len(res[0]) > 0 {
-				b.WriteString(strings.ToLower(res[0][:1]))
+				firstRune, _ := utf8.DecodeRuneInString(res[0])
+				if firstRune != utf8.RuneError {
+					b.WriteRune(unicode.ToLower(firstRune))
+					written++
+				}
 			}
 		} else if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			b.WriteRune(unicode.ToLower(r))
+			written++
 		}
 	}
-	out := b.String()
-	if len(out) > 240 {
-		out = out[:240]
-	}
-	return out
+	return b.String()
 }
 
 // BuildSortName produces a normalized sort key.

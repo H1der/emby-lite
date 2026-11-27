@@ -1960,9 +1960,9 @@ func normalizeEmbyPremiereDate(raw string) string {
 		return time.Unix(n, 0).UTC().Format("2006-01-02")
 	}
 	if len(s) > 10 {
-		return s[:10]
+		return scanner.TruncateRunes(s, 10)
 	}
-	return s
+	return scanner.SanitizeUTF8(s)
 }
 
 // classifyEmbyType maps an Emby item type to an emby-lite media kind.

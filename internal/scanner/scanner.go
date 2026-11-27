@@ -24,6 +24,7 @@ import (
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ProgressFunc receives live scan/probe progress updates.
@@ -925,11 +926,45 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 		report(stats.ItemsSkipped, len(candidates), fmt.Sprintf("【%s】快速跳过 %d 个未变更文件，准备处理 %d 个变更...", lib.Name, stats.ItemsSkipped, len(toMove)+len(toIngest)))
 	}
 
-	// Stage 4: Relocate moved items in a single transaction.
+	// Stage 4: Relocate moved items (batch transaction with per-item fallback for PostgreSQL safety).
 	if len(toMove) > 0 && ctx.Err() == nil {
-		_ = s.db.Gorm.Transaction(func(tx *gorm.DB) error {
+		var batchSeen []string
+		var batchFallback []scanCandidate
+		batchMoved := 0
+		batchErr := s.db.Gorm.Transaction(func(tx *gorm.DB) error {
 			for _, mj := range toMove {
-				if relocated := s.relocateMovedItemTx(tx, &lib, &mj.oldSF, mj.cand, allSnapshots[mj.cand.dir], mj.depHash, runID); relocated {
+				relocated, err := s.relocateMovedItemTx(tx, &lib, &mj.oldSF, mj.cand, allSnapshots[mj.cand.dir], mj.depHash, runID)
+				if err != nil {
+					return err
+				}
+				if relocated {
+					batchSeen = append(batchSeen, mj.oldSF.ItemID)
+					batchMoved++
+				} else {
+					batchFallback = append(batchFallback, mj.cand)
+				}
+			}
+			return nil
+		})
+		if batchErr == nil {
+			for _, id := range batchSeen {
+				seenItems[id] = true
+				markAncestorsMem(id, seenItems)
+			}
+			stats.ItemsMoved += batchMoved
+			toIngest = append(toIngest, batchFallback...)
+		} else {
+			for _, mj := range toMove {
+				relocated := false
+				_ = s.db.Gorm.Transaction(func(tx *gorm.DB) error {
+					ok, err := s.relocateMovedItemTx(tx, &lib, &mj.oldSF, mj.cand, allSnapshots[mj.cand.dir], mj.depHash, runID)
+					if err != nil {
+						return err
+					}
+					relocated = ok
+					return nil
+				})
+				if relocated {
 					seenItems[mj.oldSF.ItemID] = true
 					markAncestorsMem(mj.oldSF.ItemID, seenItems)
 					stats.ItemsMoved++
@@ -937,8 +972,7 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 					toIngest = append(toIngest, mj.cand)
 				}
 			}
-			return nil
-		})
+		}
 	}
 
 	// Stage 5: Concurrent I/O preparation (NFO parsing, pure-Go native header probing, image/sub discovery).
@@ -1016,14 +1050,65 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 		ensuredSeasons := make(map[seasonKey]*model.Item, len(seasonKeys))
 		personCache := make(map[string]string, 128)
 
-		// Pre-commit all unique Series & Seasons in a single transaction first.
+		// Pre-commit all unique Series & Seasons in a single transaction first; fall back to
+		// per-item transactions on error so one bad row never aborts the whole batch in PostgreSQL.
 		if len(preparedSeriesMap) > 0 && ctx.Err() == nil {
-			_ = s.db.Gorm.Transaction(func(tx *gorm.DB) error {
+			batchSeries := make(map[string]*model.Item, len(preparedSeriesMap))
+			batchSeasons := make(map[seasonKey]*model.Item, len(preparedSeasonMap))
+			batchPeople := cloneStringMap(personCache)
+			batchErr := s.db.Gorm.Transaction(func(tx *gorm.DB) error {
 				for sdir, ps := range preparedSeriesMap {
-					seriesItem, err := s.ensureSeriesTx(tx, &lib, ps, personCache)
-					if err == nil && seriesItem != nil {
+					seriesItem, err := s.ensureSeriesTx(tx, &lib, ps, batchPeople)
+					if err != nil {
+						return err
+					}
+					if seriesItem != nil {
+						batchSeries[sdir] = seriesItem
+					}
+				}
+				for sk, pSeas := range preparedSeasonMap {
+					seriesItem := batchSeries[sk.seriesDir]
+					if seriesItem == nil {
+						continue
+					}
+					seasonItem, err := s.ensureSeasonTx(tx, &lib, seriesItem, pSeas)
+					if err != nil {
+						return err
+					}
+					if seasonItem != nil {
+						batchSeasons[sk] = seasonItem
+					}
+				}
+				return nil
+			})
+			if batchErr == nil {
+				for sdir, item := range batchSeries {
+					ensuredSeries[sdir] = item
+					seenItems[item.ID] = true
+				}
+				for sk, item := range batchSeasons {
+					ensuredSeasons[sk] = item
+					seenItems[item.ID] = true
+				}
+				personCache = batchPeople
+			} else {
+				slog.Warn("batch series/season pre-commit failed, falling back to per-item transactions", "library", lib.Name, "err", batchErr)
+				for sdir, ps := range preparedSeriesMap {
+					itemPeople := cloneStringMap(personCache)
+					var seriesItem *model.Item
+					err := s.db.Gorm.Transaction(func(tx *gorm.DB) error {
+						var txErr error
+						seriesItem, txErr = s.ensureSeriesTx(tx, &lib, ps, itemPeople)
+						return txErr
+					})
+					if err != nil {
+						slog.Warn("failed to ensure series", "dir", sdir, "err", err)
+						continue
+					}
+					if seriesItem != nil {
 						ensuredSeries[sdir] = seriesItem
 						seenItems[seriesItem.ID] = true
+						personCache = itemPeople
 					}
 				}
 				for sk, pSeas := range preparedSeasonMap {
@@ -1031,14 +1116,34 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 					if seriesItem == nil {
 						continue
 					}
-					seasonItem, err := s.ensureSeasonTx(tx, &lib, seriesItem, pSeas)
-					if err == nil && seasonItem != nil {
+					var seasonItem *model.Item
+					err := s.db.Gorm.Transaction(func(tx *gorm.DB) error {
+						var txErr error
+						seasonItem, txErr = s.ensureSeasonTx(tx, &lib, seriesItem, pSeas)
+						return txErr
+					})
+					if err != nil {
+						slog.Warn("failed to ensure season", "dir", sk.seasonDir, "season", sk.seasonNum, "err", err)
+						continue
+					}
+					if seasonItem != nil {
 						ensuredSeasons[sk] = seasonItem
 						seenItems[seasonItem.ID] = true
 					}
 				}
-				return nil
-			})
+			}
+		}
+
+		writePreparedOne := func(tx *gorm.DB, p *preparedIngest, pCache map[string]string) (string, bool, error) {
+			if p.isTV {
+				seriesItem := ensuredSeries[p.seriesDir]
+				seasonItem := ensuredSeasons[seasonKey{seriesDir: p.seriesDir, seasonDir: p.seasonDir, seasonNum: p.seasonNum}]
+				if seriesItem == nil || seasonItem == nil {
+					return "", false, nil
+				}
+				return s.writeEpisodeTx(tx, &lib, seriesItem, seasonItem, p, runID)
+			}
+			return s.writeMovieTx(tx, &lib, p, runID, pCache)
 		}
 
 		const batchSize = 64
@@ -1053,26 +1158,67 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 				end = len(prepared)
 			}
 			chunk := prepared[start:end]
-			_ = s.db.Gorm.Transaction(func(tx *gorm.DB) error {
+
+			// Commit the chunk in one transaction for throughput. In PostgreSQL, any single SQL
+			// error aborts the entire transaction (SQLSTATE 25P02), so return the error immediately
+			// to roll back cleanly and retry each item in its own transaction instead of losing
+			// the other 63 items in the batch.
+			batchAdded := 0
+			batchUpdated := 0
+			batchSeen := make([]string, 0, len(chunk))
+			batchPeople := cloneStringMap(personCache)
+			batchErr := s.db.Gorm.Transaction(func(tx *gorm.DB) error {
 				for _, p := range chunk {
 					if p == nil {
 						continue
 					}
+					itemID, added, err := writePreparedOne(tx, p, batchPeople)
+					if err != nil {
+						return err
+					}
+					if itemID == "" {
+						continue
+					}
+					if added {
+						batchAdded++
+					} else {
+						batchUpdated++
+					}
+					batchSeen = append(batchSeen, itemID)
+				}
+				return nil
+			})
+			if batchErr == nil {
+				stats.ItemsAdded += batchAdded
+				stats.ItemsUpdated += batchUpdated
+				written += batchAdded + batchUpdated
+				for _, id := range batchSeen {
+					seenItems[id] = true
+				}
+				personCache = batchPeople
+			} else {
+				slog.Warn("batch ingest transaction rolled back, retrying items individually", "library", lib.Name, "batch_size", len(chunk), "err", batchErr)
+				for _, p := range chunk {
+					if p == nil {
+						continue
+					}
+					if ctx.Err() != nil {
+						scanErr = ctx.Err()
+						break
+					}
+					itemPeople := cloneStringMap(personCache)
 					var itemID string
 					var added bool
-					var err error
-					if p.isTV {
-						seriesItem := ensuredSeries[p.seriesDir]
-						seasonItem := ensuredSeasons[seasonKey{seriesDir: p.seriesDir, seasonDir: p.seasonDir, seasonNum: p.seasonNum}]
-						if seriesItem == nil || seasonItem == nil {
-							continue
-						}
-						itemID, added, err = s.writeEpisodeTx(tx, &lib, seriesItem, seasonItem, p, runID)
-					} else {
-						itemID, added, err = s.writeMovieTx(tx, &lib, p, runID, personCache)
-					}
+					err := s.db.Gorm.Transaction(func(tx *gorm.DB) error {
+						var txErr error
+						itemID, added, txErr = writePreparedOne(tx, p, itemPeople)
+						return txErr
+					})
 					if err != nil {
 						slog.Warn("failed to ingest media file", "path", p.cand.path, "err", err)
+						continue
+					}
+					if itemID == "" {
 						continue
 					}
 					if added {
@@ -1080,13 +1226,11 @@ func (s *Service) scanLibraryLocked(ctx context.Context, libraryID string, repor
 					} else {
 						stats.ItemsUpdated++
 					}
-					if itemID != "" {
-						seenItems[itemID] = true
-					}
+					seenItems[itemID] = true
+					personCache = itemPeople
 					written++
 				}
-				return nil
-			})
+			}
 			if report != nil {
 				overall := stats.ItemsSkipped + stats.ItemsMoved + written
 				if overall > len(candidates) {
@@ -1286,12 +1430,12 @@ func (s *Service) prepareCandidate(ctx context.Context, lib *model.Library, cand
 				epTitle = stem
 			}
 		}
-		p.title = epTitle
-		p.sortTitle = fmt.Sprintf("%03d-%04d-%s", parsed.Season, parsed.Episode, BuildSortName(epTitle))
-		p.pinyin = PinyinInitials(epTitle)
+		p.title = TruncateRunes(epTitle, 512)
+		p.sortTitle = TruncateRunes(fmt.Sprintf("%03d-%04d-%s", parsed.Season, parsed.Episode, BuildSortName(p.title)), 512)
+		p.pinyin = PinyinInitials(p.title)
 		if hasEpNFO {
-			p.overview = epNFO.EffectivePlot()
-			p.premiereDate = epNFO.EffectivePremiereDate()
+			p.overview = SanitizeUTF8(epNFO.EffectivePlot())
+			p.premiereDate = TruncateRunes(epNFO.EffectivePremiereDate(), 32)
 			p.rating = epNFO.EffectiveRating()
 			if secs := epNFO.EffectiveDurationSeconds(); secs > 0 {
 				p.runtimeTicks = int64(secs * 1e7)
@@ -1320,14 +1464,14 @@ func (s *Service) prepareCandidate(ctx context.Context, lib *model.Library, cand
 		}
 		p.origTitle = strings.TrimSpace(nfo.OriginalTitle)
 		p.sortTitle = strings.TrimSpace(nfo.SortTitle)
-		p.overview = nfo.EffectivePlot()
+		p.overview = SanitizeUTF8(nfo.EffectivePlot())
 		p.tagline = strings.TrimSpace(nfo.Tagline)
 		if y := nfo.EffectiveYear(); y > 0 {
 			p.year = y
 		}
-		p.premiereDate = nfo.EffectivePremiereDate()
+		p.premiereDate = TruncateRunes(nfo.EffectivePremiereDate(), 32)
 		p.rating = nfo.EffectiveRating()
-		p.officialRat = strings.TrimSpace(nfo.MPAA)
+		p.officialRat = TruncateRunes(strings.TrimSpace(nfo.MPAA), 32)
 		if secs := nfo.EffectiveDurationSeconds(); secs > 0 {
 			p.runtimeTicks = int64(secs * 1e7)
 		}
@@ -1336,9 +1480,13 @@ func (s *Service) prepareCandidate(ctx context.Context, lib *model.Library, cand
 		p.genres = nfo.Genres
 		p.tags = nfo.Tags
 	}
+	p.title = TruncateRunes(p.title, 512)
+	p.origTitle = TruncateRunes(p.origTitle, 512)
+	p.tagline = TruncateRunes(p.tagline, 512)
 	if p.sortTitle == "" {
 		p.sortTitle = BuildSortName(p.title)
 	}
+	p.sortTitle = TruncateRunes(p.sortTitle, 512)
 	p.pinyin = PinyinInitials(p.title + " " + p.origTitle)
 	p.images = snap.discoverImages(stem)
 	p.subtitles = snap.findSidecarSubtitles(stem)
@@ -1450,22 +1598,26 @@ func prepareSeriesData(seriesDir string, snap *dirSnapshot) *preparedSeries {
 		}
 		ps.origTitle = strings.TrimSpace(nfo.OriginalTitle)
 		ps.sortTitle = strings.TrimSpace(nfo.SortTitle)
-		ps.overview = nfo.EffectivePlot()
+		ps.overview = SanitizeUTF8(nfo.EffectivePlot())
 		ps.tagline = strings.TrimSpace(nfo.Tagline)
 		if y := nfo.EffectiveYear(); y > 0 {
 			ps.year = y
 		}
-		ps.premiereDate = nfo.EffectivePremiereDate()
+		ps.premiereDate = TruncateRunes(nfo.EffectivePremiereDate(), 32)
 		ps.rating = nfo.EffectiveRating()
-		ps.officialRat = strings.TrimSpace(nfo.MPAA)
+		ps.officialRat = TruncateRunes(strings.TrimSpace(nfo.MPAA), 32)
 		ps.providerIDs = nfo.ProviderIDs()
 		ps.studios = nfo.Studios
 		ps.genres = nfo.Genres
 		ps.tags = nfo.Tags
 	}
+	ps.title = TruncateRunes(ps.title, 512)
+	ps.origTitle = TruncateRunes(ps.origTitle, 512)
+	ps.tagline = TruncateRunes(ps.tagline, 512)
 	if ps.sortTitle == "" {
 		ps.sortTitle = BuildSortName(ps.title)
 	}
+	ps.sortTitle = TruncateRunes(ps.sortTitle, 512)
 	ps.pinyin = PinyinInitials(ps.title + " " + ps.origTitle)
 	ps.images = snap.discoverImages("")
 	return ps
@@ -1481,13 +1633,13 @@ func prepareSeasonData(seriesDir, seasonDir string, seasonNum int, seasonSnap, s
 		if t := strings.TrimSpace(nfo.Title); t != "" {
 			name = t
 		}
-		overview = nfo.EffectivePlot()
+		overview = SanitizeUTF8(nfo.EffectivePlot())
 	}
 	return &preparedSeason{
 		seriesDir: seriesDir,
 		seasonDir: seasonDir,
 		seasonNum: seasonNum,
-		name:      name,
+		name:      TruncateRunes(name, 512),
 		overview:  overview,
 		poster:    discoverSeasonPosterFromSnapshots(seasonSnap, seriesSnap, seasonNum),
 	}
@@ -1495,13 +1647,26 @@ func prepareSeasonData(seriesDir, seasonDir string, seasonNum int, seasonSnap, s
 
 // --- Transactional DB Writers ---
 
-func (s *Service) relocateMovedItemTx(tx *gorm.DB, lib *model.Library, oldSF *model.ScanFile, cand scanCandidate, snap *dirSnapshot, depHash, runID string) bool {
+func cloneStringMap(src map[string]string) map[string]string {
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func (s *Service) relocateMovedItemTx(tx *gorm.DB, lib *model.Library, oldSF *model.ScanFile, cand scanCandidate, snap *dirSnapshot, depHash, runID string) (bool, error) {
 	var item model.Item
 	if err := tx.Where("id = ?", oldSF.ItemID).First(&item).Error; err != nil {
-		return false
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		return false, err
 	}
 	var srcCount int64
-	tx.Model(&model.MediaSource{}).Where("item_id = ?", item.ID).Count(&srcCount)
+	if err := tx.Model(&model.MediaSource{}).Where("item_id = ?", item.ID).Count(&srcCount).Error; err != nil {
+		return false, err
+	}
 	prefix := "movie"
 	if item.Type == "Episode" {
 		prefix = "episode"
@@ -1512,7 +1677,7 @@ func (s *Service) relocateMovedItemTx(tx *gorm.DB, lib *model.Library, oldSF *mo
 		updates["dir_path"] = cand.dir
 	}
 	if err := tx.Model(&item).Updates(updates).Error; err != nil {
-		return false
+		return false, err
 	}
 
 	var src model.MediaSource
@@ -1522,18 +1687,30 @@ func (s *Service) relocateMovedItemTx(tx *gorm.DB, lib *model.Library, oldSF *mo
 		if IsSTRMFile(cand.path) {
 			src.StrmURL = ReadSTRMTarget(cand.path)
 		}
-		_ = tx.Save(&src).Error
-		stem := strings.TrimSuffix(cand.name, filepath.Ext(cand.name))
-		s.syncSidecarSubtitlesTx(tx, item.ID, src.ID, stem, snap.findSidecarSubtitles(stem))
-		if item.Type == "Movie" {
-			s.syncImagesTx(tx, item.ID, snap.discoverImages(stem))
+		if err := tx.Save(&src).Error; err != nil {
+			return false, err
 		}
+		stem := strings.TrimSuffix(cand.name, filepath.Ext(cand.name))
+		if err := s.syncSidecarSubtitlesTx(tx, item.ID, src.ID, stem, snap.findSidecarSubtitles(stem)); err != nil {
+			return false, err
+		}
+		if item.Type == "Movie" {
+			if err := s.syncImagesTx(tx, item.ID, snap.discoverImages(stem)); err != nil {
+				return false, err
+			}
+		}
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, err
 	}
 
-	_ = tx.Where("library_id = ? AND path = ?", lib.ID, oldSF.Path).Delete(&model.ScanFile{}).Error
-	s.upsertScanFileTx(tx, lib.ID, cand, depHash, item.ID, runID)
+	if err := tx.Where("library_id = ? AND path = ?", lib.ID, oldSF.Path).Delete(&model.ScanFile{}).Error; err != nil {
+		return false, err
+	}
+	if err := s.upsertScanFileTx(tx, lib.ID, cand, depHash, item.ID, runID); err != nil {
+		return false, err
+	}
 	slog.Info("detected moved media file, preserved item id", "item_id", item.ID, "from", oldSF.Path, "to", cand.path)
-	return true
+	return true, nil
 }
 
 func (s *Service) ensureSeriesTx(tx *gorm.DB, lib *model.Library, ps *preparedSeries, personCache map[string]string) (*model.Item, error) {
@@ -1580,13 +1757,19 @@ func (s *Service) ensureSeriesTx(tx *gorm.DB, lib *model.Library, ps *preparedSe
 		return nil, err
 	}
 	s.syncFTSTx(tx, &series)
-	s.syncImagesTx(tx, series.ID, ps.images)
+	if err := s.syncImagesTx(tx, series.ID, ps.images); err != nil {
+		return nil, err
+	}
 	locks := s.loadLockedFieldsTx(tx, series.ID)
 	if !locks["genres"] {
-		s.syncGenresAndTagsTx(tx, series.ID, ps.genres, ps.tags)
+		if err := s.syncGenresAndTagsTx(tx, series.ID, ps.genres, ps.tags); err != nil {
+			return nil, err
+		}
 	}
 	if ps.hasNFO {
-		s.syncPeopleTx(tx, series.ID, ps.dir, ps.snap, ps.nfo, personCache)
+		if err := s.syncPeopleTx(tx, series.ID, ps.dir, ps.snap, ps.nfo, personCache); err != nil {
+			return nil, err
+		}
 	}
 	return &series, nil
 }
@@ -1627,7 +1810,9 @@ func (s *Service) ensureSeasonTx(tx *gorm.DB, lib *model.Library, series *model.
 		return nil, err
 	}
 	if pSeas.poster != nil {
-		s.syncImagesTx(tx, season.ID, map[string]fileMeta{"Primary": *pSeas.poster})
+		if err := s.syncImagesTx(tx, season.ID, map[string]fileMeta{"Primary": *pSeas.poster}); err != nil {
+			return nil, err
+		}
 	}
 	return &season, nil
 }
@@ -1680,17 +1865,30 @@ func (s *Service) writeMovieTx(tx *gorm.DB, lib *model.Library, p *preparedInges
 	}
 
 	s.syncFTSTx(tx, &item)
-	sourceID := s.saveMediaSourceTx(tx, &item, p.cand, p.mediaSource)
-	s.syncSidecarSubtitlesTx(tx, item.ID, sourceID, p.stem, p.subtitles)
-	s.syncImagesTx(tx, item.ID, p.images)
+	sourceID, err := s.saveMediaSourceTx(tx, &item, p.cand, p.mediaSource)
+	if err != nil {
+		return "", false, err
+	}
+	if err := s.syncSidecarSubtitlesTx(tx, item.ID, sourceID, p.stem, p.subtitles); err != nil {
+		return "", false, err
+	}
+	if err := s.syncImagesTx(tx, item.ID, p.images); err != nil {
+		return "", false, err
+	}
 	locks := s.loadLockedFieldsTx(tx, item.ID)
 	if !locks["genres"] {
-		s.syncGenresAndTagsTx(tx, item.ID, p.genres, p.tags)
+		if err := s.syncGenresAndTagsTx(tx, item.ID, p.genres, p.tags); err != nil {
+			return "", false, err
+		}
 	}
 	if p.hasNFO {
-		s.syncPeopleTx(tx, item.ID, p.cand.dir, p.snap, p.nfo, personCache)
+		if err := s.syncPeopleTx(tx, item.ID, p.cand.dir, p.snap, p.nfo, personCache); err != nil {
+			return "", false, err
+		}
 	}
-	s.upsertScanFileTx(tx, lib.ID, p.cand, p.depHash, item.ID, runID)
+	if err := s.upsertScanFileTx(tx, lib.ID, p.cand, p.depHash, item.ID, runID); err != nil {
+		return "", false, err
+	}
 	return item.ID, added, nil
 }
 
@@ -1741,43 +1939,56 @@ func (s *Service) writeEpisodeTx(tx *gorm.DB, lib *model.Library, seriesItem, se
 	}
 
 	s.syncFTSTx(tx, &epItem)
-	sourceID := s.saveMediaSourceTx(tx, &epItem, p.cand, p.mediaSource)
-	s.syncSidecarSubtitlesTx(tx, epItem.ID, sourceID, p.stem, p.subtitles)
-	s.syncImagesTx(tx, epItem.ID, p.images)
-	s.upsertScanFileTx(tx, lib.ID, p.cand, p.depHash, epItem.ID, runID)
+	sourceID, err := s.saveMediaSourceTx(tx, &epItem, p.cand, p.mediaSource)
+	if err != nil {
+		return "", false, err
+	}
+	if err := s.syncSidecarSubtitlesTx(tx, epItem.ID, sourceID, p.stem, p.subtitles); err != nil {
+		return "", false, err
+	}
+	if err := s.syncImagesTx(tx, epItem.ID, p.images); err != nil {
+		return "", false, err
+	}
+	if err := s.upsertScanFileTx(tx, lib.ID, p.cand, p.depHash, epItem.ID, runID); err != nil {
+		return "", false, err
+	}
 	return epItem.ID, added, nil
 }
 
-func (s *Service) saveMediaSourceTx(tx *gorm.DB, item *model.Item, cand scanCandidate, ms preparedMediaSource) string {
+func (s *Service) saveMediaSourceTx(tx *gorm.DB, item *model.Item, cand scanCandidate, ms preparedMediaSource) (string, error) {
 	sourceID := StableID("src", cand.path)
 	src := model.MediaSource{
 		ID:           sourceID,
 		ItemID:       item.ID,
 		SourceType:   ms.sourceType,
-		Path:         cand.path,
-		StrmURL:      ms.strmURL,
+		Path:         TruncateRunes(cand.path, 1024),
+		StrmURL:      SanitizeUTF8(ms.strmURL),
 		FileSize:     cand.size,
 		FileMtime:    cand.mtime,
 		Fingerprint:  Fingerprint(cand.path, cand.size),
-		VersionLabel: ms.versionLabel,
-		Container:    ms.container,
-		VideoCodec:   ms.videoCodec,
+		VersionLabel: TruncateRunes(ms.versionLabel, 128),
+		Container:    TruncateRunes(ms.container, 32),
+		VideoCodec:   TruncateRunes(ms.videoCodec, 32),
 		Width:        ms.width,
 		Height:       ms.height,
-		HDRType:      ms.hdrType,
+		HDRType:      TruncateRunes(ms.hdrType, 32),
 		DurationSecs: ms.durationSecs,
 		Bitrate:      ms.bitrate,
-		ProbeJSON:    ms.probeJSON,
+		ProbeJSON:    SanitizeUTF8(ms.probeJSON),
 		ProbedAt:     ms.probedAt,
 	}
-	_ = tx.Save(&src).Error
-	return sourceID
+	if err := tx.Save(&src).Error; err != nil {
+		return "", err
+	}
+	return sourceID, nil
 }
 
-func (s *Service) syncSidecarSubtitlesTx(tx *gorm.DB, itemID, sourceID, mediaStem string, subs []fileMeta) {
-	_ = tx.Where("media_source_id = ? AND is_external = ?", sourceID, true).Delete(&model.MediaSubtitle{}).Error
+func (s *Service) syncSidecarSubtitlesTx(tx *gorm.DB, itemID, sourceID, mediaStem string, subs []fileMeta) error {
+	if err := tx.Where("media_source_id = ? AND is_external = ?", sourceID, true).Delete(&model.MediaSubtitle{}).Error; err != nil {
+		return err
+	}
 	if len(subs) == 0 {
-		return
+		return nil
 	}
 	idx := 100
 	batch := make([]model.MediaSubtitle, 0, len(subs))
@@ -1793,23 +2004,24 @@ func (s *Service) syncSidecarSubtitlesTx(tx *gorm.DB, itemID, sourceID, mediaSte
 			ItemID:        itemID,
 			StreamIndex:   idx,
 			IsExternal:    true,
-			Path:          sub.path,
-			Language:      lang,
-			Title:         title,
-			Codec:         codec,
+			Path:          TruncateRunes(sub.path, 1024),
+			Language:      TruncateRunes(lang, 32),
+			Title:         TruncateRunes(title, 128),
+			Codec:         TruncateRunes(codec, 32),
 			IsDefault:     isDef,
 			IsForced:      isForced,
 		})
 		idx++
 	}
 	if len(batch) > 0 {
-		_ = tx.Create(&batch).Error
+		return tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(&batch).Error
 	}
+	return nil
 }
 
-func (s *Service) syncImagesTx(tx *gorm.DB, itemID string, images map[string]fileMeta) {
+func (s *Service) syncImagesTx(tx *gorm.DB, itemID string, images map[string]fileMeta) error {
 	if len(images) == 0 {
-		return
+		return nil
 	}
 	now := time.Now().UTC()
 	for kind, fm := range images {
@@ -1820,21 +2032,26 @@ func (s *Service) syncImagesTx(tx *gorm.DB, itemID string, images map[string]fil
 			Kind:       kind,
 			IndexNum:   0,
 			SourceType: "local",
-			SourceRef:  fm.path,
+			SourceRef:  TruncateRunes(fm.path, 1024),
 			Tag:        tag,
 			UpdatedAt:  now,
 		}
-		_ = tx.Save(&img).Error
+		if err := tx.Save(&img).Error; err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
-func (s *Service) syncGenresAndTagsTx(tx *gorm.DB, itemID string, genres, tags []string) {
-	_ = tx.Where("item_id = ?", itemID).Delete(&model.ItemGenre{}).Error
+func (s *Service) syncGenresAndTagsTx(tx *gorm.DB, itemID string, genres, tags []string) error {
+	if err := tx.Where("item_id = ?", itemID).Delete(&model.ItemGenre{}).Error; err != nil {
+		return err
+	}
 	if len(genres) > 0 {
 		seenG := make(map[string]bool, len(genres))
 		batchG := make([]model.ItemGenre, 0, len(genres))
 		for _, g := range genres {
-			g = strings.TrimSpace(g)
+			g = TruncateRunes(strings.TrimSpace(g), 128)
 			if g == "" || seenG[g] {
 				continue
 			}
@@ -1842,16 +2059,20 @@ func (s *Service) syncGenresAndTagsTx(tx *gorm.DB, itemID string, genres, tags [
 			batchG = append(batchG, model.ItemGenre{ItemID: itemID, Genre: g})
 		}
 		if len(batchG) > 0 {
-			_ = tx.Create(&batchG).Error
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&batchG).Error; err != nil {
+				return err
+			}
 		}
 	}
 
-	_ = tx.Where("item_id = ?", itemID).Delete(&model.ItemTag{}).Error
+	if err := tx.Where("item_id = ?", itemID).Delete(&model.ItemTag{}).Error; err != nil {
+		return err
+	}
 	if len(tags) > 0 {
 		seenT := make(map[string]bool, len(tags))
 		batchT := make([]model.ItemTag, 0, len(tags))
 		for _, t := range tags {
-			t = strings.TrimSpace(t)
+			t = TruncateRunes(strings.TrimSpace(t), 128)
 			if t == "" || seenT[t] {
 				continue
 			}
@@ -1859,21 +2080,26 @@ func (s *Service) syncGenresAndTagsTx(tx *gorm.DB, itemID string, genres, tags [
 			batchT = append(batchT, model.ItemTag{ItemID: itemID, Tag: t})
 		}
 		if len(batchT) > 0 {
-			_ = tx.Create(&batchT).Error
+			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&batchT).Error; err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
-func (s *Service) syncPeopleTx(tx *gorm.DB, itemID, dir string, snap *dirSnapshot, nfo *NFO, personCache map[string]string) {
-	_ = tx.Where("item_id = ?", itemID).Delete(&model.ItemPerson{}).Error
+func (s *Service) syncPeopleTx(tx *gorm.DB, itemID, dir string, snap *dirSnapshot, nfo *NFO, personCache map[string]string) error {
+	if err := tx.Where("item_id = ?", itemID).Delete(&model.ItemPerson{}).Error; err != nil {
+		return err
+	}
 	if nfo == nil || (len(nfo.Actors) == 0 && len(nfo.Directors) == 0) {
-		return
+		return nil
 	}
 
 	now := time.Now().UTC()
-	upsertPerson := func(name, rawThumb string) string {
+	upsertPerson := func(name, rawThumb string) (string, error) {
 		pid := StableID("person", strings.ToLower(name))
-		thumb := strings.TrimSpace(rawThumb)
+		thumb := strings.TrimSpace(SanitizeUTF8(rawThumb))
 		if thumb != "" && !strings.HasPrefix(strings.ToLower(thumb), "http://") && !strings.HasPrefix(strings.ToLower(thumb), "https://") && !filepath.IsAbs(thumb) {
 			cand := filepath.Join(dir, thumb)
 			if _, err := os.Stat(cand); err == nil {
@@ -1885,77 +2111,103 @@ func (s *Service) syncPeopleTx(tx *gorm.DB, itemID, dir string, snap *dirSnapsho
 		if localActor := snap.findLocalActorThumb(name); localActor != "" {
 			thumb = localActor
 		}
+		thumb = TruncateRunes(thumb, 1024)
 
 		// Skip redundant DB write if we already synced this person in this scan run with no better thumb.
 		if cachedThumb, ok := personCache[pid]; ok {
 			if thumb == "" || cachedThumb == thumb || (cachedThumb != "" && !filepath.IsAbs(thumb)) {
-				return pid
+				return pid, nil
 			}
 		}
 
 		var existing model.Person
-		if err := tx.Where("id = ?", pid).First(&existing).Error; err == nil {
+		err := tx.Where("id = ?", pid).First(&existing).Error
+		if err == nil {
 			updates := map[string]any{"name": name, "updated_at": now}
 			finalThumb := existing.ThumbPath
 			if thumb != "" && (existing.ThumbPath == "" || filepath.IsAbs(thumb)) {
 				updates["thumb_path"] = thumb
 				finalThumb = thumb
 			}
-			_ = tx.Model(&existing).Updates(updates).Error
+			if err := tx.Model(&existing).Updates(updates).Error; err != nil {
+				return "", err
+			}
 			personCache[pid] = finalThumb
-		} else {
-			_ = tx.Create(&model.Person{
+		} else if errors.Is(err, gorm.ErrRecordNotFound) {
+			pRow := model.Person{
 				ID:        pid,
 				Name:      name,
 				ThumbPath: thumb,
 				UpdatedAt: now,
-			}).Error
+			}
+			if err := tx.Clauses(clause.OnConflict{
+				Columns: []clause.Column{{Name: "id"}},
+				DoUpdates: clause.Assignments(map[string]any{
+					"name":       name,
+					"updated_at": now,
+				}),
+			}).Create(&pRow).Error; err != nil {
+				return "", err
+			}
 			personCache[pid] = thumb
+		} else {
+			return "", err
 		}
-		return pid
+		return pid, nil
 	}
 
 	seenLink := map[string]bool{}
 	idx := 0
 	for _, a := range nfo.Actors {
-		name := strings.TrimSpace(a.Name)
+		name := TruncateRunes(strings.TrimSpace(a.Name), 256)
 		if name == "" {
 			continue
 		}
-		pid := upsertPerson(name, a.Thumb)
+		pid, err := upsertPerson(name, a.Thumb)
+		if err != nil {
+			return err
+		}
 		k := pid + "|Actor"
 		if seenLink[k] {
 			continue
 		}
 		seenLink[k] = true
-		_ = tx.Save(&model.ItemPerson{
+		if err := tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(&model.ItemPerson{
 			ItemID:   itemID,
 			PersonID: pid,
 			RoleType: "Actor",
-			RoleName: strings.TrimSpace(a.Role),
+			RoleName: TruncateRunes(strings.TrimSpace(a.Role), 256),
 			SortIdx:  idx,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
 		idx++
 	}
 	for _, d := range nfo.Directors {
-		name := strings.TrimSpace(d)
+		name := TruncateRunes(strings.TrimSpace(d), 256)
 		if name == "" {
 			continue
 		}
-		pid := upsertPerson(name, "")
+		pid, err := upsertPerson(name, "")
+		if err != nil {
+			return err
+		}
 		k := pid + "|Director"
 		if seenLink[k] {
 			continue
 		}
 		seenLink[k] = true
-		_ = tx.Save(&model.ItemPerson{
+		if err := tx.Clauses(clause.OnConflict{UpdateAll: true}).Create(&model.ItemPerson{
 			ItemID:   itemID,
 			PersonID: pid,
 			RoleType: "Director",
 			SortIdx:  idx,
-		}).Error
+		}).Error; err != nil {
+			return err
+		}
 		idx++
 	}
+	return nil
 }
 
 func (s *Service) syncFTSTx(tx *gorm.DB, item *model.Item) {
@@ -1967,11 +2219,11 @@ func (s *Service) syncFTSTx(tx *gorm.DB, item *model.Item) {
 		item.ID, item.Name, item.OriginalName, item.PinyinInitials).Error
 }
 
-func (s *Service) upsertScanFileTx(tx *gorm.DB, libID string, cand scanCandidate, depHash, itemID, runID string) {
-	_ = tx.Save(&model.ScanFile{
+func (s *Service) upsertScanFileTx(tx *gorm.DB, libID string, cand scanCandidate, depHash, itemID, runID string) error {
+	return tx.Save(&model.ScanFile{
 		LibraryID:   libID,
-		Path:        cand.path,
-		DirPath:     cand.dir,
+		Path:        TruncateRunes(cand.path, 1024),
+		DirPath:     TruncateRunes(cand.dir, 1024),
 		Size:        cand.size,
 		Mtime:       cand.mtime,
 		Fingerprint: Fingerprint(cand.path, cand.size),
