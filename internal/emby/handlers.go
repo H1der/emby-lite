@@ -1250,6 +1250,45 @@ func (h *Handler) GetSimilar(c *gin.Context) {
 		}
 	}
 
+	preferLibID := item.LibraryID
+	if targetItem != nil && targetItem.LibraryID != "" {
+		preferLibID = targetItem.LibraryID
+	}
+
+	// Isolate hidden / excluded libraries:
+	// - When viewing an item in a normal library, never leak items from Hidden, !ShowInMyMedia, or MyMediaExcludes libraries.
+	// - When viewing an item inside a hidden/excluded library, keep recommendations strictly within that same library.
+	var userCfg UserConfiguration
+	if p != nil && p.User != nil {
+		userCfg = h.loadUserConfig(p.User.ID)
+	}
+	myMediaExc := idSliceToSet(userCfg.MyMediaExcludes)
+	var visibleLibs []model.Library
+	_ = h.db.Read().Select("id, hidden, show_in_my_media").Where("id IN ?", visibleIDs).Find(&visibleLibs).Error
+	isLibHidden := func(l model.Library) bool {
+		return l.Hidden || !l.ShowInMyMedia || myMediaExc[l.ID]
+	}
+	targetIsHidden := myMediaExc[preferLibID]
+	for _, l := range visibleLibs {
+		if l.ID == preferLibID {
+			targetIsHidden = isLibHidden(l)
+			break
+		}
+	}
+	var candidateLibIDs []string
+	if targetIsHidden {
+		candidateLibIDs = []string{preferLibID}
+	} else {
+		for _, l := range visibleLibs {
+			if !isLibHidden(l) {
+				candidateLibIDs = append(candidateLibIDs, l.ID)
+			}
+		}
+		if len(candidateLibIDs) == 0 && preferLibID != "" {
+			candidateLibIDs = []string{preferLibID}
+		}
+	}
+
 	excludeSet := map[string]bool{item.ID: true}
 	if targetItem != nil && targetItem.ID != "" {
 		excludeSet[targetItem.ID] = true
@@ -1261,39 +1300,311 @@ func (h *Handler) GetSimilar(c *gin.Context) {
 	for eid := range excludeSet {
 		excludeIDs = append(excludeIDs, eid)
 	}
+	hidePlayed := p != nil && p.User != nil && userCfg.HidePlayedInMoreLikeThis
+	playedSet := map[string]bool{}
+	if hidePlayed {
+		var playedIDs []string
+		_ = h.db.Read().Model(&model.UserData{}).
+			Where("user_id = ? AND played = ?", p.User.ID, true).
+			Pluck("item_id", &playedIDs).Error
+		for _, pid := range playedIDs {
+			playedSet[pid] = true
+		}
+	}
+
+	rdb := h.db.Read()
+	scores := make(map[string]int, 128)
+	genreMatchCounts := make(map[string]int, 128)
+	addScore := func(id string, delta int) {
+		if id == "" || excludeSet[id] || playedSet[id] {
+			return
+		}
+		scores[id] += delta
+	}
 
 	var targetGenres []string
 	if targetItem != nil {
-		_ = h.db.Read().Model(&model.ItemGenre{}).Where("item_id = ?", targetItem.ID).Pluck("genre", &targetGenres).Error
+		// 1. Same BoxSet / Collection siblings (+120).
+		var boxIDs []string
+		_ = rdb.Model(&model.BoxSetItem{}).Where("item_id = ?", targetItem.ID).Pluck("box_set_id", &boxIDs).Error
+		if len(boxIDs) > 0 {
+			var siblingIDs []string
+			_ = rdb.Table("box_set_items bs").
+				Select("DISTINCT bs.item_id").
+				Joins("JOIN items i ON i.id = bs.item_id").
+				Where("bs.box_set_id IN ? AND i.library_id IN ? AND i.type = ? AND i.id NOT IN ? AND i.soft_deleted_at IS NULL",
+					boxIDs, candidateLibIDs, targetType, excludeIDs).
+				Pluck("bs.item_id", &siblingIDs).Error
+			for _, sid := range siblingIDs {
+				addScore(sid, 120)
+			}
+		}
+
+		// 2. Shared Directors (+50), Writers (+25), and top-billed Cast (+18).
+		type targetPersonRow struct {
+			PersonID string
+			RoleType string
+		}
+		var tPeople []targetPersonRow
+		_ = rdb.Table("item_people").
+			Select("person_id, role_type").
+			Where("item_id = ? AND role_type IN ?", targetItem.ID, []string{"Director", "Writer", "Actor", "GuestStar"}).
+			Order("sort_idx ASC, person_id ASC").
+			Scan(&tPeople).Error
+		var directorIDs, writerIDs, actorIDs []string
+		seenP := map[string]bool{}
+		for _, tp := range tPeople {
+			key := tp.RoleType + ":" + tp.PersonID
+			if tp.PersonID == "" || seenP[key] {
+				continue
+			}
+			seenP[key] = true
+			switch tp.RoleType {
+			case "Director":
+				if len(directorIDs) < 3 {
+					directorIDs = append(directorIDs, tp.PersonID)
+				}
+			case "Writer":
+				if len(writerIDs) < 3 {
+					writerIDs = append(writerIDs, tp.PersonID)
+				}
+			case "Actor", "GuestStar":
+				if len(actorIDs) < 10 {
+					actorIDs = append(actorIDs, tp.PersonID)
+				}
+			}
+		}
+		type itemCntRow struct {
+			ItemID string
+			Cnt    int
+		}
+		scoreByPeople := func(personIDs []string, roles []string, weight int) {
+			if len(personIDs) == 0 {
+				return
+			}
+			var hits []itemCntRow
+			_ = rdb.Table("item_people ip").
+				Select("ip.item_id AS item_id, COUNT(DISTINCT ip.person_id) AS cnt").
+				Joins("JOIN items i ON i.id = ip.item_id").
+				Where("ip.person_id IN ? AND ip.role_type IN ? AND i.library_id IN ? AND i.type = ? AND i.id NOT IN ? AND i.soft_deleted_at IS NULL",
+					personIDs, roles, candidateLibIDs, targetType, excludeIDs).
+				Group("ip.item_id").
+				Order("cnt DESC").
+				Limit(200).
+				Scan(&hits).Error
+			for _, h := range hits {
+				addScore(h.ItemID, h.Cnt*weight)
+			}
+		}
+		scoreByPeople(directorIDs, []string{"Director"}, 50)
+		scoreByPeople(writerIDs, []string{"Writer"}, 25)
+		scoreByPeople(actorIDs, []string{"Actor", "GuestStar"}, 18)
+
+		// 3. Shared Tags (+20 each).
+		var targetTags []string
+		_ = rdb.Model(&model.ItemTag{}).Where("item_id = ?", targetItem.ID).Pluck("tag", &targetTags).Error
+		if len(targetTags) > 0 {
+			var hits []itemCntRow
+			_ = rdb.Table("item_tags it").
+				Select("it.item_id AS item_id, COUNT(DISTINCT it.tag) AS cnt").
+				Joins("JOIN items i ON i.id = it.item_id").
+				Where("it.tag IN ? AND i.library_id IN ? AND i.type = ? AND i.id NOT IN ? AND i.soft_deleted_at IS NULL",
+					targetTags, candidateLibIDs, targetType, excludeIDs).
+				Group("it.item_id").
+				Order("cnt DESC").
+				Limit(300).
+				Scan(&hits).Error
+			for _, h := range hits {
+				addScore(h.ItemID, h.Cnt*20)
+			}
+		}
+
+		// 4. Shared Genres (+15 each, plus +10 exact-set bonus when >= 2 genres all match).
+		_ = rdb.Model(&model.ItemGenre{}).Where("item_id = ?", targetItem.ID).Pluck("genre", &targetGenres).Error
+		if len(targetGenres) > 0 {
+			var hits []itemCntRow
+			_ = rdb.Table("item_genres ig").
+				Select("ig.item_id AS item_id, COUNT(DISTINCT ig.genre) AS cnt").
+				Joins("JOIN items i ON i.id = ig.item_id").
+				Where("ig.genre IN ? AND i.library_id IN ? AND i.type = ? AND i.id NOT IN ? AND i.soft_deleted_at IS NULL",
+					targetGenres, candidateLibIDs, targetType, excludeIDs).
+				Group("ig.item_id").
+				Order(gorm.Expr("cnt DESC, CASE WHEN i.library_id = ? THEN 0 ELSE 1 END ASC, i.community_rating DESC", preferLibID)).
+				Limit(300).
+				Scan(&hits).Error
+			for _, h := range hits {
+				genreMatchCounts[h.ItemID] = h.Cnt
+				bonus := h.Cnt * 15
+				if len(targetGenres) >= 2 && h.Cnt == len(targetGenres) {
+					bonus += 10
+				}
+				addScore(h.ItemID, bonus)
+			}
+		}
 	}
 
-	q := h.db.Read().Model(&model.Item{}).
-		Where("items.library_id IN ? AND items.type = ? AND items.id NOT IN ? AND items.soft_deleted_at IS NULL",
-			visibleIDs, targetType, excludeIDs)
-	if p != nil && p.User != nil && h.loadUserConfig(p.User.ID).HidePlayedInMoreLikeThis {
-		q = q.Where("items.id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true)
+	// Pick top scored candidate IDs and refine with library/studio/country/year similarity.
+	type scoredID struct {
+		id    string
+		score int
 	}
-
-	preferLibID := item.LibraryID
-	if targetItem != nil && targetItem.LibraryID != "" {
-		preferLibID = targetItem.LibraryID
+	rankedIDs := make([]scoredID, 0, len(scores))
+	for id, sc := range scores {
+		if sc > 0 {
+			rankedIDs = append(rankedIDs, scoredID{id: id, score: sc})
+		}
 	}
-	if len(targetGenres) > 0 {
-		q = q.Order(gorm.Expr(
-			"(SELECT COUNT(*) FROM item_genres ig WHERE ig.item_id = items.id AND ig.genre IN ?) DESC, CASE WHEN items.library_id = ? THEN 0 ELSE 1 END ASC, items.community_rating DESC, items.added_at DESC, items.id ASC",
-			targetGenres, preferLibID,
-		))
-	} else {
-		q = q.Order(gorm.Expr(
-			"CASE WHEN items.library_id = ? THEN 0 ELSE 1 END ASC, items.community_rating DESC, items.added_at DESC, items.id ASC",
-			preferLibID,
-		))
+	sort.Slice(rankedIDs, func(i, j int) bool {
+		if rankedIDs[i].score != rankedIDs[j].score {
+			return rankedIDs[i].score > rankedIDs[j].score
+		}
+		return rankedIDs[i].id < rankedIDs[j].id
+	})
+	poolSize := limit * 4
+	if poolSize < 80 {
+		poolSize = 80
+	}
+	if len(rankedIDs) > poolSize {
+		rankedIDs = rankedIDs[:poolSize]
 	}
 
 	var rows []model.Item
-	_ = q.Limit(limit).Find(&rows).Error
+	if len(rankedIDs) > 0 {
+		poolIDs := make([]string, len(rankedIDs))
+		for i, r := range rankedIDs {
+			poolIDs[i] = r.id
+		}
+		var candidates []model.Item
+		_ = rdb.Model(&model.Item{}).
+			Where("id IN ? AND library_id IN ? AND type = ? AND soft_deleted_at IS NULL", poolIDs, candidateLibIDs, targetType).
+			Find(&candidates).Error
+
+		targetStudios := stringSetFromJSON(targetItem.StudiosJSON)
+		targetCountries := stringSetFromJSON(targetItem.ProductionLocationsJSON)
+
+		type scoredItem struct {
+			item  model.Item
+			score int
+		}
+		scored := make([]scoredItem, 0, len(candidates))
+		for _, cand := range candidates {
+			if excludeSet[cand.ID] || playedSet[cand.ID] {
+				continue
+			}
+			sc := scores[cand.ID]
+			if cand.LibraryID == preferLibID {
+				sc += 12
+			}
+			if len(targetStudios) > 0 && cand.StudiosJSON != "" {
+				matched := overlapCountJSON(cand.StudiosJSON, targetStudios)
+				if matched > 2 {
+					matched = 2
+				}
+				sc += matched * 10
+			}
+			if len(targetCountries) > 0 && cand.ProductionLocationsJSON != "" {
+				matched := overlapCountJSON(cand.ProductionLocationsJSON, targetCountries)
+				if matched > 2 {
+					matched = 2
+				}
+				sc += matched * 8
+			}
+			if targetItem != nil && targetItem.Year > 0 && cand.Year > 0 {
+				diff := targetItem.Year - cand.Year
+				if diff < 0 {
+					diff = -diff
+				}
+				if diff <= 3 {
+					sc += 6
+				} else if diff <= 8 {
+					sc += 3
+				}
+			}
+			scored = append(scored, scoredItem{item: cand, score: sc})
+		}
+		sort.Slice(scored, func(i, j int) bool {
+			if scored[i].score != scored[j].score {
+				return scored[i].score > scored[j].score
+			}
+			if genreMatchCounts[scored[i].item.ID] != genreMatchCounts[scored[j].item.ID] {
+				return genreMatchCounts[scored[i].item.ID] > genreMatchCounts[scored[j].item.ID]
+			}
+			if scored[i].item.CommunityRating != scored[j].item.CommunityRating {
+				return scored[i].item.CommunityRating > scored[j].item.CommunityRating
+			}
+			if !scored[i].item.AddedAt.Equal(scored[j].item.AddedAt) {
+				return scored[i].item.AddedAt.After(scored[j].item.AddedAt)
+			}
+			return scored[i].item.ID < scored[j].item.ID
+		})
+		for _, s := range scored {
+			rows = append(rows, s.item)
+			excludeSet[s.item.ID] = true
+			if len(rows) >= limit {
+				break
+			}
+		}
+	}
+
+	// Only backfill from the SAME library when genuinely similar matches are fewer than limit
+	// (never pad with unrelated items from other or hidden libraries).
+	if len(rows) < limit && preferLibID != "" {
+		rem := limit - len(rows)
+		backfillExclude := make([]string, 0, len(excludeSet))
+		for eid := range excludeSet {
+			backfillExclude = append(backfillExclude, eid)
+		}
+		var fallback []model.Item
+		fbQ := rdb.Model(&model.Item{}).
+			Where("library_id = ? AND type = ? AND id NOT IN ? AND soft_deleted_at IS NULL",
+				preferLibID, targetType, backfillExclude)
+		if hidePlayed {
+			fbQ = fbQ.Where("id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true)
+		}
+		_ = fbQ.Order("community_rating DESC, added_at DESC, id ASC").
+			Limit(rem).
+			Find(&fallback).Error
+		rows = append(rows, fallback...)
+	}
+
 	out := h.itemsToDTOs(c.Request, p, rows, fieldsNeedDetail(queryAllCI(c, "Fields")))
 	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": len(out), "StartIndex": 0})
+}
+
+func stringSetFromJSON(raw string) map[string]bool {
+	if strings.TrimSpace(raw) == "" || raw == "[]" {
+		return nil
+	}
+	var list []string
+	if json.Unmarshal([]byte(raw), &list) != nil || len(list) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(list))
+	for _, s := range list {
+		if k := strings.ToLower(strings.TrimSpace(s)); k != "" {
+			set[k] = true
+		}
+	}
+	return set
+}
+
+func overlapCountJSON(raw string, target map[string]bool) int {
+	if len(target) == 0 || strings.TrimSpace(raw) == "" || raw == "[]" {
+		return 0
+	}
+	var list []string
+	if json.Unmarshal([]byte(raw), &list) != nil || len(list) == 0 {
+		return 0
+	}
+	seen := map[string]bool{}
+	cnt := 0
+	for _, s := range list {
+		if k := strings.ToLower(strings.TrimSpace(s)); k != "" && target[k] && !seen[k] {
+			seen[k] = true
+			cnt++
+		}
+	}
+	return cnt
 }
 
 func (h *Handler) resolveParentSeries(item *model.Item) *model.Item {

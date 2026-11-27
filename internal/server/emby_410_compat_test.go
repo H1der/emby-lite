@@ -1016,4 +1016,90 @@ func TestDailyUseFixesSimilarPathRandomAndYambySearchSort(t *testing.T) {
 	if len(playCntDesc.Items) != 4 || playCntDesc.Items[0].ID != "mv-h" {
 		t.Fatalf("PlayCount DESC expected mv-h first, got %+v", playCntDesc.Items)
 	}
+
+	// 5. Similar items MUST isolate hidden / !ShowInMyMedia / MyMediaExcludes libraries even for admin,
+	// and rank by multi-signal similarity (BoxSet, Director, Actor, Tag, multiple Genres).
+	hidDir := filepath.Join(tmp, "hidden-lib")
+	exclDir := filepath.Join(tmp, "excl-lib")
+	_ = os.MkdirAll(hidDir, 0o755)
+	_ = os.MkdirAll(exclDir, 0o755)
+	falseVal := false
+	recHidLib := doJSON(t, h, http.MethodPost, "/api/admin/libraries", tok, map[string]any{
+		"name":   "隐藏私密库",
+		"kind":   "movies",
+		"paths":  []string{hidDir},
+		"hidden": true,
+	})
+	var hidLibResp struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(recHidLib.Body.Bytes(), &hidLibResp)
+	recExclLib := doJSON(t, h, http.MethodPost, "/api/admin/libraries", tok, map[string]any{
+		"name":             "首页隐藏库",
+		"kind":             "movies",
+		"paths":            []string{exclDir},
+		"show_in_my_media": &falseVal,
+	})
+	var exclLibResp struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(recExclLib.Body.Bytes(), &exclLibResp)
+
+	// Add high-rated movies in hidden & excluded libraries sharing ALL genres/director with mv-s (沙丘).
+	hidMov := model.Item{ID: "mv-hidden-1", LibraryID: hidLibResp.ID, ParentID: hidLibResp.ID, Type: "Movie", Name: "隐藏库高分片", SortName: "h1", Year: 2021, CommunityRating: 9.9, ScanKey: "df:hid1", RandomKey: "rh1", AddedAt: now, CreatedAt: now, UpdatedAt: now}
+	hidMov2 := model.Item{ID: "mv-hidden-2", LibraryID: hidLibResp.ID, ParentID: hidLibResp.ID, Type: "Movie", Name: "隐藏库同款片", SortName: "h2", Year: 2022, CommunityRating: 8.5, ScanKey: "df:hid2", RandomKey: "rh2", AddedAt: now, CreatedAt: now, UpdatedAt: now}
+	exclMov := model.Item{ID: "mv-excl-1", LibraryID: exclLibResp.ID, ParentID: exclLibResp.ID, Type: "Movie", Name: "首页隐藏高分片", SortName: "e1", Year: 2021, CommunityRating: 9.8, ScanKey: "df:exc1", RandomKey: "re1", AddedAt: now, CreatedAt: now, UpdatedAt: now}
+	// Normal library movies: mv-s2 (same BoxSet + Director + 2 Genres -> #1), mv-arrival (same Director + 1 Genre -> #2).
+	mvS2 := model.Item{ID: "mv-s2", LibraryID: mvLibID, ParentID: mvLibID, Type: "Movie", Name: "沙丘2", SortName: "shaqiu2", Year: 2024, CommunityRating: 8.6, StudiosJSON: `["Legendary"]`, ScanKey: "df:mvs2", RandomKey: "rs2", AddedAt: now, CreatedAt: now, UpdatedAt: now}
+	mvArrival := model.Item{ID: "mv-arrival", LibraryID: mvLibID, ParentID: mvLibID, Type: "Movie", Name: "降临", SortName: "jianglin", Year: 2016, CommunityRating: 8.0, ScanKey: "df:mvarrival", RandomKey: "rarr", AddedAt: now, CreatedAt: now, UpdatedAt: now}
+	for _, it := range []*model.Item{&hidMov, &hidMov2, &exclMov, &mvS2, &mvArrival} {
+		if err := srv.DB.Gorm.Create(it).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Give mv-s multiple genres (科幻, 冒险) to also verify multi-element IN clause!
+	_ = srv.DB.Gorm.Create(&model.ItemGenre{ItemID: "mv-s", Genre: "冒险"}).Error
+	for _, id := range []string{hidMov.ID, exclMov.ID, mvS2.ID} {
+		_ = srv.DB.Gorm.Create(&model.ItemGenre{ItemID: id, Genre: "科幻"}).Error
+		_ = srv.DB.Gorm.Create(&model.ItemGenre{ItemID: id, Genre: "冒险"}).Error
+		_ = srv.DB.Gorm.Create(&model.ItemPerson{ItemID: id, PersonID: "per-dv", RoleType: "Director"}).Error
+	}
+	_ = srv.DB.Gorm.Create(&model.ItemGenre{ItemID: mvArrival.ID, Genre: "科幻"}).Error
+	_ = srv.DB.Gorm.Create(&model.ItemPerson{ItemID: mvArrival.ID, PersonID: "per-dv", RoleType: "Director"}).Error
+	_ = srv.DB.Gorm.Create(&model.BoxSetItem{BoxSetID: "box-dune", ItemID: "mv-s", SortIdx: 0}).Error
+	_ = srv.DB.Gorm.Create(&model.BoxSetItem{BoxSetID: "box-dune", ItemID: mvS2.ID, SortIdx: 1}).Error
+
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/mv-s/Similar?Limit=12", tok, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("similar for mv-s failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var mvSim struct {
+		Items []struct {
+			ID string `json:"Id"`
+		} `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &mvSim)
+	if len(mvSim.Items) < 2 {
+		t.Fatalf("expected similar movies for mv-s, got %+v", mvSim.Items)
+	}
+	for _, it := range mvSim.Items {
+		if it.ID == hidMov.ID || it.ID == hidMov2.ID || it.ID == exclMov.ID {
+			t.Fatalf("normal library similar leaked hidden/excluded library item %s: %+v", it.ID, mvSim.Items)
+		}
+	}
+	if mvSim.Items[0].ID != mvS2.ID || mvSim.Items[1].ID != mvArrival.ID {
+		t.Fatalf("expected similarity order [mv-s2, mv-arrival, ...], got %+v", mvSim.Items)
+	}
+
+	// Viewing an item INSIDE a hidden library should stay strictly inside that hidden library.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/"+hidMov.ID+"/Similar?Limit=12", tok, nil)
+	var hidSim struct {
+		Items []struct {
+			ID string `json:"Id"`
+		} `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &hidSim)
+	if len(hidSim.Items) != 1 || hidSim.Items[0].ID != hidMov2.ID {
+		t.Fatalf("hidden library item similar must stay within same hidden library, got %+v", hidSim.Items)
+	}
 }
