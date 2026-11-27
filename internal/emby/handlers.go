@@ -1,6 +1,7 @@
 package emby
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -983,6 +984,12 @@ func (h *Handler) GetItemDetail(c *gin.Context) {
 
 	var item model.Item
 	if err := h.db.Gorm.Where("id = ? AND soft_deleted_at IS NULL", itemID).First(&item).Error; err != nil {
+		// Standard Emby clients (Yamby, Emby Official, Infuse, etc.) also fetch Person details via /Users/:userId/Items/:personId.
+		var pr model.Person
+		if pErr := h.db.Gorm.Where("id = ?", itemID).First(&pr).Error; pErr == nil {
+			c.JSON(http.StatusOK, h.personDTO(c.Request.Context(), p, &pr, h.embyMetadataDir(), h.canLookupTMDBPortraits(), nil))
+			return
+		}
 		jsonErr(c, http.StatusNotFound, "item not found")
 		return
 	}
@@ -990,7 +997,11 @@ func (h *Handler) GetItemDetail(c *gin.Context) {
 		jsonErr(c, http.StatusNotFound, "item not found")
 		return
 	}
-	c.JSON(http.StatusOK, h.itemDTO(c.Request, p, &item, true))
+	dto := h.itemDTO(c.Request, p, &item, true)
+	if selectedSourceID := strings.TrimSpace(queryCI(c, "MediaSourceId")); selectedSourceID != "" {
+		applySelectedMediaSourceToItemDTO(dto, item.ID, selectedSourceID)
+	}
+	c.JSON(http.StatusOK, dto)
 }
 
 func (h *Handler) GetLatest(c *gin.Context) {
@@ -2064,6 +2075,12 @@ func (h *Handler) GetItemImage(c *gin.Context) {
 
 	item := h.getItemByID(itemID)
 	if item == nil {
+		// Standard Emby clients fetch actor/director portraits via /Items/:personId/Images/Primary.
+		var pr model.Person
+		if err := h.db.Gorm.Where("id = ?", itemID).First(&pr).Error; err == nil {
+			h.servePersonImage(c, &pr)
+			return
+		}
 		c.Status(http.StatusNotFound)
 		return
 	}
@@ -2174,19 +2191,11 @@ func (h *Handler) GetPersons(c *gin.Context) {
 	}
 	_ = listQ.Offset(startIndex).Limit(limit).Find(&rows).Error
 	metaDir := h.embyMetadataDir()
+	canTMDB := h.canLookupTMDBPortraits()
+	embyPersonImgCache := make(map[string]bool)
 	items := make([]map[string]any, 0, len(rows))
-	for _, pr := range rows {
-		imgTags := map[string]string{}
-		if pr.ThumbPath != "" || (metaDir != "" && imgpipe.FindEmbyPersonImage(metaDir, pr.Name, pr.TMDBID) != "") {
-			imgTags["Primary"] = h.signTag(p, pr.ID, "Primary", "person")
-		}
-		items = append(items, map[string]any{
-			"Id":        pr.ID,
-			"Name":      pr.Name,
-			"ServerId":  h.serverID(),
-			"Type":      "Person",
-			"ImageTags": imgTags,
-		})
+	for i := range rows {
+		items = append(items, h.personDTO(c.Request.Context(), p, &rows[i], metaDir, canTMDB, embyPersonImgCache))
 	}
 	c.JSON(http.StatusOK, gin.H{"Items": items, "TotalRecordCount": total, "StartIndex": startIndex})
 }
@@ -2199,24 +2208,87 @@ func (h *Handler) GetPersonDetail(c *gin.Context) {
 		jsonErr(c, http.StatusNotFound, "person not found")
 		return
 	}
-	metaDir := h.embyMetadataDir()
+	c.JSON(http.StatusOK, h.personDTO(c.Request.Context(), p, &pr, h.embyMetadataDir(), h.canLookupTMDBPortraits(), nil))
+}
+
+func (h *Handler) personDTO(ctx context.Context, p *auth.Principal, pr *model.Person, metaDir string, canTMDB bool, embyCache map[string]bool) map[string]any {
 	imgTags := map[string]string{}
-	if pr.ThumbPath != "" || (metaDir != "" && imgpipe.FindEmbyPersonImage(metaDir, pr.Name, pr.TMDBID) != "") {
+	if h.personHasPrimaryImage(ctx, metaDir, canTMDB, pr.ID, pr.Name, pr.TMDBID, pr.ThumbPath, embyCache) {
 		imgTags["Primary"] = h.signTag(p, pr.ID, "Primary", "person")
 	}
-	c.JSON(http.StatusOK, map[string]any{
-		"Id":        pr.ID,
-		"Name":      pr.Name,
-		"ServerId":  h.serverID(),
-		"Type":      "Person",
-		"ImageTags": imgTags,
-		"ProviderIds": func() map[string]string {
-			if pr.TMDBID != "" {
-				return map[string]string{"Tmdb": pr.TMDBID}
+	providerIDs := map[string]string{}
+	if pr.TMDBID != "" {
+		providerIDs["Tmdb"] = pr.TMDBID
+	}
+	return map[string]any{
+		"Id":          pr.ID,
+		"Name":        pr.Name,
+		"ServerId":    h.serverID(),
+		"Type":        "Person",
+		"ImageTags":   imgTags,
+		"ProviderIds": providerIDs,
+	}
+}
+
+func isHTTPURL(raw string) bool {
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	return strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")
+}
+
+func (h *Handler) canLookupTMDBPortraits() bool {
+	return h.scraper != nil && h.scraper.HasCredentials()
+}
+
+func personNoImgCacheKey(personID string) string {
+	return "person:noimg:" + personID
+}
+
+func (h *Handler) isPersonPortraitMissing(ctx context.Context, personID string) bool {
+	if h.cache == nil || personID == "" {
+		return false
+	}
+	_, ok := h.cache.Get(ctx, personNoImgCacheKey(personID))
+	return ok
+}
+
+func (h *Handler) markPersonPortraitMissing(ctx context.Context, personID string) {
+	if h.cache == nil || personID == "" {
+		return
+	}
+	_ = h.cache.Set(ctx, personNoImgCacheKey(personID), []byte("1"), 24*time.Hour)
+}
+
+func (h *Handler) personHasPrimaryImage(ctx context.Context, metaDir string, canTMDB bool, personID, name, tmdbID, thumbPath string, embyCache map[string]bool) bool {
+	thumbPath = strings.TrimSpace(thumbPath)
+	if thumbPath != "" {
+		if isHTTPURL(thumbPath) {
+			return true
+		}
+		if fi, err := os.Stat(thumbPath); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+			return true
+		}
+	}
+	if metaDir != "" {
+		if embyCache != nil {
+			if cached, ok := embyCache[personID]; ok {
+				if cached {
+					return true
+				}
+			} else {
+				found := imgpipe.FindEmbyPersonImage(metaDir, name, tmdbID) != ""
+				embyCache[personID] = found
+				if found {
+					return true
+				}
 			}
-			return map[string]string{}
-		}(),
-	})
+		} else if imgpipe.FindEmbyPersonImage(metaDir, name, tmdbID) != "" {
+			return true
+		}
+	}
+	if canTMDB && !h.isPersonPortraitMissing(ctx, personID) {
+		return true
+	}
+	return false
 }
 
 func (h *Handler) GetPersonImage(c *gin.Context) {
@@ -2226,13 +2298,17 @@ func (h *Handler) GetPersonImage(c *gin.Context) {
 		c.Status(http.StatusNotFound)
 		return
 	}
+	h.servePersonImage(c, &pr)
+}
+
+func (h *Handler) servePersonImage(c *gin.Context, pr *model.Person) {
 	maxW := queryIntCI(c, "maxWidth", queryIntCI(c, "width", 0))
 	maxH := queryIntCI(c, "maxHeight", queryIntCI(c, "height", 0))
 	quality := queryIntCI(c, "quality", 85)
 
 	// 1. Local .actors/ or local absolute file path on Person record.
-	if pr.ThumbPath != "" && !strings.HasPrefix(pr.ThumbPath, "http://") && !strings.HasPrefix(pr.ThumbPath, "https://") {
-		if _, err := os.Stat(pr.ThumbPath); err == nil {
+	if pr.ThumbPath != "" && !isHTTPURL(pr.ThumbPath) {
+		if fi, err := os.Stat(pr.ThumbPath); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
 			h.serveLocalImage(c, pr.ThumbPath, pr.ID, maxW, maxH, quality)
 			return
 		}
@@ -2247,21 +2323,26 @@ func (h *Handler) GetPersonImage(c *gin.Context) {
 		}
 	}
 
-	// 3. Remote URL (from NFO/TMDB scrape) or on-demand TMDB person lookup.
-	remoteURL := pr.ThumbPath
-	if remoteURL == "" && h.scraper != nil {
-		if tid, u := h.scraper.LookupPersonPortrait(c.Request.Context(), pr.Name); u != "" {
+	// 3. Remote URL (from NFO/TMDB scrape) or on-demand TMDB person lookup (prefers TMDBID, falls back to name).
+	remoteURL := ""
+	if isHTTPURL(pr.ThumbPath) {
+		remoteURL = strings.TrimSpace(pr.ThumbPath)
+	}
+	if remoteURL == "" && h.scraper != nil && h.scraper.HasCredentials() && !h.isPersonPortraitMissing(c.Request.Context(), pr.ID) {
+		if tid, u := h.scraper.LookupPersonPortrait(c.Request.Context(), pr.Name, pr.TMDBID); u != "" {
 			remoteURL = u
 			updates := map[string]any{"thumb_path": u, "updated_at": time.Now().UTC()}
 			if tid != "" && pr.TMDBID == "" {
 				updates["tmdb_id"] = tid
 				pr.TMDBID = tid
 			}
-			_ = h.db.Gorm.Model(&pr).Updates(updates).Error
+			_ = h.db.Gorm.Model(pr).Updates(updates).Error
+		} else {
+			h.markPersonPortraitMissing(c.Request.Context(), pr.ID)
 		}
 	}
 
-	if strings.HasPrefix(remoteURL, "http://") || strings.HasPrefix(remoteURL, "https://") {
+	if isHTTPURL(remoteURL) {
 		if h.images == nil {
 			c.Status(http.StatusNotFound)
 			return
@@ -2401,19 +2482,24 @@ func (h *Handler) PlaybackInfo(c *gin.Context) {
 		jsonErr(c, http.StatusNotFound, "item not found")
 		return
 	}
-	preferredSourceID := queryCI(c, "MediaSourceId")
-	if preferredSourceID == "" && c.Request.Body != nil {
+	selectedSourceID := queryCI(c, "MediaSourceId")
+	if selectedSourceID == "" && c.Request.Body != nil {
 		// Tolerate arbitrary Emby 4.8-4.10 client DeviceProfile payloads (e.g. string/int MinSegments or MaxAudioChannels).
 		var raw map[string]any
 		if b, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20)); err == nil && len(b) > 0 {
 			if json.Unmarshal(b, &raw) == nil {
-				if v, ok := raw["MediaSourceId"].(string); ok && strings.TrimSpace(v) != "" {
-					preferredSourceID = strings.TrimSpace(v)
+				for k, v := range raw {
+					if strings.EqualFold(k, "MediaSourceId") {
+						if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+							selectedSourceID = strings.TrimSpace(s)
+						}
+						break
+					}
 				}
 			}
 		}
 	}
-	c.JSON(http.StatusOK, h.playback.BuildPlaybackInfoWithSource(c.Request, p, item, preferredSourceID))
+	c.JSON(http.StatusOK, h.playback.BuildPlaybackInfoWithSource(c.Request, p, item, selectedSourceID))
 }
 
 func (h *Handler) StreamVideo(c *gin.Context) {

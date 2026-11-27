@@ -255,12 +255,22 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 		(100, 0, 2, 'h264', 'und', '', 1920, 1080, 0, 1, '1080p'),
 		(100, 1, 1, 'aac', 'chi', '', 0, 0, 0, 1, '国语'),
 		(100, 2, 3, 'ass', 'chi', '/emby/subs/inception.ass', 0, 0, 1, 0, '简体中文')`).Error
+	// Create a local Emby metadata/people portrait file to verify %MetadataPath% resolution & auto-linking.
+	nolanDir := filepath.Join(tmp, "metadata", "people", "C", "Christopher Nolan")
+	if err := os.MkdirAll(nolanDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	nolanImg := filepath.Join(nolanDir, "folder.jpg")
+	if err := os.WriteFile(nolanImg, []byte("\xff\xd8\xff\xe0NOLAN"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	// Person items (type 23) and their links. 900 has a remote portrait and a
-	// TMDB id; the movie carries every major PersonType to prove nothing is dropped.
+	// TMDB id; 902 has a local %MetadataPath% portrait; the movie carries every major PersonType.
 	_ = lDB.Exec(`INSERT INTO MediaItems (Id, type, Name, ProviderIds, Images) VALUES
 		(900, 23, '莱昂纳多·迪卡普里奥', 'Tmdb=6193', 'https://image.tmdb.org/t/p/original/leonardo.jpg*0*Primary*0*0*null'),
 		(901, 23, '约瑟夫·高登-莱维特', 'Tmdb=24045', ''),
-		(902, 23, '克里斯托弗·诺兰', 'Tmdb=525', ''),
+		(902, 23, '克里斯托弗·诺兰', 'Tmdb=525', '%MetadataPath%/people/C/Christopher Nolan/folder.jpg*0*Primary*0*0*null'),
 		(903, 23, '乔纳森·诺兰', 'Tmdb=1010', ''),
 		(904, 23, '艾玛·托马斯', 'Tmdb=9999', ''),
 		(905, 23, '渡边谦', 'Tmdb=3894', ''),
@@ -288,7 +298,7 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 
 	svc := NewService(db)
 	snapshotDir := t.TempDir()
-	req := EmbyMigrationRequest{UsersDBPath: usersPath, LibraryDBPath: libraryPath, SnapshotDir: snapshotDir}
+	req := EmbyMigrationRequest{EmbyConfigDir: tmp, UsersDBPath: usersPath, LibraryDBPath: libraryPath, SnapshotDir: snapshotDir}
 
 	preview, err := svc.Preview(req)
 	if err != nil {
@@ -516,6 +526,16 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 	if person.TMDBID != "6193" || !strings.Contains(person.ThumbPath, "image.tmdb.org") {
 		t.Fatalf("person metadata not migrated: %+v", person)
 	}
+	var nolan model.Person
+	if err := db.Gorm.Where("name = ?", "克里斯托弗·诺兰").First(&nolan).Error; err != nil {
+		t.Fatalf("migrated nolan missing: %v", err)
+	}
+	if nolan.ThumbPath != nolanImg {
+		t.Fatalf("expected %s for %%MetadataPath%% person thumb, got %q", nolanImg, nolan.ThumbPath)
+	}
+	if gotMetaDir := db.GetSetting("emby_metadata_dir", ""); gotMetaDir != filepath.Join(tmp, "metadata") {
+		t.Fatalf("expected emby_metadata_dir auto-linked to %q, got %q", filepath.Join(tmp, "metadata"), gotMetaDir)
+	}
 	var producer model.Person
 	if err := db.Gorm.Where("name = ?", "艾玛·托马斯").First(&producer).Error; err != nil {
 		t.Fatalf("producer missing: %v", err)
@@ -538,13 +558,20 @@ func TestEmby49MediaItemsSchemaMigration(t *testing.T) {
 		t.Fatalf("episode cast not migrated: %+v", episodeCast)
 	}
 
-	// Running again while item_people rows exist must not duplicate them.
+	// Running again while item_people rows exist must not duplicate them,
+	// and must still backfill empty people.thumb_path when Overwrite=false.
+	if err := db.Gorm.Model(&model.Person{}).Where("id = ?", nolan.ID).Update("thumb_path", "").Error; err != nil {
+		t.Fatalf("clear nolan thumb_path: %v", err)
+	}
 	again, err := svc.Import(req)
 	if err != nil {
 		t.Fatalf("second Import failed: %v", err)
 	}
 	if again.ItemsSkipped != 8 || again.PeopleImported != 0 {
 		t.Fatalf("unexpected second import report: %+v", again)
+	}
+	if err := db.Gorm.Where("id = ?", nolan.ID).First(&nolan).Error; err != nil || nolan.ThumbPath != nolanImg {
+		t.Fatalf("second Import did not backfill empty thumb_path: %+v err=%v", nolan, err)
 	}
 	var peopleCount int64
 	_ = db.Gorm.Model(&model.ItemPerson{}).Where("item_id = ?", movie.ID).Count(&peopleCount).Error

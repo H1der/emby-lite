@@ -3,6 +3,7 @@ package migration
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -87,32 +88,35 @@ const embyPersonRoleOrder = `CASE LOWER(CAST(ip.PersonType AS TEXT))
 	ELSE 99
 END`
 
-// embyPersonThumb extracts a usable portrait URL from Emby's Images column.
-// Emby stores local metadata paths with a %MetadataPath% placeholder; those are
-// only valid inside the old Emby config tree, so they are ignored here and the
-// request-time lookup by person name/TMDB id takes over.
-func embyPersonThumb(raw string) string {
+// embyPersonThumb extracts a usable portrait URL or existing local file path from Emby's Images column.
+// Supports both remote http(s):// URLs and Emby's %MetadataPath% local portrait paths when mounted.
+func embyPersonThumb(raw, embyConfigDir string) string {
 	for _, entry := range strings.Split(raw, "|") {
 		parts := strings.SplitN(strings.TrimSpace(entry), "*", 4)
-		if len(parts) < 3 {
-			if u := strings.TrimSpace(parts[0]); strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
-				return u
+		rawPath := strings.TrimSpace(parts[0])
+		if rawPath == "" {
+			continue
+		}
+		if len(parts) >= 3 && !strings.EqualFold(strings.TrimSpace(parts[2]), "Primary") {
+			continue
+		}
+		lower := strings.ToLower(rawPath)
+		if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+			return rawPath
+		}
+		resolved := resolveEmbyMetadataPath(rawPath, embyConfigDir)
+		if resolved != "" {
+			if fi, err := os.Stat(resolved); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+				return resolved
 			}
-			continue
-		}
-		if !strings.EqualFold(strings.TrimSpace(parts[2]), "Primary") {
-			continue
-		}
-		if u := strings.TrimSpace(parts[0]); strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
-			return u
 		}
 	}
 	return ""
 }
 
-func embyPersonMeta(providerIDs, images string) (tmdbID, thumb string) {
+func embyPersonMeta(providerIDs, images, embyConfigDir string) (tmdbID, thumb string) {
 	tmdbID = strings.TrimSpace(parseEmbyProviderIDs(providerIDs)["Tmdb"])
-	return tmdbID, embyPersonThumb(images)
+	return tmdbID, embyPersonThumb(images, embyConfigDir)
 }
 
 // importEmbyPeople streams ItemPeople2 and writes the cast/crew rows for items
@@ -123,7 +127,7 @@ func embyPersonMeta(providerIDs, images string) (tmdbID, thumb string) {
 // That makes a re-run able to repair an earlier import (including one that
 // only knew Actor/Director/Writer) without deleting or overwriting existing
 // metadata or scanner-owned people rows.
-func (s *Service) importEmbyPeople(ctx context.Context, libraryDBPath string, targets map[string]string, overwrite bool, now time.Time) (int, []string, error) {
+func (s *Service) importEmbyPeople(ctx context.Context, libraryDBPath, embyConfigDir string, targets map[string]string, overwrite bool, now time.Time) (int, []string, error) {
 	if len(targets) == 0 || strings.TrimSpace(libraryDBPath) == "" {
 		return 0, nil, nil
 	}
@@ -262,7 +266,7 @@ func (s *Service) importEmbyPeople(ctx context.Context, libraryDBPath string, ta
 		}
 		seenLinks[key] = true
 
-		tmdbID, thumb := embyPersonMeta(rawPids, rawImages)
+		tmdbID, thumb := embyPersonMeta(rawPids, rawImages, embyConfigDir)
 		current.Links = append(current.Links, embyPersonLink{
 			Name:      name,
 			RoleType:  roleType,
@@ -321,27 +325,30 @@ func (s *Service) writePeopleBatch(groups []embyPersonGroup, overwrite bool, now
 		for _, l := range g.Links {
 			pid := scanner.StableID("person", strings.ToLower(l.Name))
 			linkKey := g.LocalID + "|" + pid + "|" + l.RoleType
-			if existingLinks[linkKey] {
+			linkExists := existingLinks[linkKey]
+			if !linkExists || l.TMDBID != "" || l.ThumbPath != "" {
+				if idx, ok := personIndex[pid]; ok {
+					if people[idx].TMDBID == "" {
+						people[idx].TMDBID = l.TMDBID
+					}
+					if people[idx].ThumbPath == "" {
+						people[idx].ThumbPath = l.ThumbPath
+					}
+				} else {
+					personIndex[pid] = len(people)
+					people = append(people, model.Person{
+						ID:        pid,
+						Name:      l.Name,
+						TMDBID:    l.TMDBID,
+						ThumbPath: l.ThumbPath,
+						UpdatedAt: now,
+					})
+				}
+			}
+			if linkExists {
 				continue
 			}
 			existingLinks[linkKey] = true
-			if idx, ok := personIndex[pid]; ok {
-				if people[idx].TMDBID == "" {
-					people[idx].TMDBID = l.TMDBID
-				}
-				if people[idx].ThumbPath == "" {
-					people[idx].ThumbPath = l.ThumbPath
-				}
-			} else {
-				personIndex[pid] = len(people)
-				people = append(people, model.Person{
-					ID:        pid,
-					Name:      l.Name,
-					TMDBID:    l.TMDBID,
-					ThumbPath: l.ThumbPath,
-					UpdatedAt: now,
-				})
-			}
 			links = append(links, model.ItemPerson{
 				ItemID:   g.LocalID,
 				PersonID: pid,
@@ -351,7 +358,7 @@ func (s *Service) writePeopleBatch(groups []embyPersonGroup, overwrite bool, now
 			})
 		}
 	}
-	if len(links) == 0 {
+	if len(links) == 0 && len(people) == 0 {
 		return 0, nil
 	}
 
@@ -376,6 +383,9 @@ func (s *Service) writePeopleBatch(groups []embyPersonGroup, overwrite bool, now
 			}).CreateInBatches(people, batchSize).Error; err != nil {
 				return err
 			}
+		}
+		if len(links) == 0 {
+			return nil
 		}
 		return tx.Clauses(clause.OnConflict{DoNothing: true}).
 			CreateInBatches(links, batchSize).Error

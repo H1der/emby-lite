@@ -210,6 +210,29 @@ func (c *TMDBClient) RewriteImageURL(raw string) string {
 	return raw
 }
 
+// GetPersonProfileByID fetches a person's TMDB profile image URL directly by TMDB person ID
+// (cached in provider_cache, avoiding name-search ambiguity).
+func (c *TMDBClient) GetPersonProfileByID(ctx context.Context, tmdbID string) (string, error) {
+	tmdbID = strings.TrimSpace(tmdbID)
+	if !c.HasCredentials() || tmdbID == "" {
+		return "", nil
+	}
+	params := url.Values{}
+	params.Set("language", c.cfg.Language)
+	cacheKey := fmt.Sprintf("person:profile:%s", tmdbID)
+	var resp struct {
+		ID          int    `json:"id"`
+		ProfilePath string `json:"profile_path"`
+	}
+	if err := c.getJSON(ctx, cacheKey, cacheTTLDetail, "/person/"+url.PathEscape(tmdbID), params, &resp); err != nil {
+		return "", err
+	}
+	if resp.ProfilePath != "" {
+		return c.ImageURL("w185", resp.ProfilePath), nil
+	}
+	return "", nil
+}
+
 // SearchPersonProfile looks up a person's TMDB profile image URL (cached in provider_cache).
 func (c *TMDBClient) SearchPersonProfile(ctx context.Context, name string) (string, string, error) {
 	if !c.HasCredentials() || strings.TrimSpace(name) == "" {

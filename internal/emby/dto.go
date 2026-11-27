@@ -1,6 +1,7 @@
 package emby
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,8 +11,8 @@ import (
 	"time"
 
 	"emby-lite/internal/auth"
-	imgpipe "emby-lite/internal/image"
 	"emby-lite/internal/model"
+	"emby-lite/internal/playback"
 )
 
 const ProtocolVersion = "4.10.2.0"
@@ -621,6 +622,11 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			Order("CASE item_people.role_type WHEN 'Actor' THEN 0 WHEN 'GuestStar' THEN 1 WHEN 'Director' THEN 2 WHEN 'Writer' THEN 3 WHEN 'Producer' THEN 4 ELSE 5 END ASC, item_people.sort_idx ASC, item_people.person_id ASC").
 			Scan(&pRows).Error
 		metaDir := h.embyMetadataDir()
+		canTMDB := h.canLookupTMDBPortraits()
+		reqCtx := context.Background()
+		if r != nil {
+			reqCtx = r.Context()
+		}
 		embyPersonImgCache := make(map[string]bool)
 		peopleByItem = make(map[string][]map[string]any, len(itemIDs))
 		for _, pr := range pRows {
@@ -630,16 +636,7 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 				"Role": pr.RoleName,
 				"Type": pr.RoleType,
 			}
-			hasImg := pr.ThumbPath != ""
-			if !hasImg && metaDir != "" {
-				if cached, ok := embyPersonImgCache[pr.PersonID]; ok {
-					hasImg = cached
-				} else {
-					hasImg = imgpipe.FindEmbyPersonImage(metaDir, pr.Name, pr.TMDBID) != ""
-					embyPersonImgCache[pr.PersonID] = hasImg
-				}
-			}
-			if hasImg {
+			if h.personHasPrimaryImage(reqCtx, metaDir, canTMDB, pr.PersonID, pr.Name, pr.TMDBID, pr.ThumbPath, embyPersonImgCache) {
 				pe["PrimaryImageTag"] = h.signTag(p, pr.PersonID, "Primary", "person")
 			}
 			peopleByItem[pr.ItemID] = append(peopleByItem[pr.ItemID], pe)
@@ -1037,36 +1034,7 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 				m["MediaSources"] = sources
 				m["MediaSourceCount"] = len(sources)
 				if len(sources) > 0 {
-					if pathStr, _ := sources[0]["Path"].(string); strings.TrimSpace(pathStr) != "" {
-						m["Path"] = pathStr
-					}
-					if streams, ok := sources[0]["MediaStreams"]; ok {
-						m["MediaStreams"] = streams
-						hasSubs := false
-						if sList, ok := streams.([]map[string]any); ok {
-							for _, st := range sList {
-								if stType, _ := st["Type"].(string); strings.EqualFold(stType, "Subtitle") {
-									hasSubs = true
-									break
-								}
-							}
-						}
-						m["HasSubtitles"] = hasSubs
-					}
-					if container, ok := sources[0]["Container"]; ok {
-						m["Container"] = container
-					}
-					w, _ := sources[0]["Width"].(int)
-					h, _ := sources[0]["Height"].(int)
-					if w > 0 {
-						m["Width"] = w
-					}
-					if h > 0 {
-						m["Height"] = h
-					}
-					if w > 0 || h > 0 {
-						m["IsHD"] = w >= 1280 || h >= 720
-					}
+					applyMediaSourceSummaryToItemDTO(m, sources[0])
 				}
 				if cs := chaptersByItem[item.ID]; len(cs) > 0 {
 					chapters := make([]map[string]any, 0, len(cs))
@@ -1237,4 +1205,70 @@ func itemEtag(item *model.Item) string {
 	}
 	sum := sha256.Sum256([]byte(item.ID + "|" + strconv.FormatInt(item.UpdatedAt.UnixNano(), 10)))
 	return hex.EncodeToString(sum[:8])
+}
+
+func applyMediaSourceSummaryToItemDTO(m map[string]any, src map[string]any) {
+	delete(m, "Path")
+	delete(m, "MediaStreams")
+	delete(m, "HasSubtitles")
+	delete(m, "Container")
+	delete(m, "Width")
+	delete(m, "Height")
+	delete(m, "IsHD")
+	if src == nil {
+		return
+	}
+	if pathStr, _ := src["Path"].(string); strings.TrimSpace(pathStr) != "" {
+		m["Path"] = pathStr
+	}
+	if streams, ok := src["MediaStreams"]; ok {
+		m["MediaStreams"] = streams
+		hasSubs := false
+		if sList, ok := streams.([]map[string]any); ok {
+			for _, st := range sList {
+				if stType, _ := st["Type"].(string); strings.EqualFold(stType, "Subtitle") {
+					hasSubs = true
+					break
+				}
+			}
+		}
+		m["HasSubtitles"] = hasSubs
+	}
+	if container, ok := src["Container"]; ok {
+		m["Container"] = container
+	}
+	w, _ := src["Width"].(int)
+	h, _ := src["Height"].(int)
+	if w > 0 {
+		m["Width"] = w
+	}
+	if h > 0 {
+		m["Height"] = h
+	}
+	if w > 0 || h > 0 {
+		m["IsHD"] = w >= 1280 || h >= 720
+	}
+	if rt, ok := src["RunTimeTicks"].(int64); ok && rt > 0 {
+		m["RunTimeTicks"] = rt
+	}
+}
+
+func applySelectedMediaSourceToItemDTO(m map[string]any, itemID, selectedSourceID string) {
+	selectedSourceID = strings.TrimSpace(selectedSourceID)
+	if m == nil || selectedSourceID == "" {
+		return
+	}
+	sources, ok := m["MediaSources"].([]map[string]any)
+	if !ok {
+		return
+	}
+	filtered := playback.FilterMediaSources(sources, itemID, selectedSourceID)
+	m["MediaSources"] = filtered
+	if len(filtered) > 0 {
+		applyMediaSourceSummaryToItemDTO(m, filtered[0])
+	} else {
+		applyMediaSourceSummaryToItemDTO(m, nil)
+		m["MediaStreams"] = []map[string]any{}
+		m["HasSubtitles"] = false
+	}
 }

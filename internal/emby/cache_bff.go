@@ -20,7 +20,7 @@ import (
 
 const (
 	hotCacheTTL     = 60 * time.Second
-	dtoCacheVersion = "v3"
+	dtoCacheVersion = "v4"
 )
 
 func (h *Handler) userDataRevKey(uid string) string {

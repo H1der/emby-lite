@@ -709,26 +709,38 @@ func streamIndexInt(v any) int {
 	}
 }
 
+// FilterMediaSources filters a built MediaSources slice to only the requested source ID.
+// Matches Emby/Jellyfin MediaInfoHelper semantics: when selectedSourceID is empty all sources
+// are returned; when specified, only the matching MediaSource is returned (with a fallback to
+// the primary source if a client passes itemID as MediaSourceId).
+func FilterMediaSources(sources []map[string]any, itemID, selectedSourceID string) []map[string]any {
+	selectedSourceID = strings.TrimSpace(selectedSourceID)
+	if selectedSourceID == "" {
+		return sources
+	}
+	for _, src := range sources {
+		if id, _ := src["Id"].(string); strings.EqualFold(strings.TrimSpace(id), selectedSourceID) {
+			return []map[string]any{src}
+		}
+	}
+	if itemID != "" && strings.EqualFold(strings.TrimSpace(itemID), selectedSourceID) && len(sources) > 0 {
+		return []map[string]any{sources[0]}
+	}
+	return []map[string]any{}
+}
+
 // BuildPlaybackInfo builds the full Emby PlaybackInfo JSON payload.
 func (s *Service) BuildPlaybackInfo(r *http.Request, p *auth.Principal, item *model.Item) map[string]any {
 	return s.BuildPlaybackInfoWithSource(r, p, item, "")
 }
 
-// BuildPlaybackInfoWithSource builds Emby PlaybackInfo, prioritizing preferredSourceID when specified.
-func (s *Service) BuildPlaybackInfoWithSource(r *http.Request, p *auth.Principal, item *model.Item, preferredSourceID string) map[string]any {
+// BuildPlaybackInfoWithSource builds Emby PlaybackInfo. When selectedSourceID is specified,
+// only that selected MediaSource is returned instead of all versions (matching Emby/Jellyfin).
+func (s *Service) BuildPlaybackInfoWithSource(r *http.Request, p *auth.Principal, item *model.Item, selectedSourceID string) map[string]any {
 	playSessionID := strings.ReplaceAll(uuid.NewString(), "-", "")
 	sources := s.BuildMediaSources(r, p, item)
-	if preferredSourceID != "" && len(sources) > 1 {
-		for i, src := range sources {
-			if id, _ := src["Id"].(string); id == preferredSourceID && i > 0 {
-				reordered := make([]map[string]any, 0, len(sources))
-				reordered = append(reordered, sources[i])
-				reordered = append(reordered, sources[:i]...)
-				reordered = append(reordered, sources[i+1:]...)
-				sources = reordered
-				break
-			}
-		}
+	if strings.TrimSpace(selectedSourceID) != "" {
+		sources = FilterMediaSources(sources, item.ID, selectedSourceID)
 	}
 	return map[string]any{
 		"MediaSources":  sources,

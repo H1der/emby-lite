@@ -340,6 +340,8 @@ func registerEmbyRoutes(r *gin.Engine, h *emby.Handler) {
 	r.HEAD("/persons/:personId/images/:type", h.GetPersonImage)
 	r.GET("/persons/:personId/images/:type/:index", h.GetPersonImage)
 	r.HEAD("/persons/:personId/images/:type/:index", h.GetPersonImage)
+	r.GET("/persons/:personId/images/:type/:index/:tag", h.GetPersonImage)
+	r.HEAD("/persons/:personId/images/:type/:index/:tag", h.GetPersonImage)
 	r.GET("/users/:userId/images/:type", h.GetUserImage)
 	r.HEAD("/users/:userId/images/:type", h.GetUserImage)
 	r.GET("/users/:userId/images/:type/:index", h.GetUserImage)

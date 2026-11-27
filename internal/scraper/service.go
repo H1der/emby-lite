@@ -154,6 +154,15 @@ func (s *Service) Client() *TMDBClient {
 	return NewTMDBClient(s.db, s.GetConfig())
 }
 
+// HasCredentials reports whether a TMDB API Key or Read Access Token is configured.
+func (s *Service) HasCredentials() bool {
+	if s == nil {
+		return false
+	}
+	cfg := s.GetConfig()
+	return strings.TrimSpace(cfg.APIKey) != "" || strings.TrimSpace(cfg.ReadToken) != ""
+}
+
 // ResolveRemoteImage rewrites TMDB image URLs to custom mirror and returns an HTTP client honoring configured proxy.
 func (s *Service) ResolveRemoteImage(rawURL string) (string, *http.Client) {
 	c := s.Client()
@@ -161,10 +170,16 @@ func (s *Service) ResolveRemoteImage(rawURL string) (string, *http.Client) {
 }
 
 // LookupPersonPortrait fetches a missing actor/director portrait from TMDB (cached in provider_cache).
-func (s *Service) LookupPersonPortrait(ctx context.Context, name string) (tmdbID string, imageURL string) {
+// Prefers exact lookup by tmdbID when available, falling back to name search.
+func (s *Service) LookupPersonPortrait(ctx context.Context, name, tmdbID string) (resolvedTMDBID string, imageURL string) {
 	c := s.Client()
 	if !c.HasCredentials() {
 		return "", ""
+	}
+	if tid := strings.TrimSpace(tmdbID); tid != "" {
+		if u, err := c.GetPersonProfileByID(ctx, tid); err == nil && u != "" {
+			return tid, u
+		}
 	}
 	id, u, err := c.SearchPersonProfile(ctx, name)
 	if err != nil {

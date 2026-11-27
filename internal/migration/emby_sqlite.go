@@ -939,12 +939,23 @@ func (s *Service) ImportWithProgress(ctx context.Context, req EmbyMigrationReque
 		writer.flush()
 
 		// Migrate cast/crew for the items mapped above. Re-running an older migration
-		// with Overwrite=false fills items that still have no people rows.
-		peopleImported, peopleWarnings, err := s.importEmbyPeople(ctx, resolved.LibraryDBPath, embyItemToLocal, req.Overwrite, now)
+		// with Overwrite=false fills items that still have no people rows and backfills
+		// missing person portraits / TMDB IDs.
+		peopleImported, peopleWarnings, err := s.importEmbyPeople(ctx, resolved.LibraryDBPath, req.EmbyConfigDir, embyItemToLocal, req.Overwrite, now)
 		report.Warnings = append(report.Warnings, peopleWarnings...)
 		report.PeopleImported += peopleImported
 		if err != nil {
 			return nil, err
+		}
+		// Auto-link Emby metadata/people directory for zero-copy person portraits if not already configured.
+		if strings.TrimSpace(req.EmbyConfigDir) != "" && strings.TrimSpace(s.db.GetSetting("emby_metadata_dir", "")) == "" {
+			metaRoot := filepath.Join(req.EmbyConfigDir, "metadata")
+			for _, sub := range []string{"people", "People"} {
+				if fi, statErr := os.Stat(filepath.Join(metaRoot, sub)); statErr == nil && fi.IsDir() {
+					_ = s.db.SetSetting("emby_metadata_dir", metaRoot, false)
+					break
+				}
+			}
 		}
 
 		// Update library item counts.

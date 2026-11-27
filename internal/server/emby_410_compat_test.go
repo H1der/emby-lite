@@ -1,18 +1,24 @@
 package server_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"emby-lite/internal/emby"
 	"emby-lite/internal/model"
+	"emby-lite/internal/scraper"
 )
 
 func TestEmby410AndYambyCompatibility(t *testing.T) {
@@ -335,7 +341,8 @@ func TestEmby410AndYambyCompatibility(t *testing.T) {
 		t.Fatalf("MediaSegments failed: %d %s", rec.Code, rec.Body.String())
 	}
 
-	// 9. /Users/:userId/Items/:itemId/PlaybackInfo with MediaSourceId preference + 4.10 subtitle path with StartPositionTicks
+	// 9. /Users/:userId/Items/:itemId/PlaybackInfo & GetItemDetail with MediaSourceId filtering + 4.10 subtitle path with StartPositionTicks
+	// 9a. PlaybackInfo with query MediaSourceId returns ONLY the selected version (official Emby/Jellyfin semantics).
 	rec = doJSON(t, h, http.MethodPost, "/emby/Users/"+uid+"/Items/"+movie.ID+"/PlaybackInfo?MediaSourceId=src-2", tok, map[string]any{
 		"DeviceProfile": map[string]any{
 			"Name": "Yamby",
@@ -349,12 +356,75 @@ func TestEmby410AndYambyCompatibility(t *testing.T) {
 	}
 	var pb struct {
 		MediaSources []struct {
-			ID string `json:"Id"`
+			ID     string `json:"Id"`
+			Width  int    `json:"Width"`
+			Height int    `json:"Height"`
 		} `json:"MediaSources"`
 	}
 	_ = json.Unmarshal(rec.Body.Bytes(), &pb)
-	if len(pb.MediaSources) != 2 || pb.MediaSources[0].ID != "src-2" {
-		t.Fatalf("expected preferred MediaSourceId src-2 first, got %+v", pb.MediaSources)
+	if len(pb.MediaSources) != 1 || pb.MediaSources[0].ID != "src-2" || pb.MediaSources[0].Height != 1080 {
+		t.Fatalf("expected ONLY selected MediaSourceId src-2 in PlaybackInfo, got %+v", pb.MediaSources)
+	}
+
+	// 9b. PlaybackInfo with lowercase camelCase mediaSourceId in JSON body also returns ONLY that selected version.
+	rec = doJSON(t, h, http.MethodPost, "/emby/Items/"+movie.ID+"/PlaybackInfo", tok, map[string]any{
+		"mediaSourceId": "src-1",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PlaybackInfo body mediaSourceId failed: %d %s", rec.Code, rec.Body.String())
+	}
+	pb.MediaSources = nil
+	_ = json.Unmarshal(rec.Body.Bytes(), &pb)
+	if len(pb.MediaSources) != 1 || pb.MediaSources[0].ID != "src-1" || pb.MediaSources[0].Height != 2160 {
+		t.Fatalf("expected ONLY selected MediaSourceId src-1 from JSON body, got %+v", pb.MediaSources)
+	}
+
+	// 9c. PlaybackInfo without MediaSourceId still returns all versions for client version discovery.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/"+movie.ID+"/PlaybackInfo", tok, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PlaybackInfo without MediaSourceId failed: %d %s", rec.Code, rec.Body.String())
+	}
+	pb.MediaSources = nil
+	_ = json.Unmarshal(rec.Body.Bytes(), &pb)
+	if len(pb.MediaSources) != 2 || pb.MediaSources[0].ID != "src-1" || pb.MediaSources[1].ID != "src-2" {
+		t.Fatalf("expected all 2 MediaSources when MediaSourceId omitted, got %+v", pb.MediaSources)
+	}
+
+	// 9d. PlaybackInfo with unknown MediaSourceId returns empty MediaSources.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/"+movie.ID+"/PlaybackInfo?MediaSourceId=missing-src", tok, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PlaybackInfo unknown MediaSourceId failed: %d %s", rec.Code, rec.Body.String())
+	}
+	pb.MediaSources = nil
+	_ = json.Unmarshal(rec.Body.Bytes(), &pb)
+	if len(pb.MediaSources) != 0 {
+		t.Fatalf("expected empty MediaSources for unknown MediaSourceId, got %+v", pb.MediaSources)
+	}
+
+	// 9e. GetItemDetail with MediaSourceId returns ONLY the selected version and updates top-level media summary.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/"+movie.ID+"?MediaSourceId=src-2", tok, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GetItemDetail with MediaSourceId failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var detailSelected struct {
+		Width            int    `json:"Width"`
+		Height           int    `json:"Height"`
+		HasSubtitles     bool   `json:"HasSubtitles"`
+		MediaSourceCount int    `json:"MediaSourceCount"`
+		MediaSources     []struct {
+			ID string `json:"Id"`
+		} `json:"MediaSources"`
+		MediaStreams []map[string]any `json:"MediaStreams"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &detailSelected)
+	if len(detailSelected.MediaSources) != 1 || detailSelected.MediaSources[0].ID != "src-2" {
+		t.Fatalf("GetItemDetail?MediaSourceId=src-2 expected only src-2, got %+v", detailSelected.MediaSources)
+	}
+	if detailSelected.Width != 1920 || detailSelected.Height != 1080 || detailSelected.HasSubtitles || len(detailSelected.MediaStreams) != 0 {
+		t.Fatalf("GetItemDetail?MediaSourceId=src-2 did not refresh top-level media summary: %+v", detailSelected)
+	}
+	if detailSelected.MediaSourceCount != 2 {
+		t.Fatalf("GetItemDetail?MediaSourceId=src-2 MediaSourceCount = %d, want 2", detailSelected.MediaSourceCount)
 	}
 
 	rec = doJSON(t, h, http.MethodGet, "/emby/Videos/"+movie.ID+"/src-1/Subtitles/2/0/Stream.srt", tok, nil)
@@ -1101,5 +1171,185 @@ func TestDailyUseFixesSimilarPathRandomAndYambySearchSort(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &hidSim)
 	if len(hidSim.Items) != 1 || hidSim.Items[0].ID != hidMov2.ID {
 		t.Fatalf("hidden library item similar must stay within same hidden library, got %+v", hidSim.Items)
+	}
+}
+
+func TestPersonPortraitEndpointsAndTMDBFallback(t *testing.T) {
+	srv, tmp := setupTestServer(t)
+	h := srv.Handler
+
+	rec := doJSON(t, h, http.MethodPost, "/api/web/setup", "", map[string]any{
+		"username":    "admin",
+		"password":    "SecretPass123!",
+		"server_name": "EmbyLite PersonPortrait",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var setupResp struct {
+		AccessToken string `json:"access_token"`
+		User        struct {
+			ID string `json:"id"`
+		} `json:"user"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &setupResp)
+	tok, uid := setupResp.AccessToken, setupResp.User.ID
+
+	// Build a valid tiny JPEG payload for local + mock TMDB image responses.
+	var jpgBuf bytes.Buffer
+	imgObj := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	imgObj.Set(0, 0, color.RGBA{R: 200, G: 100, B: 50, A: 255})
+	if err := jpeg.Encode(&jpgBuf, imgObj, nil); err != nil {
+		t.Fatal(err)
+	}
+	validJPG := jpgBuf.Bytes()
+
+	// Create library + movie.
+	mvDir := filepath.Join(tmp, "movies")
+	_ = os.MkdirAll(mvDir, 0o755)
+	rec = doJSON(t, h, http.MethodPost, "/api/admin/libraries", tok, map[string]any{
+		"name": "电影", "kind": "movies", "paths": []string{mvDir},
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create lib failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var libResp struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &libResp)
+
+	now := time.Now().UTC()
+	mv := model.Item{
+		ID: "mv-actor-1", LibraryID: libResp.ID, ParentID: libResp.ID,
+		Type: "Movie", Name: "盗梦空间", SortName: "daomengkongjian", Year: 2010,
+		ScanKey: "pa:mv1", RandomKey: "r1", AddedAt: now, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := srv.DB.Gorm.Create(&mv).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	localThumb := filepath.Join(tmp, "nolan.jpg")
+	if err := os.WriteFile(localThumb, validJPG, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pLocal := model.Person{ID: "per-local", Name: "克里斯托弗·诺兰", TMDBID: "525", ThumbPath: localThumb, UpdatedAt: now}
+	pRemoteTMDB := model.Person{ID: "per-tmdb-hit", Name: "莱昂纳多·迪卡普里奥", TMDBID: "6193", ThumbPath: "", UpdatedAt: now}
+	pNoPhoto := model.Person{ID: "per-tmdb-miss", Name: "无图演员", TMDBID: "99999", ThumbPath: "", UpdatedAt: now}
+	for _, p := range []*model.Person{&pLocal, &pRemoteTMDB, &pNoPhoto} {
+		if err := srv.DB.Gorm.Create(p).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = srv.DB.Gorm.Create(&model.ItemPerson{ItemID: mv.ID, PersonID: pLocal.ID, RoleType: "Director", SortIdx: 0}).Error
+	_ = srv.DB.Gorm.Create(&model.ItemPerson{ItemID: mv.ID, PersonID: pRemoteTMDB.ID, RoleType: "Actor", RoleName: "柯布", SortIdx: 1}).Error
+	_ = srv.DB.Gorm.Create(&model.ItemPerson{ItemID: mv.ID, PersonID: pNoPhoto.ID, RoleType: "Actor", RoleName: "路人", SortIdx: 2}).Error
+
+	// 1. Standard Emby client routes: /Items/:personId/Images/Primary, /Persons/:personId/Images/Primary/0/:tag, /Users/:uid/Items/:personId.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Items/"+pLocal.ID+"/Images/Primary?maxWidth=185", tok, nil)
+	if rec.Code != http.StatusOK || len(rec.Body.Bytes()) == 0 {
+		t.Fatalf("GET /Items/:personId/Images/Primary failed: %d", rec.Code)
+	}
+	rec = doJSON(t, h, http.MethodGet, "/emby/Persons/"+pLocal.ID+"/Images/Primary/0/testtag", tok, nil)
+	if rec.Code != http.StatusOK || len(rec.Body.Bytes()) == 0 {
+		t.Fatalf("GET /Persons/:personId/Images/Primary/0/:tag failed: %d", rec.Code)
+	}
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/"+pLocal.ID, tok, nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"Type":"Person"`) {
+		t.Fatalf("GET /Users/:uid/Items/:personId failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 2. Without TMDB credentials, persons with empty ThumbPath must NOT emit PrimaryImageTag.
+	fetchPeopleTags := func() map[string]string {
+		t.Helper()
+		r := doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/"+mv.ID, tok, nil)
+		if r.Code != http.StatusOK {
+			t.Fatalf("item detail failed: %d %s", r.Code, r.Body.String())
+		}
+		var detail struct {
+			People []struct {
+				ID              string `json:"Id"`
+				PrimaryImageTag string `json:"PrimaryImageTag"`
+			} `json:"People"`
+		}
+		_ = json.Unmarshal(r.Body.Bytes(), &detail)
+		out := map[string]string{}
+		for _, p := range detail.People {
+			out[p.ID] = p.PrimaryImageTag
+		}
+		return out
+	}
+	tagsBefore := fetchPeopleTags()
+	if tagsBefore[pLocal.ID] == "" || tagsBefore[pRemoteTMDB.ID] != "" || tagsBefore[pNoPhoto.ID] != "" {
+		t.Fatalf("unexpected tags without TMDB creds: %+v", tagsBefore)
+	}
+
+	// 3. Configure mock TMDB server: verify exact /person/6193 lookup (not /search/person) + negative caching for 99999.
+	var personByIDHits atomic.Int32
+	var missHits atomic.Int32
+	mockTMDB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/person/6193":
+			personByIDHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":6193,"profile_path":"/leo.jpg"}`))
+		case "/person/99999":
+			missHits.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"id":99999,"profile_path":""}`))
+		case "/search/person":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"results":[]}`))
+		case "/w185/leo.jpg":
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write(validJPG)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer mockTMDB.Close()
+
+	if err := srv.Scraper.SaveConfig(scraper.TMDBConfig{
+		APIKey:       "test-key",
+		APIBaseURL:   mockTMDB.URL,
+		ImageBaseURL: mockTMDB.URL,
+		Language:     "zh-CN",
+	}); err != nil {
+		t.Fatalf("save TMDB config: %v", err)
+	}
+
+	// With TMDB credentials configured, PrimaryImageTag is emitted so clients request the portrait on demand.
+	tagsWithTMDB := fetchPeopleTags()
+	if tagsWithTMDB[pRemoteTMDB.ID] == "" || tagsWithTMDB[pNoPhoto.ID] == "" {
+		t.Fatalf("expected PrimaryImageTag for TMDB on-demand lookup, got %+v", tagsWithTMDB)
+	}
+
+	// Requesting via standard Emby /Items/:personId/Images/Primary triggers /person/6193 and persists thumb_path.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Items/"+pRemoteTMDB.ID+"/Images/Primary?tag="+tagsWithTMDB[pRemoteTMDB.ID], tok, nil)
+	if rec.Code != http.StatusOK || len(rec.Body.Bytes()) == 0 {
+		t.Fatalf("on-demand TMDB portrait via /Items/:personId/Images/Primary failed: %d", rec.Code)
+	}
+	if personByIDHits.Load() != 1 {
+		t.Fatalf("expected exact /person/6193 lookup hit once, got %d", personByIDHits.Load())
+	}
+	var updatedLeo model.Person
+	_ = srv.DB.Gorm.Where("id = ?", pRemoteTMDB.ID).First(&updatedLeo).Error
+	if !strings.HasSuffix(updatedLeo.ThumbPath, "/w185/leo.jpg") {
+		t.Fatalf("expected persisted TMDB thumb_path, got %q", updatedLeo.ThumbPath)
+	}
+
+	// Missing portrait caches negative result so subsequent detail calls stop advertising PrimaryImageTag.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Items/"+pNoPhoto.ID+"/Images/Primary?tag="+tagsWithTMDB[pNoPhoto.ID], tok, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for portrait-less person, got %d", rec.Code)
+	}
+	tagsAfterMiss := fetchPeopleTags()
+	if tagsAfterMiss[pNoPhoto.ID] != "" {
+		t.Fatalf("expected PrimaryImageTag suppressed after negative cache, got %+v", tagsAfterMiss)
+	}
+	// Repeat request must hit negative cache without calling TMDB again.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Items/"+pNoPhoto.ID+"/Images/Primary", tok, nil)
+	if rec.Code != http.StatusNotFound || missHits.Load() != 1 {
+		t.Fatalf("expected negative cache to block repeat TMDB lookup, code=%d hits=%d", rec.Code, missHits.Load())
 	}
 }
