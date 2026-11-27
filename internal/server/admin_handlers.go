@@ -100,7 +100,7 @@ func (a *AdminHandler) Bootstrap(c *gin.Context) {
 		"initialized": initialized,
 		"server_name": a.db.GetSetting("server_name", a.cfg.Server.ServerName),
 		"server_id":   a.db.GetSetting("server_id", ""),
-		"version":     "0.3.10",
+		"version":     "0.3.11",
 	})
 }
 
@@ -172,7 +172,11 @@ func (a *AdminHandler) ExternalPlay(c *gin.Context) {
 			}
 		}
 	}
-	directURL, _ := selected["Path"].(string)
+	relDirect, _ := selected["DirectStreamUrl"].(string)
+	directURL := playback.PublicOrigin(c.Request, a.cfg.Server.PublicURL) + "/emby" + relDirect
+	if relDirect == "" {
+		directURL, _ = selected["Path"].(string)
+	}
 	encoded := url.QueryEscape(directURL)
 	c.JSON(http.StatusOK, gin.H{
 		"item_id":         item.ID,

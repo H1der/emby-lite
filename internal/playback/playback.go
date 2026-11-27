@@ -104,7 +104,6 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 		}
 	}
 
-	origin := PublicOrigin(r, s.cfg.Server.PublicURL)
 	seriesNamesByItem := s.resolveEpisodeSeriesNames(items)
 	for _, src := range sources {
 		item := itemByID[src.ItemID]
@@ -120,10 +119,8 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 			relURL += "&api_key=" + url.QueryEscape(p.Token)
 		}
 
-		streamProto := "File"
-		if src.SourceType == "strm" {
-			streamProto = "Http"
-		}
+		pathVal, msProto, isRemote := resolveMediaSourceDisplayPath(&src)
+		streamProto := msProto
 
 		// Collect embedded + external subtitles.
 		streams := []map[string]any{}
@@ -177,17 +174,6 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 			runtimeTicks = int64(src.DurationSecs * 1e7)
 		}
 
-		pathVal := origin + "/emby" + relURL
-		msProto := "Http"
-		if p != nil && p.IsAPIKey {
-			if src.SourceType == "strm" && src.StrmURL != "" {
-				pathVal = src.StrmURL
-			} else {
-				pathVal = src.Path
-				msProto = "File"
-			}
-		}
-
 		ms := map[string]any{
 			"Id":                         src.ID,
 			"ItemId":                     item.ID,
@@ -201,7 +187,7 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 			"SupportsDirectStream":       true,
 			"SupportsTranscoding":        false,
 			"SupportsProbing":            true,
-			"IsRemote":                   src.SourceType == "strm",
+			"IsRemote":                   isRemote,
 			"IsInfiniteStream":           false,
 			"RequiresOpening":            false,
 			"RequiresClosing":            false,
@@ -269,6 +255,32 @@ func (s *Service) BuildMediaSourcesBatch(r *http.Request, p *auth.Principal, ite
 		result[item.ID] = append(result[item.ID], ms)
 	}
 	return result
+}
+
+func resolveMediaSourceDisplayPath(src *model.MediaSource) (pathVal, protocol string, isRemote bool) {
+	if src == nil {
+		return "", "File", false
+	}
+	if src.SourceType == "strm" {
+		target := strings.TrimSpace(src.StrmURL)
+		if target != "" {
+			lower := strings.ToLower(target)
+			if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+				return target, "Http", true
+			}
+			if strings.HasPrefix(lower, "rtsp://") {
+				return target, "Rtsp", true
+			}
+			if strings.HasPrefix(lower, "rtmp://") {
+				return target, "Rtmp", true
+			}
+			if strings.HasPrefix(lower, "ftp://") {
+				return target, "Ftp", true
+			}
+			return target, "File", false
+		}
+	}
+	return src.Path, "File", false
 }
 
 func (s *Service) resolveEpisodeSeriesNames(items []model.Item) map[string]string {

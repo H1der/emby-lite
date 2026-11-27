@@ -19,6 +19,7 @@ import (
 	"emby-lite/internal/playback"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 )
 
 // --- Emby 4.10.2.0 Home Sections & Section Feeds ---
@@ -207,7 +208,11 @@ func (h *Handler) GetMediaSegments(c *gin.Context) {
 // SearchHints implements Emby GET /Search/Hints.
 func (h *Handler) SearchHints(c *gin.Context) {
 	p := getPrincipal(c)
-	if uidParam := queryCI(c, "UserId"); uidParam != "" && !h.checkUserScope(c, p, uidParam) {
+	uidScope := c.Param("userId")
+	if uidScope == "" {
+		uidScope = queryCI(c, "UserId")
+	}
+	if uidScope != "" && !h.checkUserScope(c, p, uidScope) {
 		return
 	}
 	visibleIDs, err := h.auth.VisibleLibraryIDs(p)
@@ -220,47 +225,52 @@ func (h *Handler) SearchHints(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"SearchHints": []any{}, "TotalRecordCount": 0})
 		return
 	}
+	startIndex := queryIntCI(c, "StartIndex", 0)
+	if startIndex < 0 {
+		startIndex = 0
+	}
 	limit := queryIntCI(c, "Limit", 20)
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	includeTypes := normalizeItemTypes(splitCSV(queryCI(c, "IncludeItemTypes")))
+	parentID := queryCI(c, "ParentId")
+	includeTypes := normalizeItemTypes(splitCSV(queryAllCI(c, "IncludeItemTypes")))
+	excludeTypes := normalizeItemTypes(splitCSV(queryAllCI(c, "ExcludeItemTypes")))
+
 	q := h.db.Read().Model(&model.Item{}).
 		Where("items.soft_deleted_at IS NULL AND items.library_id IN ?", visibleIDs)
+	if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
+		q = q.Where("(items.library_id = ? OR items.parent_id = ? OR items.series_id = ? OR items.season_id = ?)",
+			parentID, parentID, parentID, parentID)
+	}
 	if len(includeTypes) > 0 {
 		q = q.Where("items.type IN ?", includeTypes)
 	} else {
 		q = q.Where("items.type IN ?", []string{"Movie", "Series", "Episode", "BoxSet"})
 	}
-	like := "%" + strings.ToLower(term) + "%"
-	switch {
-	case h.db.Dialect == "postgres" && h.db.HasTrgm:
-		q = q.Where("(items.name % ? OR items.original_name % ? OR items.name ILIKE ? OR items.original_name ILIKE ? OR items.pinyin_initials ILIKE ?)",
-			term, term, like, like, like)
-	case h.db.Dialect == "sqlite" && h.db.HasFTS5:
-		ftsQuery := sanitizeFTSQuery(term)
-		if ftsQuery != "" {
-			q = q.Where("(items.id IN (SELECT item_id FROM items_fts WHERE items_fts MATCH ?) OR LOWER(items.name) LIKE ? OR LOWER(items.original_name) LIKE ? OR items.pinyin_initials LIKE ?)",
-				ftsQuery, like, like, like)
-		} else {
-			q = q.Where("(LOWER(items.name) LIKE ? OR LOWER(items.original_name) LIKE ? OR items.pinyin_initials LIKE ?)", like, like, like)
-		}
-	default:
-		q = q.Where("(LOWER(items.name) LIKE ? OR LOWER(items.original_name) LIKE ? OR items.pinyin_initials LIKE ?)", like, like, like)
+	if len(excludeTypes) > 0 {
+		q = q.Where("items.type NOT IN ?", excludeTypes)
 	}
+	q = h.applyItemSearch(q, term)
 
 	var total int64
 	_ = q.Count(&total).Error
+	lowerTerm := strings.ToLower(term)
+	prefixTerm := escapeSQLLike(lowerTerm) + "%"
 	var rows []model.Item
-	_ = q.Order("items.sort_name ASC, items.id ASC").Limit(limit).Find(&rows).Error
+	_ = q.Order(gorm.Expr(
+		"CASE WHEN LOWER(items.name) = ? OR LOWER(items.original_name) = ? THEN 0 WHEN LOWER(items.name) LIKE ? ESCAPE '\\' OR LOWER(items.original_name) LIKE ? ESCAPE '\\' OR items.pinyin_initials = ? THEN 1 WHEN items.pinyin_initials LIKE ? ESCAPE '\\' THEN 2 ELSE 3 END ASC, "+effectiveSortNameExpr+" ASC, LOWER(items.sort_name) ASC, items.id ASC",
+		lowerTerm, lowerTerm, prefixTerm, prefixTerm, lowerTerm, prefixTerm,
+	)).Offset(startIndex).Limit(limit).Find(&rows).Error
 	dtos := h.itemsToDTOs(c.Request, p, rows, false)
 	hints := make([]map[string]any, 0, len(dtos))
 	for _, d := range dtos {
 		hint := map[string]any{
-			"ItemId": d["Id"],
-			"Id":     d["Id"],
-			"Name":   d["Name"],
-			"Type":   d["Type"],
+			"ItemId":      d["Id"],
+			"Id":          d["Id"],
+			"Name":        d["Name"],
+			"Type":        d["Type"],
+			"MatchedTerm": term,
 		}
 		if v, ok := d["ProductionYear"]; ok {
 			hint["ProductionYear"] = v
@@ -274,6 +284,9 @@ func (h *Handler) SearchHints(c *gin.Context) {
 		if v, ok := d["SeriesName"]; ok {
 			hint["Series"] = v
 		}
+		if v, ok := d["SeriesId"]; ok {
+			hint["SeriesId"] = v
+		}
 		if v, ok := d["IndexNumber"]; ok {
 			hint["IndexNumber"] = v
 		}
@@ -283,6 +296,10 @@ func (h *Handler) SearchHints(c *gin.Context) {
 		if tags, ok := d["ImageTags"].(map[string]string); ok {
 			if pt := tags["Primary"]; pt != "" {
 				hint["PrimaryImageTag"] = pt
+			}
+			if tt := tags["Thumb"]; tt != "" {
+				hint["ThumbImageTag"] = tt
+				hint["ThumbImageItemId"] = d["Id"]
 			}
 		}
 		if bgs, ok := d["BackdropImageTags"].([]string); ok && len(bgs) > 0 {
@@ -299,23 +316,26 @@ func (h *Handler) GetStudios(c *gin.Context) {
 	p := getPrincipal(c)
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
 	parentID := queryCI(c, "ParentId")
-	cacheKey := dtoCacheVersion + ":studios:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
-	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
-		names := h.collectStudioNames(visibleIDs, parentID)
-		sid := h.serverID()
-		items := make([]map[string]any, 0, len(names))
-		for _, n := range names {
-			items = append(items, map[string]any{
-				"Name":      n,
-				"Id":        strconv.FormatInt(stableNumericID("studio", n), 10),
-				"ServerId":  sid,
-				"Type":      "Studio",
-				"IsFolder":  false,
-				"ImageTags": map[string]string{},
-			})
-		}
-		return gin.H{"Items": items, "TotalRecordCount": len(items), "StartIndex": 0}, nil
-	})
+	searchTerm := strings.TrimSpace(queryCI(c, "SearchTerm"))
+	nameStartsWith := strings.TrimSpace(queryCI(c, "NameStartsWith"))
+	sortBy := queryAllCI(c, "SortBy")
+	sortOrder := queryAllCI(c, "SortOrder")
+	startIndex := queryIntCI(c, "StartIndex", 0)
+	limit := queryIntCI(c, "Limit", 0)
+
+	if searchTerm == "" && nameStartsWith == "" && sortBy == "" && sortOrder == "" && startIndex == 0 && limit == 0 {
+		cacheKey := dtoCacheVersion + ":studios:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
+		h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
+			names := h.collectStudioNames(visibleIDs, parentID)
+			items := h.buildNameEntityDTOs("studio", "Studio", names)
+			return gin.H{"Items": items, "TotalRecordCount": len(items), "StartIndex": 0}, nil
+		})
+		return
+	}
+	names := filterSortSlice(h.collectStudioNames(visibleIDs, parentID), searchTerm, nameStartsWith, sortBy, sortOrder)
+	page, total, start := slicePage(names, startIndex, limit)
+	items := h.buildNameEntityDTOs("studio", "Studio", page)
+	c.JSON(http.StatusOK, gin.H{"Items": items, "TotalRecordCount": total, "StartIndex": start})
 }
 
 func (h *Handler) collectStudioNames(visibleIDs []string, parentID string) []string {

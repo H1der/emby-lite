@@ -248,6 +248,45 @@
         </div>
       </section>
 
+      <!-- Media Info -->
+      <section v-if="(item.Type === 'Movie' || item.Type === 'Episode') && activeSource" class="space-y-3">
+        <h2 class="text-lg sm:text-xl font-bold text-ink tracking-tight">媒体信息</h2>
+        <div class="glass-panel rounded-2xl p-4 sm:p-5 space-y-3 text-xs sm:text-sm">
+          <div v-if="activeSource.Path" class="flex flex-col sm:flex-row sm:items-start gap-2">
+            <span class="text-ink-muted font-semibold shrink-0 sm:w-20 pt-0.5">
+              {{ activeSource.IsRemote || activeSource.Protocol === 'Http' ? 'STRM 地址' : '文件路径' }}
+            </span>
+            <div class="flex-1 min-w-0 flex items-start gap-2">
+              <code class="flex-1 min-w-0 break-all px-2.5 py-1.5 rounded-xl neu-inset text-xs text-ink font-mono select-all">
+                {{ activeSource.Path }}
+              </code>
+              <n-button size="tiny" secondary @click="copyMediaPath">复制</n-button>
+            </div>
+          </div>
+          <div v-if="mediaInfoSummary.length > 0" class="flex flex-col sm:flex-row sm:items-center gap-2">
+            <span class="text-ink-muted font-semibold shrink-0 sm:w-20">规格参数</span>
+            <div class="flex flex-wrap items-center gap-2">
+              <span v-for="entry in mediaInfoSummary" :key="entry" class="px-2.5 py-1 rounded-xl glass-pill text-xs text-ink-secondary">
+                {{ entry }}
+              </span>
+            </div>
+          </div>
+          <div v-if="mediaStreamsList.length > 0" class="flex flex-col sm:flex-row sm:items-start gap-2">
+            <span class="text-ink-muted font-semibold shrink-0 sm:w-20 pt-0.5">媒体流</span>
+            <div class="flex-1 min-w-0 flex flex-wrap gap-2">
+              <span
+                v-for="st in mediaStreamsList"
+                :key="`${st.Type}-${st.Index}`"
+                class="px-2.5 py-1 rounded-xl neu-inset text-xs text-ink-secondary"
+              >
+                <strong class="text-ink">{{ streamTypeLabel(st.Type) }}</strong>
+                <span class="ml-1.5">{{ st.DisplayTitle || st.Codec || '未知' }}</span>
+              </span>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- Cast & Crew -->
       <section v-if="item.People && item.People.length > 0" class="space-y-3">
         <div class="flex items-center justify-between gap-3">
@@ -451,6 +490,45 @@ const mediaSpecs = computed(() => {
   }
   return specs
 })
+
+const mediaInfoSummary = computed(() => {
+  const out: string[] = []
+  const src = activeSource.value
+  if (!src) return out
+  if (src.Container) out.push(`容器: ${String(src.Container).toUpperCase()}`)
+  if (src.Width > 0 && src.Height > 0) out.push(`分辨率: ${src.Width}×${src.Height}`)
+  if (src.Bitrate > 0) out.push(`码率: ${(src.Bitrate / 1_000_000).toFixed(1)} Mbps`)
+  if (src.Size > 0) {
+    const gb = src.Size / (1024 * 1024 * 1024)
+    out.push(`大小: ${gb >= 1 ? `${gb.toFixed(2)} GB` : `${(src.Size / (1024 * 1024)).toFixed(0)} MB`}`)
+  }
+  return out
+})
+
+const mediaStreamsList = computed<any[]>(() => {
+  const list = activeSource.value?.MediaStreams
+  return Array.isArray(list) ? list : []
+})
+
+function streamTypeLabel(t?: string): string {
+  switch (String(t || '').toLowerCase()) {
+    case 'video':
+      return '视频'
+    case 'audio':
+      return '音频'
+    case 'subtitle':
+      return '字幕'
+    default:
+      return t || '流'
+  }
+}
+
+async function copyMediaPath() {
+  const path = activeSource.value?.Path
+  if (!path) return
+  await navigator.clipboard.writeText(path)
+  message.success('已复制媒体路径')
+}
 
 function episodeThumbUrl(ep: any): string {
   if (ep.ImageTags?.Primary) return itemImageUrl(ep.Id, 'Primary', ep.ImageTags.Primary, 420)

@@ -388,6 +388,16 @@ func registerEmbyRoutes(r *gin.Engine, h *emby.Handler) {
 		authed.GET("/users/:userId/items/:itemId/images", h.GetItemImagesList)
 		authed.GET("/items/:itemId/similar", h.GetSimilar)
 		authed.GET("/users/:userId/items/:itemId/similar", h.GetSimilar)
+		authed.GET("/shows/:seriesId/similar", h.GetSimilar)
+		authed.GET("/users/:userId/shows/:seriesId/similar", h.GetSimilar)
+		authed.GET("/movies/:itemId/similar", h.GetSimilar)
+		authed.GET("/users/:userId/movies/:itemId/similar", h.GetSimilar)
+		authed.GET("/items/:itemId/instantmix", h.GetInstantMix)
+		authed.GET("/users/:userId/items/:itemId/instantmix", h.GetInstantMix)
+		authed.GET("/shows/:seriesId/instantmix", h.GetInstantMix)
+		authed.GET("/users/:userId/shows/:seriesId/instantmix", h.GetInstantMix)
+		authed.GET("/movies/:itemId/instantmix", h.GetInstantMix)
+		authed.GET("/users/:userId/movies/:itemId/instantmix", h.GetInstantMix)
 		authed.GET("/items/:itemId/specialfeatures", h.EmptyArray)
 		authed.GET("/users/:userId/items/:itemId/specialfeatures", h.EmptyArray)
 		authed.GET("/items/:itemId/intros", h.EmptyItemsResult)
@@ -405,6 +415,7 @@ func registerEmbyRoutes(r *gin.Engine, h *emby.Handler) {
 		authed.GET("/mediasegments/:itemId", h.GetMediaSegments)
 		authed.GET("/users/:userId/mediasegments/:itemId", h.GetMediaSegments)
 		authed.GET("/search/hints", h.SearchHints)
+		authed.GET("/users/:userId/search/hints", h.SearchHints)
 
 		// TV Shows, Genres, Tags, Studios, Persons
 		authed.GET("/shows/:seriesId/seasons", h.GetSeasons)
@@ -417,6 +428,7 @@ func registerEmbyRoutes(r *gin.Engine, h *emby.Handler) {
 		authed.GET("/users/:userId/shows/upcoming", h.EmptyItemsResult)
 		authed.GET("/movies/recommendations", h.EmptyArray)
 		authed.GET("/genres", h.GetGenres)
+		authed.GET("/musicgenres", h.EmptyItemsResult)
 		authed.GET("/tags", h.GetTags)
 		authed.GET("/studios", h.GetStudios)
 		authed.GET("/artists", h.EmptyItemsResult)
@@ -515,12 +527,12 @@ var embyKeywords = map[string]bool{
 	"sessions": true, "logout": true, "playing": true, "progress": true, "stopped": true, "capabilities": true, "full": true,
 	"library": true, "mediafolders": true, "virtualfolders": true, "selectablemediafolders": true, "refresh": true,
 	"items": true, "root": true, "children": true, "latest": true, "resume": true, "counts": true,
-	"filters": true, "filters2": true, "similar": true, "images": true, "playbackinfo": true, "download": true,
+	"filters": true, "filters2": true, "similar": true, "instantmix": true, "images": true, "playbackinfo": true, "download": true,
 	"specialfeatures": true, "intros": true, "localtrailers": true, "thememedia": true, "themesongs": true, "themevideos": true, "thumbnailset": true,
 	"mediasegments": true, "search": true, "hints": true,
 	"userdata": true, "playeditems": true, "favoriteitems": true, "delete": true, "hidefromresume": true, "groupingoptions": true,
 	"shows": true, "seasons": true, "episodes": true, "nextup": true, "upcoming": true,
-	"movies": true, "recommendations": true, "genres": true, "tags": true, "studios": true, "persons": true,
+	"movies": true, "recommendations": true, "genres": true, "musicgenres": true, "tags": true, "studios": true, "persons": true,
 	"artists": true, "albumartists": true, "livetv": true, "recordings": true,
 	"displaypreferences": true, "videos": true, "additionalparts": true, "subtitles": true, "scheduledtasks": true,
 	"mergeversions": true, "alternatesources": true,

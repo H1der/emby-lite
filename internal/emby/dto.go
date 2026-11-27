@@ -1037,6 +1037,9 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 				m["MediaSources"] = sources
 				m["MediaSourceCount"] = len(sources)
 				if len(sources) > 0 {
+					if pathStr, _ := sources[0]["Path"].(string); strings.TrimSpace(pathStr) != "" {
+						m["Path"] = pathStr
+					}
 					if streams, ok := sources[0]["MediaStreams"]; ok {
 						m["MediaStreams"] = streams
 						hasSubs := false
@@ -1094,12 +1097,20 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			}
 
 			if item.Type == "Series" {
+				if strings.TrimSpace(item.DirPath) != "" {
+					m["Path"] = item.DirPath
+				}
 				m["ChildCount"] = seriesSeasonCounts[item.ID]
 				m["RecursiveItemCount"] = seriesEpCounts[item.ID]
 			} else if item.Type == "Season" {
+				if strings.TrimSpace(item.DirPath) != "" {
+					m["Path"] = item.DirPath
+				}
 				m["ChildCount"] = seasonEpCounts[item.ID]
 			} else if item.Type == "BoxSet" {
 				m["ChildCount"] = boxsetMemberCounts[item.ID]
+			} else if item.Type == "Folder" && strings.TrimSpace(item.DirPath) != "" {
+				m["Path"] = item.DirPath
 			}
 		}
 

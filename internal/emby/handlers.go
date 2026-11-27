@@ -4,13 +4,16 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"math/rand/v2"
 	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"emby-lite/internal/auth"
 	"emby-lite/internal/cache"
@@ -456,29 +459,60 @@ func (h *Handler) GetItems(c *gin.Context) {
 		parentID = "root"
 	}
 	recursive := strings.EqualFold(queryCI(c, "Recursive"), "true")
-	idsParam := queryCI(c, "Ids")
-	excludeIDs := splitCSV(queryCI(c, "ExcludeItemIds"))
+	idsParam := queryAllCI(c, "Ids")
+	excludeIDs := splitCSV(queryAllCI(c, "ExcludeItemIds"))
 	searchTerm := strings.TrimSpace(queryCI(c, "SearchTerm"))
 	nameStartsWith := strings.TrimSpace(queryCI(c, "NameStartsWith"))
 	nameStartsWithOrGreater := strings.TrimSpace(queryCI(c, "NameStartsWithOrGreater"))
 	nameLessThan := strings.TrimSpace(queryCI(c, "NameLessThan"))
-	includeTypes := normalizeItemTypes(splitCSV(queryCI(c, "IncludeItemTypes")))
-	excludeTypes := normalizeItemTypes(splitCSV(queryCI(c, "ExcludeItemTypes")))
-	filters := splitCSV(queryCI(c, "Filters"))
-	genres := splitMulti(queryCI(c, "Genres"))
-	genreIDs := splitMulti(queryCI(c, "GenreIds"))
-	tags := splitMulti(queryCI(c, "Tags"))
-	tagIDs := splitMulti(queryCI(c, "TagIds"))
-	studios := splitMulti(queryCI(c, "Studios"))
-	studioIDs := splitMulti(queryCI(c, "StudioIds"))
-	officialRatings := splitMulti(queryCI(c, "OfficialRatings"))
-	years := splitCSV(queryCI(c, "Years"))
-	personIDs := splitCSV(queryCI(c, "PersonIds"))
+	includeTypesRaw := queryAllCI(c, "IncludeItemTypes")
+	includeTypes := normalizeItemTypes(splitCSV(includeTypesRaw))
+	excludeTypes := normalizeItemTypes(splitCSV(queryAllCI(c, "ExcludeItemTypes")))
+	filtersRaw := queryAllCI(c, "Filters")
+	filters := splitCSV(filtersRaw)
+	genresRaw := queryAllCI(c, "Genres")
+	genres := splitMulti(genresRaw)
+	genreIDsRaw := queryAllCI(c, "GenreIds")
+	genreIDs := splitMulti(genreIDsRaw)
+	tagsRaw := queryAllCI(c, "Tags")
+	tags := splitMulti(tagsRaw)
+	tagIDsRaw := queryAllCI(c, "TagIds")
+	tagIDs := splitMulti(tagIDsRaw)
+	studiosRaw := queryAllCI(c, "Studios")
+	studios := splitMulti(studiosRaw)
+	studioIDsRaw := queryAllCI(c, "StudioIds")
+	studioIDs := splitMulti(studioIDsRaw)
+	officialRatings := splitMulti(queryAllCI(c, "OfficialRatings"))
+	yearsRaw := queryAllCI(c, "Years")
+	years := splitCSV(yearsRaw)
+	personIDs := splitCSV(queryAllCI(c, "PersonIds"))
 	personName := strings.TrimSpace(queryCI(c, "Person"))
+	mediaTypes := splitCSV(queryAllCI(c, "MediaTypes"))
 	isFavorite := queryCI(c, "IsFavorite")
 	isPlayed := queryCI(c, "IsPlayed")
 	isFolderParam := queryCI(c, "IsFolder")
 	minRatingStr := strings.TrimSpace(queryCI(c, "MinCommunityRating"))
+	sortByRaw := queryAllCI(c, "SortBy")
+	sortOrderRaw := queryAllCI(c, "SortOrder")
+	fieldsRaw := queryAllCI(c, "Fields")
+
+	// Some Emby clients (e.g. Yamby) search People/Genres/Tags/Studios via /Items?IncludeItemTypes=Person|Genre|Tag|Studio.
+	if len(includeTypes) == 1 && idsParam == "" {
+		switch includeTypes[0] {
+		case "Person":
+			h.GetPersons(c)
+			return
+		case "Genre":
+			h.GetGenres(c)
+			return
+		case "Tag":
+			h.GetTags(c)
+			return
+		case "Studio":
+			h.GetStudios(c)
+			return
+		}
+	}
 
 	// Clients like Yamby / Infuse may request top-level libraries via /Items?IncludeItemTypes=CollectionFolder,UserView
 	// or non-recursive /Users/{id}/Items (ParentId="" or "root") without media filters.
@@ -517,10 +551,10 @@ func (h *Handler) GetItems(c *gin.Context) {
 		uid,
 		parentID,
 		searchTerm,
-		queryCI(c, "IncludeItemTypes"),
-		queryCI(c, "SortBy"),
-		queryCI(c, "SortOrder"),
-		queryCI(c, "Filters")+queryCI(c, "Genres")+queryCI(c, "GenreIds")+queryCI(c, "Tags")+queryCI(c, "TagIds")+queryCI(c, "Studios")+queryCI(c, "StudioIds")+queryCI(c, "Years"),
+		includeTypesRaw,
+		sortByRaw,
+		sortOrderRaw,
+		filtersRaw+genresRaw+genreIDsRaw+tagsRaw+tagIDsRaw+studiosRaw+studioIDsRaw+yearsRaw,
 	)
 	if cursorTok := strings.TrimSpace(queryCI(c, "Cursor")); cursorTok != "" {
 		cp, err := verifyCursor(h.auth.ImageSecret(), cursorTok, scopeHash)
@@ -611,22 +645,24 @@ func (h *Handler) GetItems(c *gin.Context) {
 		}
 		defaultVirtualSort = rule.SortBy
 	} else if parentID != "" && parentID != "root" {
-		if recursive {
+		// BoxSet members are linked through box_set_items instead of parent_id (both recursive and direct).
+		var memberIDs []string
+		if err := h.db.Read().Model(&model.BoxSetItem{}).
+			Where("box_set_id = ?", parentID).
+			Order("sort_idx ASC").
+			Pluck("item_id", &memberIDs).Error; err == nil && len(memberIDs) > 0 {
+			if recursive {
+				q = q.Where("(items.id IN ? OR items.series_id IN ?)", memberIDs, memberIDs)
+			} else {
+				q = q.Where("items.id IN ?", memberIDs)
+			}
+		} else if recursive || searchTerm != "" || containsCI(includeTypes, "Episode") || containsCI(includeTypes, "Season") {
 			// Parent could be a library, series, or season.
 			q = q.Where("(items.library_id = ? OR items.parent_id = ? OR items.series_id = ? OR items.season_id = ?)",
 				parentID, parentID, parentID, parentID)
 		} else {
-			// BoxSet members are linked through box_set_items instead of parent_id.
-			var memberIDs []string
-			if err := h.db.Read().Model(&model.BoxSetItem{}).
-				Where("box_set_id = ?", parentID).
-				Order("sort_idx ASC").
-				Pluck("item_id", &memberIDs).Error; err == nil && len(memberIDs) > 0 {
-				q = q.Where("items.id IN ?", memberIDs)
-			} else {
-				q = q.Where("(items.parent_id = ? OR (items.library_id = ? AND items.parent_id = '' AND items.type IN ?))",
-					parentID, parentID, []string{"Movie", "Series", "BoxSet"})
-			}
+			q = q.Where("(items.parent_id = ? OR (items.library_id = ? AND items.parent_id = '' AND items.type IN ?))",
+				parentID, parentID, []string{"Movie", "Series", "BoxSet"})
 		}
 	} else if !recursive && len(includeTypes) == 0 && searchTerm == "" && idsParam == "" {
 		q = q.Where("items.type IN ?", []string{"Movie", "Series"})
@@ -638,41 +674,33 @@ func (h *Handler) GetItems(c *gin.Context) {
 	if len(excludeTypes) > 0 {
 		q = q.Where("items.type NOT IN ?", excludeTypes)
 	}
-	if isFolderParam != "" {
-		if strings.EqualFold(isFolderParam, "true") {
-			q = q.Where("items.type IN ?", []string{"Series", "Season", "BoxSet", "Folder"})
-		} else if strings.EqualFold(isFolderParam, "false") {
-			q = q.Where("items.type NOT IN ?", []string{"Series", "Season", "BoxSet", "Folder"})
+	if len(mediaTypes) > 0 {
+		if !containsCI(mediaTypes, "Video") {
+			c.JSON(http.StatusOK, gin.H{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": startIndex, "HasMore": false})
+			return
 		}
+		q = q.Where("items.type IN ?", []string{"Movie", "Episode"})
+	}
+	wantFolder := strings.EqualFold(isFolderParam, "true") || containsCI(filters, "IsFolder")
+	wantNotFolder := strings.EqualFold(isFolderParam, "false") || containsCI(filters, "IsNotFolder")
+	if wantFolder && !wantNotFolder {
+		q = q.Where("items.type IN ?", []string{"Series", "Season", "BoxSet", "Folder"})
+	} else if wantNotFolder && !wantFolder {
+		q = q.Where("items.type NOT IN ?", []string{"Series", "Season", "BoxSet", "Folder"})
 	}
 
 	if searchTerm != "" {
-		like := "%" + strings.ToLower(searchTerm) + "%"
-		switch {
-		case h.db.Dialect == "postgres" && h.db.HasTrgm:
-			q = q.Where("(items.name % ? OR items.original_name % ? OR items.name ILIKE ? OR items.original_name ILIKE ? OR items.pinyin_initials ILIKE ?)",
-				searchTerm, searchTerm, like, like, like)
-		case h.db.Dialect == "sqlite" && h.db.HasFTS5:
-			ftsQuery := sanitizeFTSQuery(searchTerm)
-			if ftsQuery != "" {
-				q = q.Where("(items.id IN (SELECT item_id FROM items_fts WHERE items_fts MATCH ?) OR LOWER(items.name) LIKE ? OR LOWER(items.original_name) LIKE ? OR items.pinyin_initials LIKE ?)",
-					ftsQuery, like, like, like)
-			} else {
-				q = q.Where("(LOWER(items.name) LIKE ? OR LOWER(items.original_name) LIKE ? OR items.pinyin_initials LIKE ?)", like, like, like)
-			}
-		default:
-			q = q.Where("(LOWER(items.name) LIKE ? OR LOWER(items.original_name) LIKE ? OR items.pinyin_initials LIKE ?)", like, like, like)
-		}
+		q = h.applyItemSearch(q, searchTerm)
 	}
 	if nameStartsWith != "" {
-		prefix := strings.ToLower(nameStartsWith) + "%"
-		q = q.Where("(LOWER(items.sort_name) LIKE ? OR items.pinyin_initials LIKE ?)", prefix, prefix)
+		prefix := escapeSQLLike(strings.ToLower(nameStartsWith)) + "%"
+		q = q.Where("(LOWER(items.sort_name) LIKE ? ESCAPE '\\' OR items.pinyin_initials LIKE ? ESCAPE '\\')", prefix, prefix)
 	}
 	if nameStartsWithOrGreater != "" {
-		q = q.Where("LOWER(items.sort_name) >= ?", strings.ToLower(nameStartsWithOrGreater))
+		q = q.Where(effectiveSortNameExpr+" >= ?", strings.ToLower(nameStartsWithOrGreater))
 	}
 	if nameLessThan != "" {
-		q = q.Where("LOWER(items.sort_name) < ?", strings.ToLower(nameLessThan))
+		q = q.Where(effectiveSortNameExpr+" < ?", strings.ToLower(nameLessThan))
 	}
 	if len(years) > 0 {
 		var yi []int
@@ -796,23 +824,45 @@ func (h *Handler) GetItems(c *gin.Context) {
 		}
 	}
 
-	sortByParam := queryCI(c, "SortBy")
+	sortByParam := sortByRaw
 	if sortByParam == "" && defaultVirtualSort != "" {
 		sortByParam = defaultVirtualSort
 	}
-	useUserDataSort := uid != "" && containsCI(splitCSV(sortByParam), "DatePlayed")
-	orderClause := buildOrderClauseWithUserData(sortByParam, queryCI(c, "SortOrder"), useUserDataSort)
+	sortFields := splitCSV(sortByParam)
+	useUserDataSort := uid != "" && hasAnyCI(sortFields, "DatePlayed", "SeriesDatePlayed", "PlayCount", "IsPlayed", "IsUnplayed", "IsFavoriteOrLiked")
+	useLatestEpisodeSort := hasAnyCI(sortFields, "DateLastContentAdded", "SeriesDateLastContentAdded", "DateLastEpisodeAdded")
 	listQ := q
+	if useUserDataSort || useLatestEpisodeSort {
+		listQ = listQ.Select("items.*")
+	}
 	if useUserDataSort {
-		listQ = q.Select("items.*").Joins("LEFT JOIN user_data AS ud_sort ON ud_sort.item_id = items.id AND ud_sort.user_id = ?", uid)
+		listQ = listQ.Joins("LEFT JOIN user_data AS ud_sort ON ud_sort.item_id = items.id AND ud_sort.user_id = ?", uid)
+	}
+	if useLatestEpisodeSort {
+		listQ = listQ.Joins("LEFT JOIN (SELECT series_id, MAX(added_at) AS max_added_at FROM items WHERE type = 'Episode' AND soft_deleted_at IS NULL GROUP BY series_id) AS ep_latest ON ep_latest.series_id = items.id")
 	}
 	var rows []model.Item
-	if err := listQ.Order(orderClause).Offset(startIndex).Limit(limit).Find(&rows).Error; err != nil {
+	if sortByParam == "" && searchTerm != "" {
+		lowerTerm := strings.ToLower(searchTerm)
+		prefixTerm := escapeSQLLike(lowerTerm) + "%"
+		listQ = listQ.Order(gorm.Expr(
+			"CASE WHEN LOWER(items.name) = ? OR LOWER(items.original_name) = ? THEN 0 WHEN LOWER(items.name) LIKE ? ESCAPE '\\' OR LOWER(items.original_name) LIKE ? ESCAPE '\\' OR items.pinyin_initials = ? THEN 1 WHEN items.pinyin_initials LIKE ? ESCAPE '\\' THEN 2 ELSE 3 END ASC, "+effectiveSortNameExpr+" ASC, LOWER(items.sort_name) ASC, items.id ASC",
+			lowerTerm, lowerTerm, prefixTerm, prefixTerm, lowerTerm, prefixTerm,
+		))
+	} else {
+		orderClause := buildOrderClauseWithOpts(sortByParam, sortOrderRaw, orderBuildOpts{
+			Dialect:              h.db.Dialect,
+			HasUserDataJoin:      useUserDataSort,
+			HasLatestEpisodeJoin: useLatestEpisodeSort,
+		})
+		listQ = listQ.Order(orderClause)
+	}
+	if err := listQ.Offset(startIndex).Limit(limit).Find(&rows).Error; err != nil {
 		jsonErr(c, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	needDetail := fieldsNeedDetail(queryCI(c, "Fields"))
+	needDetail := fieldsNeedDetail(fieldsRaw)
 
 	out := h.itemsToDTOs(c.Request, p, rows, needDetail)
 	if wantResumable {
@@ -1107,7 +1157,11 @@ func (h *Handler) GetEpisodes(c *gin.Context) {
 	var total int64
 	_ = q.Count(&total).Error
 	var eps []model.Item
-	_ = q.Order("season_num ASC, episode_num ASC, sort_name ASC").Offset(startIndex).Limit(limit).Find(&eps).Error
+	epOrder := "season_num ASC, episode_num ASC, LOWER(sort_name) ASC, id ASC"
+	if containsCI(splitCSV(queryAllCI(c, "SortBy")), "Random") {
+		epOrder = "RANDOM()"
+	}
+	_ = q.Order(epOrder).Offset(startIndex).Limit(limit).Find(&eps).Error
 	out := h.itemsToDTOs(c.Request, p, eps, true)
 	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": total, "StartIndex": startIndex})
 }
@@ -1155,17 +1209,205 @@ func (h *Handler) GetNextUp(c *gin.Context) {
 
 func (h *Handler) GetSimilar(c *gin.Context) {
 	p := getPrincipal(c)
-	item := h.getItemByID(c.Param("itemId"))
-	if item == nil || !h.auth.CanAccessLibrary(p, item.LibraryID) {
-		c.JSON(http.StatusOK, gin.H{"Items": []any{}, "TotalRecordCount": 0})
+	uidScope := c.Param("userId")
+	if uidScope == "" {
+		uidScope = queryCI(c, "UserId")
+	}
+	if uidScope != "" && !h.checkUserScope(c, p, uidScope) {
 		return
 	}
+	itemID := c.Param("itemId")
+	if itemID == "" {
+		itemID = c.Param("seriesId")
+	}
+	item := h.getItemByID(itemID)
+	if item == nil || !h.auth.CanAccessLibrary(p, item.LibraryID) {
+		c.JSON(http.StatusOK, gin.H{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": 0})
+		return
+	}
+	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
+	if len(visibleIDs) == 0 {
+		c.JSON(http.StatusOK, gin.H{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": 0})
+		return
+	}
+
 	limit := queryIntCI(c, "Limit", 12)
+	if limit <= 0 {
+		limit = 12
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	// Emby official behavior: Episode and Season detail pages recommend similar Series (never Episodes/Seasons),
+	// and always exclude the episode's/season's own parent Series.
+	targetItem := item
+	targetType := item.Type
+	if item.Type == "Episode" || item.Type == "Season" {
+		targetType = "Series"
+		if series := h.resolveParentSeries(item); series != nil {
+			targetItem = series
+		}
+	}
+
+	excludeSet := map[string]bool{item.ID: true}
+	if targetItem != nil && targetItem.ID != "" {
+		excludeSet[targetItem.ID] = true
+	}
+	for _, eid := range splitCSV(queryAllCI(c, "ExcludeItemIds")) {
+		excludeSet[eid] = true
+	}
+	excludeIDs := make([]string, 0, len(excludeSet))
+	for eid := range excludeSet {
+		excludeIDs = append(excludeIDs, eid)
+	}
+
+	var targetGenres []string
+	if targetItem != nil {
+		_ = h.db.Read().Model(&model.ItemGenre{}).Where("item_id = ?", targetItem.ID).Pluck("genre", &targetGenres).Error
+	}
+
+	q := h.db.Read().Model(&model.Item{}).
+		Where("items.library_id IN ? AND items.type = ? AND items.id NOT IN ? AND items.soft_deleted_at IS NULL",
+			visibleIDs, targetType, excludeIDs)
+	if p != nil && p.User != nil && h.loadUserConfig(p.User.ID).HidePlayedInMoreLikeThis {
+		q = q.Where("items.id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true)
+	}
+
+	preferLibID := item.LibraryID
+	if targetItem != nil && targetItem.LibraryID != "" {
+		preferLibID = targetItem.LibraryID
+	}
+	if len(targetGenres) > 0 {
+		q = q.Order(gorm.Expr(
+			"(SELECT COUNT(*) FROM item_genres ig WHERE ig.item_id = items.id AND ig.genre IN ?) DESC, CASE WHEN items.library_id = ? THEN 0 ELSE 1 END ASC, items.community_rating DESC, items.added_at DESC, items.id ASC",
+			targetGenres, preferLibID,
+		))
+	} else {
+		q = q.Order(gorm.Expr(
+			"CASE WHEN items.library_id = ? THEN 0 ELSE 1 END ASC, items.community_rating DESC, items.added_at DESC, items.id ASC",
+			preferLibID,
+		))
+	}
+
 	var rows []model.Item
-	_ = h.db.Read().Where("library_id = ? AND type = ? AND id <> ? AND soft_deleted_at IS NULL", item.LibraryID, item.Type, item.ID).
-		Order("added_at DESC").Limit(limit).Find(&rows).Error
-	out := h.itemsToDTOs(c.Request, p, rows, fieldsNeedDetail(queryCI(c, "Fields")))
-	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": len(out)})
+	_ = q.Limit(limit).Find(&rows).Error
+	out := h.itemsToDTOs(c.Request, p, rows, fieldsNeedDetail(queryAllCI(c, "Fields")))
+	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": len(out), "StartIndex": 0})
+}
+
+func (h *Handler) resolveParentSeries(item *model.Item) *model.Item {
+	if item == nil {
+		return nil
+	}
+	if item.Type == "Series" {
+		return item
+	}
+	if item.SeriesID != "" {
+		if s := h.getItemByID(item.SeriesID); s != nil {
+			return s
+		}
+	}
+	if item.SeasonID != "" {
+		if season := h.getItemByID(item.SeasonID); season != nil {
+			if season.SeriesID != "" {
+				if s := h.getItemByID(season.SeriesID); s != nil {
+					return s
+				}
+			}
+			if season.ParentID != "" {
+				if p := h.getItemByID(season.ParentID); p != nil && p.Type == "Series" {
+					return p
+				}
+			}
+		}
+	}
+	if item.ParentID != "" {
+		if p := h.getItemByID(item.ParentID); p != nil {
+			if p.Type == "Series" {
+				return p
+			}
+			if p.SeriesID != "" {
+				if s := h.getItemByID(p.SeriesID); s != nil {
+					return s
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// GetInstantMix implements Emby GET /Items/:itemId/InstantMix (and /Shows|Movies/:itemId/InstantMix)
+// returning a fresh randomized list of playable items for shuffle/mix actions.
+func (h *Handler) GetInstantMix(c *gin.Context) {
+	p := getPrincipal(c)
+	uidScope := c.Param("userId")
+	if uidScope == "" {
+		uidScope = queryCI(c, "UserId")
+	}
+	if uidScope != "" && !h.checkUserScope(c, p, uidScope) {
+		return
+	}
+	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
+	if len(visibleIDs) == 0 {
+		c.JSON(http.StatusOK, gin.H{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": 0})
+		return
+	}
+	limit := queryIntCI(c, "Limit", 50)
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 300 {
+		limit = 300
+	}
+
+	itemID := c.Param("itemId")
+	if itemID == "" {
+		itemID = c.Param("seriesId")
+	}
+	q := h.db.Read().Model(&model.Item{}).
+		Where("items.soft_deleted_at IS NULL AND items.library_id IN ? AND items.type IN ?", visibleIDs, []string{"Movie", "Episode"})
+
+	var lib model.Library
+	if err := h.db.Read().Where("id = ?", itemID).First(&lib).Error; err == nil {
+		if !h.auth.CanAccessLibrary(p, lib.ID) {
+			c.JSON(http.StatusOK, gin.H{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": 0})
+			return
+		}
+		q = q.Where("items.library_id = ?", lib.ID)
+	} else if item := h.getItemByID(itemID); item != nil {
+		if !h.auth.CanAccessLibrary(p, item.LibraryID) {
+			c.JSON(http.StatusOK, gin.H{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": 0})
+			return
+		}
+		switch item.Type {
+		case "Series":
+			q = q.Where("items.series_id = ? AND items.type = ?", item.ID, "Episode")
+		case "Season":
+			q = q.Where("items.season_id = ? AND items.type = ?", item.ID, "Episode")
+		case "BoxSet":
+			var memberIDs []string
+			_ = h.db.Read().Model(&model.BoxSetItem{}).Where("box_set_id = ?", item.ID).Pluck("item_id", &memberIDs).Error
+			if len(memberIDs) == 0 {
+				c.JSON(http.StatusOK, gin.H{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": 0})
+				return
+			}
+			q = q.Where("(items.id IN ? OR items.series_id IN ?)", memberIDs, memberIDs)
+		case "Episode":
+			if s := h.resolveParentSeries(item); s != nil {
+				q = q.Where("items.series_id = ? AND items.type = ?", s.ID, "Episode")
+			} else {
+				q = q.Where("items.library_id = ? AND items.type = ?", item.LibraryID, "Episode")
+			}
+		default:
+			q = q.Where("items.library_id = ? AND items.type = ?", item.LibraryID, "Movie")
+		}
+	}
+
+	var rows []model.Item
+	_ = q.Order("RANDOM()").Limit(limit).Find(&rows).Error
+	out := h.itemsToDTOs(c.Request, p, rows, fieldsNeedDetail(queryAllCI(c, "Fields")))
+	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": len(out), "StartIndex": 0})
 }
 
 func (h *Handler) GetCounts(c *gin.Context) {
@@ -1181,66 +1423,153 @@ func (h *Handler) GetGenres(c *gin.Context) {
 	p := getPrincipal(c)
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
 	parentID := queryCI(c, "ParentId")
-	cacheKey := dtoCacheVersion + ":genres:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
-	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
-		var names []string
-		if len(visibleIDs) > 0 {
-			gq := h.db.Read().Table("item_genres").
-				Select("DISTINCT item_genres.genre").
-				Joins("JOIN items ON items.id = item_genres.item_id").
-				Where("items.library_id IN ? AND items.soft_deleted_at IS NULL", visibleIDs)
-			if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
-				gq = gq.Where("items.library_id = ?", parentID)
-			}
-			_ = gq.Order("item_genres.genre ASC").Pluck("genre", &names).Error
+	searchTerm := strings.TrimSpace(queryCI(c, "SearchTerm"))
+	nameStartsWith := strings.TrimSpace(queryCI(c, "NameStartsWith"))
+	sortBy := queryAllCI(c, "SortBy")
+	sortOrder := queryAllCI(c, "SortOrder")
+	startIndex := queryIntCI(c, "StartIndex", 0)
+	limit := queryIntCI(c, "Limit", 0)
+
+	if searchTerm == "" && nameStartsWith == "" && sortBy == "" && sortOrder == "" && startIndex == 0 && limit == 0 {
+		cacheKey := dtoCacheVersion + ":genres:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
+		h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
+			names := h.collectGenreNames(visibleIDs, parentID)
+			items := h.buildNameEntityDTOs("genre", "Genre", names)
+			return gin.H{"Items": items, "TotalRecordCount": len(items), "StartIndex": 0}, nil
+		})
+		return
+	}
+	names := filterSortSlice(h.collectGenreNames(visibleIDs, parentID), searchTerm, nameStartsWith, sortBy, sortOrder)
+	page, total, start := slicePage(names, startIndex, limit)
+	items := h.buildNameEntityDTOs("genre", "Genre", page)
+	c.JSON(http.StatusOK, gin.H{"Items": items, "TotalRecordCount": total, "StartIndex": start})
+}
+
+func (h *Handler) collectGenreNames(visibleIDs []string, parentID string) []string {
+	var names []string
+	if len(visibleIDs) > 0 {
+		gq := h.db.Read().Table("item_genres").
+			Select("DISTINCT item_genres.genre").
+			Joins("JOIN items ON items.id = item_genres.item_id").
+			Where("items.library_id IN ? AND items.soft_deleted_at IS NULL", visibleIDs)
+		if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
+			gq = gq.Where("items.library_id = ?", parentID)
 		}
-		sid := h.serverID()
-		items := make([]map[string]any, 0, len(names))
-		for _, n := range names {
-			items = append(items, map[string]any{
-				"Name":      n,
-				"Id":        strconv.FormatInt(stableNumericID("genre", n), 10),
-				"ServerId":  sid,
-				"Type":      "Genre",
-				"IsFolder":  false,
-				"ImageTags": map[string]string{},
-			})
-		}
-		return gin.H{"Items": items, "TotalRecordCount": len(items), "StartIndex": 0}, nil
-	})
+		_ = gq.Order("item_genres.genre ASC").Pluck("genre", &names).Error
+	}
+	return names
 }
 
 func (h *Handler) GetTags(c *gin.Context) {
 	p := getPrincipal(c)
 	visibleIDs, _ := h.auth.VisibleLibraryIDs(p)
 	parentID := queryCI(c, "ParentId")
-	cacheKey := dtoCacheVersion + ":tags:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
-	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
-		var names []string
-		if len(visibleIDs) > 0 {
-			tq := h.db.Read().Table("item_tags").
-				Select("DISTINCT item_tags.tag").
-				Joins("JOIN items ON items.id = item_tags.item_id").
-				Where("items.library_id IN ? AND items.soft_deleted_at IS NULL", visibleIDs)
-			if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
-				tq = tq.Where("items.library_id = ?", parentID)
+	searchTerm := strings.TrimSpace(queryCI(c, "SearchTerm"))
+	nameStartsWith := strings.TrimSpace(queryCI(c, "NameStartsWith"))
+	sortBy := queryAllCI(c, "SortBy")
+	sortOrder := queryAllCI(c, "SortOrder")
+	startIndex := queryIntCI(c, "StartIndex", 0)
+	limit := queryIntCI(c, "Limit", 0)
+
+	if searchTerm == "" && nameStartsWith == "" && sortBy == "" && sortOrder == "" && startIndex == 0 && limit == 0 {
+		cacheKey := dtoCacheVersion + ":tags:" + h.db.GetLibraryRevision() + ":" + visibleIDsHash(visibleIDs) + ":" + parentID
+		h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
+			names := h.collectTagNames(visibleIDs, parentID)
+			items := h.buildNameEntityDTOs("tag", "Tag", names)
+			return gin.H{"Items": items, "TotalRecordCount": len(items), "StartIndex": 0}, nil
+		})
+		return
+	}
+	names := filterSortSlice(h.collectTagNames(visibleIDs, parentID), searchTerm, nameStartsWith, sortBy, sortOrder)
+	page, total, start := slicePage(names, startIndex, limit)
+	items := h.buildNameEntityDTOs("tag", "Tag", page)
+	c.JSON(http.StatusOK, gin.H{"Items": items, "TotalRecordCount": total, "StartIndex": start})
+}
+
+func (h *Handler) collectTagNames(visibleIDs []string, parentID string) []string {
+	var names []string
+	if len(visibleIDs) > 0 {
+		tq := h.db.Read().Table("item_tags").
+			Select("DISTINCT item_tags.tag").
+			Joins("JOIN items ON items.id = item_tags.item_id").
+			Where("items.library_id IN ? AND items.soft_deleted_at IS NULL", visibleIDs)
+		if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
+			tq = tq.Where("items.library_id = ?", parentID)
+		}
+		_ = tq.Order("item_tags.tag ASC").Pluck("tag", &names).Error
+	}
+	return names
+}
+
+func (h *Handler) buildNameEntityDTOs(prefix, itemType string, names []string) []map[string]any {
+	sid := h.serverID()
+	items := make([]map[string]any, 0, len(names))
+	for _, n := range names {
+		items = append(items, map[string]any{
+			"Name":      n,
+			"Id":        strconv.FormatInt(stableNumericID(prefix, n), 10),
+			"ServerId":  sid,
+			"Type":      itemType,
+			"IsFolder":  false,
+			"ImageTags": map[string]string{},
+		})
+	}
+	return items
+}
+
+func filterSortSlice(names []string, searchTerm, nameStartsWith, sortBy, sortOrder string) []string {
+	tokens := strings.Fields(strings.ToLower(strings.TrimSpace(searchTerm)))
+	prefix := strings.ToLower(strings.TrimSpace(nameStartsWith))
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		ln := strings.ToLower(n)
+		if prefix != "" && !strings.HasPrefix(ln, prefix) {
+			continue
+		}
+		matched := true
+		for _, tok := range tokens {
+			if !strings.Contains(ln, tok) {
+				matched = false
+				break
 			}
-			_ = tq.Order("item_tags.tag ASC").Pluck("tag", &names).Error
 		}
-		sid := h.serverID()
-		items := make([]map[string]any, 0, len(names))
-		for _, n := range names {
-			items = append(items, map[string]any{
-				"Name":      n,
-				"Id":        strconv.FormatInt(stableNumericID("tag", n), 10),
-				"ServerId":  sid,
-				"Type":      "Tag",
-				"IsFolder":  false,
-				"ImageTags": map[string]string{},
-			})
+		if matched {
+			out = append(out, n)
 		}
-		return gin.H{"Items": items, "TotalRecordCount": len(items), "StartIndex": 0}, nil
+	}
+	if containsCI(splitCSV(sortBy), "Random") {
+		rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+		return out
+	}
+	desc := isDescendingOrder(sortOrder)
+	sort.Slice(out, func(i, j int) bool {
+		li, lj := strings.ToLower(out[i]), strings.ToLower(out[j])
+		if li == lj {
+			if desc {
+				return out[i] > out[j]
+			}
+			return out[i] < out[j]
+		}
+		if desc {
+			return li > lj
+		}
+		return li < lj
 	})
+	return out
+}
+
+func slicePage(list []string, startIndex, limit int) ([]string, int, int) {
+	if startIndex < 0 {
+		startIndex = 0
+	}
+	total := len(list)
+	if startIndex >= total {
+		return []string{}, total, startIndex
+	}
+	if limit <= 0 || startIndex+limit > total {
+		return list[startIndex:], total, startIndex
+	}
+	return list[startIndex : startIndex+limit], total, startIndex
 }
 
 func (h *Handler) GetFilters(c *gin.Context) {
@@ -1485,21 +1814,54 @@ func (h *Handler) GetPersons(c *gin.Context) {
 		limit = 60
 	}
 	startIndex := queryIntCI(c, "StartIndex", 0)
+	if startIndex < 0 {
+		startIndex = 0
+	}
 	search := strings.TrimSpace(queryCI(c, "SearchTerm"))
+	nameStartsWith := strings.TrimSpace(queryCI(c, "NameStartsWith"))
+	parentID := queryCI(c, "ParentId")
+	sortBy := queryAllCI(c, "SortBy")
+	sortOrder := queryAllCI(c, "SortOrder")
 
-	q := h.db.Gorm.Table("people").
-		Select("DISTINCT people.*").
+	base := h.db.Read().Table("people").
 		Joins("JOIN item_people ON item_people.person_id = people.id").
 		Joins("JOIN items ON items.id = item_people.item_id").
 		Where("items.library_id IN ? AND items.soft_deleted_at IS NULL", visibleIDs)
-	if search != "" {
-		q = q.Where("LOWER(people.name) LIKE ?", "%"+strings.ToLower(search)+"%")
+	if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
+		base = base.Where("(items.library_id = ? OR items.id = ? OR items.series_id = ?)", parentID, parentID, parentID)
 	}
+	if search != "" {
+		for _, tok := range strings.Fields(strings.ToLower(search)) {
+			base = base.Where("LOWER(people.name) LIKE ? ESCAPE '\\'", "%"+escapeSQLLike(tok)+"%")
+		}
+	}
+	if nameStartsWith != "" {
+		base = base.Where("LOWER(people.name) LIKE ? ESCAPE '\\'", escapeSQLLike(strings.ToLower(nameStartsWith))+"%")
+	}
+
 	var total int64
-	_ = q.Count(&total).Error
+	_ = base.Session(&gorm.Session{}).Select("COUNT(DISTINCT people.id)").Scan(&total).Error
+
+	orderClause := "LOWER(people.name) ASC, people.id ASC"
+	if containsCI(splitCSV(sortBy), "Random") {
+		orderClause = "RANDOM()"
+	} else if isDescendingOrder(sortOrder) {
+		orderClause = "LOWER(people.name) DESC, people.id DESC"
+	}
 
 	var rows []model.Person
-	_ = q.Order("people.name ASC").Offset(startIndex).Limit(limit).Find(&rows).Error
+	listQ := base.Session(&gorm.Session{}).Select("people.*").Group("people.id")
+	if search != "" && sortBy == "" {
+		lowerSearch := strings.ToLower(search)
+		prefixSearch := escapeSQLLike(lowerSearch) + "%"
+		listQ = listQ.Order(gorm.Expr(
+			"CASE WHEN LOWER(people.name) = ? THEN 0 WHEN LOWER(people.name) LIKE ? ESCAPE '\\' THEN 1 ELSE 2 END ASC, LOWER(people.name) ASC, people.id ASC",
+			lowerSearch, prefixSearch,
+		))
+	} else {
+		listQ = listQ.Order(orderClause)
+	}
+	_ = listQ.Offset(startIndex).Limit(limit).Find(&rows).Error
 	metaDir := h.embyMetadataDir()
 	items := make([]map[string]any, 0, len(rows))
 	for _, pr := range rows {
@@ -1719,7 +2081,11 @@ func (h *Handler) PlaybackInfo(c *gin.Context) {
 	if uidScope != "" && !h.checkUserScope(c, p, uidScope) {
 		return
 	}
-	item := h.getItemByID(c.Param("itemId"))
+	itemID := c.Param("itemId")
+	if itemID == "" {
+		itemID = c.Param("seriesId")
+	}
+	item := h.getItemByID(itemID)
 	if item == nil || !h.auth.CanAccessLibrary(p, item.LibraryID) {
 		jsonErr(c, http.StatusNotFound, "item not found")
 		return
@@ -1741,7 +2107,11 @@ func (h *Handler) PlaybackInfo(c *gin.Context) {
 
 func (h *Handler) StreamVideo(c *gin.Context) {
 	p := getPrincipal(c)
-	item := h.getItemByID(c.Param("itemId"))
+	itemID := c.Param("itemId")
+	if itemID == "" {
+		itemID = c.Param("seriesId")
+	}
+	item := h.getItemByID(itemID)
 	if item == nil {
 		jsonErr(c, http.StatusNotFound, "item not found")
 		return
@@ -1752,7 +2122,11 @@ func (h *Handler) StreamVideo(c *gin.Context) {
 
 func (h *Handler) DownloadVideo(c *gin.Context) {
 	p := getPrincipal(c)
-	item := h.getItemByID(c.Param("itemId"))
+	itemID := c.Param("itemId")
+	if itemID == "" {
+		itemID = c.Param("seriesId")
+	}
+	item := h.getItemByID(itemID)
 	if item == nil {
 		jsonErr(c, http.StatusNotFound, "item not found")
 		return
@@ -2216,6 +2590,23 @@ func queryCI(c *gin.Context, key string) string {
 	return ""
 }
 
+// queryAllCI collects all values for a query key case-insensitively (supporting both
+// comma-separated ?SortBy=A,B and repeated ?SortBy=A&SortBy=B forms used by Retrofit/Yamby).
+func queryAllCI(c *gin.Context, key string) string {
+	var collected []string
+	for k, vals := range c.Request.URL.Query() {
+		if !strings.EqualFold(k, key) {
+			continue
+		}
+		for _, v := range vals {
+			if t := strings.TrimSpace(v); t != "" {
+				collected = append(collected, t)
+			}
+		}
+	}
+	return strings.Join(collected, ",")
+}
+
 func queryIntCI(c *gin.Context, key string, fallback int) int {
 	raw := queryCI(c, key)
 	if raw == "" {
@@ -2281,74 +2672,189 @@ func normalizeImageKind(raw string) string {
 	}
 }
 
+func hasAnyCI(slice []string, targets ...string) bool {
+	for _, t := range targets {
+		if containsCI(slice, t) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDescendingOrder(raw string) bool {
+	v := strings.TrimSpace(raw)
+	return strings.EqualFold(v, "Descending") || strings.EqualFold(v, "Desc")
+}
+
+// effectiveSortNameExpr normalizes sort_name for case-insensitive A-Z sorting across both
+// SQLite and PostgreSQL, using pinyin_initials when sort_name starts with non-ASCII (CJK)
+// characters so Chinese titles sort in A-Z pinyin order alongside ASCII titles.
+const effectiveSortNameExpr = "CASE WHEN LOWER(items.sort_name) <= '~' THEN LOWER(items.sort_name) WHEN items.pinyin_initials <> '' THEN items.pinyin_initials ELSE LOWER(items.sort_name) END"
+
+type orderBuildOpts struct {
+	Dialect              string
+	HasUserDataJoin      bool
+	HasLatestEpisodeJoin bool
+}
+
 func buildOrderClause(sortBy, sortOrder string) string {
-	return buildOrderClauseWithUserData(sortBy, sortOrder, false)
+	return buildOrderClauseWithOpts(sortBy, sortOrder, orderBuildOpts{})
 }
 
 func buildOrderClauseWithUserData(sortBy, sortOrder string, hasUserDataJoin bool) string {
+	return buildOrderClauseWithOpts(sortBy, sortOrder, orderBuildOpts{HasUserDataJoin: hasUserDataJoin})
+}
+
+func buildOrderClauseWithOpts(sortBy, sortOrder string, opts orderBuildOpts) string {
 	orders := splitCSV(sortOrder)
 	dirFor := func(i int) string {
 		raw := ""
 		if i < len(orders) {
 			raw = orders[i]
 		} else if len(orders) > 0 {
-			raw = orders[len(orders)-1]
+			raw = orders[0]
 		}
-		if strings.EqualFold(strings.TrimSpace(raw), "Descending") {
+		if isDescendingOrder(raw) {
 			return "DESC"
 		}
 		return "ASC"
 	}
 	fields := splitCSV(sortBy)
 	if len(fields) == 0 {
-		return "items.sort_name ASC, items.id ASC"
+		dir := dirFor(0)
+		return effectiveSortNameExpr + " " + dir + ", LOWER(items.sort_name) " + dir + ", items.id ASC"
+	}
+	premiereExpr := "CASE WHEN items.premiere_date <> '' THEN substr(items.premiere_date, 1, 10) WHEN items.year > 0 THEN printf('%04d-01-01', items.year) ELSE '' END"
+	if opts.Dialect == "postgres" {
+		premiereExpr = "CASE WHEN items.premiere_date <> '' THEN substring(items.premiere_date from 1 for 10) WHEN items.year > 0 THEN lpad(CAST(items.year AS TEXT), 4, '0') || '-01-01' ELSE '' END"
 	}
 	var clauses []string
+	isRandom := false
 	for i, f := range fields {
 		dir := dirFor(i)
-		switch strings.ToLower(f) {
-		case "sortname", "name", "default":
-			clauses = append(clauses, "items.sort_name "+dir)
+		switch strings.ToLower(strings.TrimSpace(f)) {
+		case "random":
+			clauses = append(clauses, "RANDOM()")
+			isRandom = true
+		case "isfolder":
+			clauses = append(clauses, "CASE WHEN items.is_folder THEN 1 ELSE 0 END "+dir)
+		case "sortname", "name", "default", "seriessortname":
+			clauses = append(clauses, effectiveSortNameExpr+" "+dir+", LOWER(items.sort_name) "+dir)
 		case "productionyear":
-			clauses = append(clauses, "items.year "+dir)
-		case "datecreated", "latestadded", "datelastcontentadded", "seriesdatelastcontentadded":
+			clauses = append(clauses, "CASE WHEN items.year > 0 THEN 0 ELSE 1 END ASC, items.year "+dir)
+		case "datecreated", "latestadded":
 			clauses = append(clauses, "items.added_at "+dir)
-		case "dateplayed":
-			if hasUserDataJoin {
+		case "datelastcontentadded", "seriesdatelastcontentadded", "datelastepisodeadded":
+			if opts.HasLatestEpisodeJoin {
+				clauses = append(clauses, "COALESCE(ep_latest.max_added_at, items.added_at) "+dir)
+			} else {
+				clauses = append(clauses, "items.added_at "+dir)
+			}
+		case "datelastsaved", "datemodified":
+			clauses = append(clauses, "items.updated_at "+dir)
+		case "dateplayed", "seriesdateplayed":
+			if opts.HasUserDataJoin {
 				clauses = append(clauses, "CASE WHEN ud_sort.last_played_at IS NULL AND ud_sort.updated_at IS NULL THEN 1 ELSE 0 END ASC, COALESCE(ud_sort.last_played_at, ud_sort.updated_at) "+dir)
 			} else {
 				clauses = append(clauses, "items.added_at "+dir)
 			}
-		case "premieredate", "seriesdatelastreleased":
-			clauses = append(clauses, "items.premiere_date "+dir)
+		case "playcount":
+			if opts.HasUserDataJoin {
+				clauses = append(clauses, "COALESCE(ud_sort.play_count, 0) "+dir)
+			}
+		case "isplayed":
+			if opts.HasUserDataJoin {
+				clauses = append(clauses, "CASE WHEN ud_sort.played THEN 1 ELSE 0 END "+dir)
+			}
+		case "isunplayed":
+			if opts.HasUserDataJoin {
+				clauses = append(clauses, "CASE WHEN ud_sort.played THEN 0 ELSE 1 END "+dir)
+			}
+		case "isfavoriteorliked":
+			if opts.HasUserDataJoin {
+				clauses = append(clauses, "CASE WHEN ud_sort.is_favorite THEN 1 ELSE 0 END "+dir)
+			}
+		case "premieredate", "startdate", "seriesdatelastreleased":
+			clauses = append(clauses, "CASE WHEN items.premiere_date <> '' OR items.year > 0 THEN 0 ELSE 1 END ASC, "+premiereExpr+" "+dir)
 		case "communityrating":
-			clauses = append(clauses, "items.community_rating "+dir)
+			clauses = append(clauses, "CASE WHEN items.community_rating > 0 THEN 0 ELSE 1 END ASC, items.community_rating "+dir)
 		case "criticrating":
-			clauses = append(clauses, "items.critic_rating "+dir)
+			clauses = append(clauses, "CASE WHEN items.critic_rating > 0 THEN 0 ELSE 1 END ASC, items.critic_rating "+dir)
 		case "officialrating":
-			clauses = append(clauses, "items.official_rating "+dir)
+			clauses = append(clauses, "CASE WHEN items.official_rating <> '' THEN 0 ELSE 1 END ASC, LOWER(items.official_rating) "+dir)
 		case "runtime":
-			clauses = append(clauses, "items.runtime_ticks "+dir)
+			clauses = append(clauses, "CASE WHEN items.runtime_ticks > 0 THEN 0 ELSE 1 END ASC, items.runtime_ticks "+dir)
 		case "indexnumber":
 			clauses = append(clauses, "items.episode_num "+dir)
 		case "parentindexnumber":
 			clauses = append(clauses, "items.season_num "+dir)
-		case "random":
-			clauses = append(clauses, "items.random_key "+dir)
+		case "airedepisodeorder":
+			clauses = append(clauses, "items.season_num "+dir+", items.episode_num "+dir)
+		case "filename", "path":
+			clauses = append(clauses, "LOWER(items.dir_path) "+dir+", LOWER(items.sort_name) "+dir)
+		case "studio":
+			clauses = append(clauses, "CASE WHEN items.studios_json <> '' AND items.studios_json <> '[]' THEN 0 ELSE 1 END ASC, LOWER(items.studios_json) "+dir)
+		case "videobitrate", "bitrate":
+			clauses = append(clauses, "COALESCE((SELECT MAX(ms.bitrate) FROM media_sources ms WHERE ms.item_id = items.id), 0) "+dir)
 		}
 	}
 	if len(clauses) == 0 {
-		return "items.sort_name ASC, items.id ASC"
+		dir := dirFor(0)
+		return effectiveSortNameExpr + " " + dir + ", LOWER(items.sort_name) " + dir + ", items.id ASC"
 	}
-	clauses = append(clauses, "items.id ASC")
+	if !isRandom {
+		clauses = append(clauses, "items.id ASC")
+	}
 	return strings.Join(clauses, ", ")
 }
 
+func escapeSQLLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
+}
+
+func (h *Handler) applyItemSearch(q *gorm.DB, rawTerm string) *gorm.DB {
+	term := strings.TrimSpace(rawTerm)
+	if term == "" {
+		return q
+	}
+	tokens := strings.Fields(strings.ToLower(term))
+	if len(tokens) <= 1 {
+		like := "%" + escapeSQLLike(strings.ToLower(term)) + "%"
+		switch {
+		case h.db.Dialect == "postgres" && h.db.HasTrgm:
+			return q.Where("(items.name % ? OR items.original_name % ? OR items.name ILIKE ? ESCAPE '\\' OR items.original_name ILIKE ? ESCAPE '\\' OR items.sort_name ILIKE ? ESCAPE '\\' OR items.pinyin_initials ILIKE ? ESCAPE '\\')",
+				term, term, like, like, like, like)
+		case h.db.Dialect == "sqlite" && h.db.HasFTS5:
+			ftsQuery := sanitizeFTSQuery(term)
+			if ftsQuery != "" {
+				return q.Where("(items.id IN (SELECT item_id FROM items_fts WHERE items_fts MATCH ?) OR LOWER(items.name) LIKE ? ESCAPE '\\' OR LOWER(items.original_name) LIKE ? ESCAPE '\\' OR LOWER(items.sort_name) LIKE ? ESCAPE '\\' OR items.pinyin_initials LIKE ? ESCAPE '\\')",
+					ftsQuery, like, like, like, like)
+			}
+			return q.Where("(LOWER(items.name) LIKE ? ESCAPE '\\' OR LOWER(items.original_name) LIKE ? ESCAPE '\\' OR LOWER(items.sort_name) LIKE ? ESCAPE '\\' OR items.pinyin_initials LIKE ? ESCAPE '\\')", like, like, like, like)
+		default:
+			return q.Where("(LOWER(items.name) LIKE ? ESCAPE '\\' OR LOWER(items.original_name) LIKE ? ESCAPE '\\' OR LOWER(items.sort_name) LIKE ? ESCAPE '\\' OR items.pinyin_initials LIKE ? ESCAPE '\\')", like, like, like, like)
+		}
+	}
+	for _, tok := range tokens {
+		like := "%" + escapeSQLLike(tok) + "%"
+		if h.db.Dialect == "postgres" {
+			q = q.Where("(items.name ILIKE ? ESCAPE '\\' OR items.original_name ILIKE ? ESCAPE '\\' OR items.sort_name ILIKE ? ESCAPE '\\' OR items.pinyin_initials ILIKE ? ESCAPE '\\')", like, like, like, like)
+		} else {
+			q = q.Where("(LOWER(items.name) LIKE ? ESCAPE '\\' OR LOWER(items.original_name) LIKE ? ESCAPE '\\' OR LOWER(items.sort_name) LIKE ? ESCAPE '\\' OR items.pinyin_initials LIKE ? ESCAPE '\\')", like, like, like, like)
+		}
+	}
+	return q
+}
+
 func sanitizeFTSQuery(raw string) string {
-	fields := strings.Fields(raw)
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
 	var terms []string
-	for _, f := range fields {
-		cleaned := strings.ReplaceAll(f, `"`, "")
+	for _, cleaned := range parts {
 		cleaned = strings.TrimSpace(cleaned)
 		if cleaned != "" {
 			terms = append(terms, `"`+cleaned+`"*`)

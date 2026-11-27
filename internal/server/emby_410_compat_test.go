@@ -672,23 +672,54 @@ func TestEmbyRestAPISchemaAlignment(t *testing.T) {
 		t.Fatalf("rewatched movie1 missing from Resume: %d %s", rec.Code, rec.Body.String())
 	}
 
-	// 4. Resume cache isolates distinct request Host/Origin when Fields=MediaSources is requested.
+	// 4. MediaSources Path exposes STRM target URL for STRM and real local path for local files,
+	// while ExternalPlay still builds absolute playback URLs from the request Host/Origin.
+	_ = srv.DB.Gorm.Create(&model.MediaSource{
+		ID: "spec-src-local-2", ItemID: movie2.ID, SourceType: "local",
+		Path: filepath.Join(mediaDir, "b.mkv"), Container: "mkv", FileSize: 1024, Width: 1920, Height: 1080,
+	}).Error
+
 	reqLan := httptest.NewRequest(http.MethodGet, "/emby/Users/"+uid+"/Items/Resume?Fields=MediaSources", nil)
 	reqLan.Host = "192.168.1.10:8096"
 	reqLan.Header.Set("X-Emby-Token", tok)
 	recLan := httptest.NewRecorder()
 	h.ServeHTTP(recLan, reqLan)
-	if !strings.Contains(recLan.Body.String(), "http://192.168.1.10:8096/emby/Videos/") {
-		t.Fatalf("LAN resume missing LAN origin: %s", recLan.Body.String())
+	if !strings.Contains(recLan.Body.String(), `"Path":"https://cdn.example.com/a.mkv"`) || !strings.Contains(recLan.Body.String(), `"Protocol":"Http"`) {
+		t.Fatalf("STRM MediaSource Path should expose STRM target URL, got: %s", recLan.Body.String())
 	}
-	reqWan := httptest.NewRequest(http.MethodGet, "/emby/Users/"+uid+"/Items/Resume?Fields=MediaSources", nil)
-	reqWan.Host = "emby.example.com"
-	reqWan.Header.Set("X-Forwarded-Proto", "https")
-	reqWan.Header.Set("X-Emby-Token", tok)
-	recWan := httptest.NewRecorder()
-	h.ServeHTTP(recWan, reqWan)
-	if !strings.Contains(recWan.Body.String(), "https://emby.example.com/emby/Videos/") {
-		t.Fatalf("WAN resume polluted by LAN cached origin: %s", recWan.Body.String())
+
+	recLocalDetail := doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/"+movie2.ID, tok, nil)
+	var localDetail map[string]any
+	_ = json.Unmarshal(recLocalDetail.Body.Bytes(), &localDetail)
+	wantLocalPath := filepath.Join(mediaDir, "b.mkv")
+	if localDetail["Path"] != wantLocalPath {
+		t.Fatalf("local BaseItemDto.Path = %v, want %q", localDetail["Path"], wantLocalPath)
+	}
+	localSources, _ := localDetail["MediaSources"].([]any)
+	if len(localSources) != 1 {
+		t.Fatalf("expected 1 local MediaSource, got %v", localSources)
+	}
+	localMS := localSources[0].(map[string]any)
+	if localMS["Path"] != wantLocalPath || localMS["Protocol"] != "File" || localMS["IsRemote"] != false {
+		t.Fatalf("local MediaSource Path/Protocol mismatch: %#v", localMS)
+	}
+
+	reqExtLan := httptest.NewRequest(http.MethodGet, "/api/web/external-play/"+movie2.ID, nil)
+	reqExtLan.Host = "192.168.1.10:8096"
+	reqExtLan.Header.Set("X-Emby-Token", tok)
+	recExtLan := httptest.NewRecorder()
+	h.ServeHTTP(recExtLan, reqExtLan)
+	if !strings.Contains(recExtLan.Body.String(), "http://192.168.1.10:8096/emby/Videos/") {
+		t.Fatalf("ExternalPlay LAN missing LAN direct_url: %s", recExtLan.Body.String())
+	}
+	reqExtWan := httptest.NewRequest(http.MethodGet, "/api/web/external-play/"+movie2.ID, nil)
+	reqExtWan.Host = "emby.example.com"
+	reqExtWan.Header.Set("X-Forwarded-Proto", "https")
+	reqExtWan.Header.Set("X-Emby-Token", tok)
+	recExtWan := httptest.NewRecorder()
+	h.ServeHTTP(recExtWan, reqExtWan)
+	if !strings.Contains(recExtWan.Body.String(), "https://emby.example.com/emby/Videos/") {
+		t.Fatalf("ExternalPlay WAN missing WAN direct_url: %s", recExtWan.Body.String())
 	}
 
 	// 5. SortBy=DatePlayed orders by actual user_data.last_played_at rather than items.added_at.
@@ -734,5 +765,255 @@ func TestEmbyRestAPISchemaAlignment(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("GET %s failed: %d %s", aliasPath, rec.Code, rec.Body.String())
 		}
+	}
+}
+
+func TestDailyUseFixesSimilarPathRandomAndYambySearchSort(t *testing.T) {
+	srv, tmp := setupTestServer(t)
+	h := srv.Handler
+
+	rec := doJSON(t, h, http.MethodPost, "/api/web/setup", "", map[string]any{
+		"username":    "admin",
+		"password":    "SecretPass123!",
+		"server_name": "EmbyLite DailyFixes",
+	})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup failed: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, h, http.MethodPost, "/emby/Users/AuthenticateByName", "", map[string]any{
+		"Username": "admin",
+		"Pw":       "SecretPass123!",
+	})
+	var login struct {
+		AccessToken string `json:"AccessToken"`
+		User        struct {
+			ID string `json:"Id"`
+		} `json:"User"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &login)
+	tok := login.AccessToken
+	uid := login.User.ID
+
+	tvDir := filepath.Join(tmp, "tv")
+	mvDir := filepath.Join(tmp, "movies")
+	_ = os.MkdirAll(tvDir, 0o755)
+	_ = os.MkdirAll(mvDir, 0o755)
+
+	createLib := func(name, kind, dir string) string {
+		r := doJSON(t, h, http.MethodPost, "/api/admin/libraries", tok, map[string]any{
+			"name":  name,
+			"kind":  kind,
+			"paths": []string{dir},
+		})
+		var resp struct {
+			ID string `json:"id"`
+		}
+		_ = json.Unmarshal(r.Body.Bytes(), &resp)
+		return resp.ID
+	}
+	tvLibID := createLib("剧集", "tvshows", tvDir)
+	mvLibID := createLib("电影", "movies", mvDir)
+
+	now := time.Now().UTC()
+
+	// Seed 3 TV series + multiple episodes so we can verify Episode /Similar returns ONLY other Series.
+	s1 := model.Item{ID: "ser-1", LibraryID: tvLibID, ParentID: tvLibID, Type: "Series", Name: "绝命毒师", SortName: "绝命毒师", PinyinInitials: "jmds", IsFolder: true, CommunityRating: 9.5, ScanKey: "df:s1", RandomKey: "rk01", AddedAt: now.Add(-10 * time.Hour), CreatedAt: now, UpdatedAt: now}
+	s2 := model.Item{ID: "ser-2", LibraryID: tvLibID, ParentID: tvLibID, Type: "Series", Name: "风骚律师", SortName: "风骚律师", PinyinInitials: "fsls", IsFolder: true, CommunityRating: 9.3, ScanKey: "df:s2", RandomKey: "rk02", AddedAt: now.Add(-20 * time.Hour), CreatedAt: now, UpdatedAt: now}
+	s3 := model.Item{ID: "ser-3", LibraryID: tvLibID, ParentID: tvLibID, Type: "Series", Name: "老友记", SortName: "老友记", PinyinInitials: "lyj", IsFolder: true, CommunityRating: 9.0, ScanKey: "df:s3", RandomKey: "rk03", AddedAt: now.Add(-5 * time.Hour), CreatedAt: now, UpdatedAt: now}
+	sea1 := model.Item{ID: "sea-1", LibraryID: tvLibID, ParentID: s1.ID, SeriesID: s1.ID, Type: "Season", Name: "第 1 季", SortName: "001", SeasonNum: 1, IsFolder: true, ScanKey: "df:sea1", RandomKey: "rk04", AddedAt: now, CreatedAt: now, UpdatedAt: now}
+	ep1 := model.Item{ID: "ep-1", LibraryID: tvLibID, ParentID: sea1.ID, SeriesID: s1.ID, SeasonID: sea1.ID, Type: "Episode", Name: "试播集", SortName: "001-0001", SeasonNum: 1, EpisodeNum: 1, ScanKey: "df:ep1", RandomKey: "rk05", AddedAt: now.Add(-1 * time.Hour), CreatedAt: now, UpdatedAt: now}
+	ep2 := model.Item{ID: "ep-2", LibraryID: tvLibID, ParentID: sea1.ID, SeriesID: s1.ID, SeasonID: sea1.ID, Type: "Episode", Name: "猫在袋中", SortName: "001-0002", SeasonNum: 1, EpisodeNum: 2, ScanKey: "df:ep2", RandomKey: "rk06", AddedAt: now.Add(-2 * time.Hour), CreatedAt: now, UpdatedAt: now}
+	// Newer episode under s2 (even though s2.AddedAt is older than s1 and s3) for DateLastContentAdded sort check.
+	epS2 := model.Item{ID: "ep-s2-1", LibraryID: tvLibID, ParentID: s2.ID, SeriesID: s2.ID, Type: "Episode", Name: "新更一集", SortName: "001-0001", SeasonNum: 1, EpisodeNum: 1, ScanKey: "df:eps2", RandomKey: "rk07", AddedAt: now.Add(-1 * time.Minute), CreatedAt: now, UpdatedAt: now}
+
+	for _, it := range []*model.Item{&s1, &s2, &s3, &sea1, &ep1, &ep2, &epS2} {
+		if err := srv.DB.Gorm.Create(it).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = srv.DB.Gorm.Create(&model.ItemGenre{ItemID: s1.ID, Genre: "犯罪"}).Error
+	_ = srv.DB.Gorm.Create(&model.ItemGenre{ItemID: s2.ID, Genre: "犯罪"}).Error
+	_ = srv.DB.Gorm.Create(&model.ItemGenre{ItemID: s3.ID, Genre: "喜剧"}).Error
+
+	// 1. Episode /Similar must recommend ONLY Series (never Episode/Season), exclude its own series, and rank shared-genre Series first.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items/"+ep1.ID+"/Similar?Limit=12", tok, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("episode similar failed: %d %s", rec.Code, rec.Body.String())
+	}
+	var simResp struct {
+		Items []struct {
+			ID   string `json:"Id"`
+			Type string `json:"Type"`
+		} `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &simResp)
+	if len(simResp.Items) != 2 {
+		t.Fatalf("expected 2 similar Series for episode, got %+v", simResp.Items)
+	}
+	for _, it := range simResp.Items {
+		if it.Type != "Series" || it.ID == s1.ID {
+			t.Fatalf("episode similar must only return other Series, got %+v", simResp.Items)
+		}
+	}
+	if simResp.Items[0].ID != s2.ID {
+		t.Fatalf("expected shared-genre series %s first, got %+v", s2.ID, simResp.Items)
+	}
+
+	// 2. DateLastContentAdded DESC on Series should put s2 first (newest episode added_at).
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?ParentId="+tvLibID+"&IncludeItemTypes=Series&SortBy=DateLastContentAdded,SortName&SortOrder=Descending", tok, nil)
+	var latestContent struct {
+		Items []struct {
+			ID string `json:"Id"`
+		} `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &latestContent)
+	if len(latestContent.Items) != 3 || latestContent.Items[0].ID != s2.ID {
+		t.Fatalf("DateLastContentAdded DESC expected s2 first, got %+v", latestContent.Items)
+	}
+
+	// 3. Seed 12 movies for Random shuffle + Yamby search & sort tests.
+	movies := []model.Item{
+		{ID: "mv-a", LibraryID: mvLibID, ParentID: mvLibID, Type: "Movie", Name: "阿凡达", OriginalName: "Avatar", SortName: "阿凡达", PinyinInitials: "afdavatar", Year: 2009, PremiereDate: "2009-12-18", CommunityRating: 8.8, StudiosJSON: `["20th Century Fox"]`, ScanKey: "df:mva", RandomKey: "a01", AddedAt: now.Add(-12 * time.Hour), CreatedAt: now, UpdatedAt: now},
+		{ID: "mv-h", LibraryID: mvLibID, ParentID: mvLibID, Type: "Movie", Name: "哈利·波特与魔法石", OriginalName: "Harry Potter", SortName: "哈利·波特与魔法石", PinyinInitials: "hlbtymfs", Year: 2001, PremiereDate: "2001-11-16", CommunityRating: 9.1, StudiosJSON: `["Warner Bros."]`, ScanKey: "df:mvh", RandomKey: "a02", AddedAt: now.Add(-11 * time.Hour), CreatedAt: now, UpdatedAt: now},
+		{ID: "mv-s", LibraryID: mvLibID, ParentID: mvLibID, Type: "Movie", Name: "沙丘", OriginalName: "Dune", SortName: "沙丘", PinyinInitials: "sqdune", Year: 2021, PremiereDate: "2021-10-22", CommunityRating: 8.0, StudiosJSON: `["Legendary"]`, ScanKey: "df:mvs", RandomKey: "a03", AddedAt: now.Add(-10 * time.Hour), CreatedAt: now, UpdatedAt: now},
+		{ID: "mv-x", LibraryID: mvLibID, ParentID: mvLibID, Type: "Movie", Name: "星际穿越", OriginalName: "Interstellar", SortName: "星际穿越", PinyinInitials: "xjcyinterstellar", Year: 0, PremiereDate: "", CommunityRating: 0, StudiosJSON: `["Paramount"]`, ScanKey: "df:mvx", RandomKey: "a04", AddedAt: now.Add(-9 * time.Hour), CreatedAt: now, UpdatedAt: now},
+	}
+	for i := 5; i <= 12; i++ {
+		id := "mv-extra-" + strconv.Itoa(i)
+		movies = append(movies, model.Item{
+			ID: id, LibraryID: mvLibID, ParentID: mvLibID, Type: "Movie",
+			Name: "测试影片 " + strconv.Itoa(i), SortName: "movie " + strconv.Itoa(i), PinyinInitials: "csyp",
+			Year: 2010 + i, PremiereDate: strconv.Itoa(2010+i) + "-05-01", CommunityRating: 7.0,
+			ScanKey: "df:" + id, RandomKey: "rk" + strconv.Itoa(i), AddedAt: now.Add(-time.Duration(i) * time.Minute), CreatedAt: now, UpdatedAt: now,
+		})
+	}
+	for i := range movies {
+		if err := srv.DB.Gorm.Create(&movies[i]).Error; err != nil {
+			t.Fatal(err)
+		}
+		_ = srv.DB.Gorm.Exec("INSERT INTO items_fts(item_id, name, original_name, pinyin_initials) VALUES (?, ?, ?, ?)",
+			movies[i].ID, movies[i].Name, movies[i].OriginalName, movies[i].PinyinInitials).Error
+	}
+	_ = srv.DB.Gorm.Create(&model.ItemGenre{ItemID: "mv-s", Genre: "科幻"}).Error
+	_ = srv.DB.Gorm.Create(&model.ItemTag{ItemID: "mv-s", Tag: "IMAX"}).Error
+	_ = srv.DB.Gorm.Create(&model.Person{ID: "per-dv", Name: "Denis Villeneuve", UpdatedAt: now}).Error
+	_ = srv.DB.Gorm.Create(&model.ItemPerson{ItemID: "mv-s", PersonID: "per-dv", RoleType: "Director"}).Error
+	_ = srv.DB.Gorm.Save(&model.UserData{UserID: uid, ItemID: "mv-h", Played: true, PlayCount: 7, UpdatedAt: now}).Error
+
+	// 3a. SortBy=Random must produce distinct orders across repeated calls (not static RandomKey!).
+	seenFirst := map[string]bool{}
+	for i := 0; i < 16; i++ {
+		r := doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?ParentId="+mvLibID+"&Recursive=true&Filters=IsNotFolder&MediaTypes=Video&SortBy=Random&Limit=5", tok, nil)
+		if r.Code != http.StatusOK {
+			t.Fatalf("random query failed: %d %s", r.Code, r.Body.String())
+		}
+		var randResp struct {
+			Items []struct {
+				ID   string `json:"Id"`
+				Type string `json:"Type"`
+			} `json:"Items"`
+		}
+		_ = json.Unmarshal(r.Body.Bytes(), &randResp)
+		if len(randResp.Items) != 5 {
+			t.Fatalf("expected 5 random items, got %d", len(randResp.Items))
+		}
+		seenFirst[randResp.Items[0].ID] = true
+	}
+	if len(seenFirst) < 2 {
+		t.Fatalf("SortBy=Random always returned the same first item: %+v", seenFirst)
+	}
+
+	// 3b. InstantMix returns randomized playable items.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Items/"+mvLibID+"/InstantMix?Limit=5", tok, nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"TotalRecordCount":5`) {
+		t.Fatalf("InstantMix failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 4a. Yamby search: punctuation / FTS special chars never 500; multi-word Chinese search matches; Persons search returns non-zero TotalRecordCount!
+	for _, rawQ := range []string{"*", `foo"bar`, "a:b(c)", "Spider-Man"} {
+		r := doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?Recursive=true&SearchTerm="+rawQ, tok, nil)
+		if r.Code != http.StatusOK {
+			t.Fatalf("special char SearchTerm=%q returned %d: %s", rawQ, r.Code, r.Body.String())
+		}
+	}
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?Recursive=true&SearchTerm=%E5%93%88%E5%88%A9%20%E9%AD%94%E6%B3%95%E7%9F%B3", tok, nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "mv-h") {
+		t.Fatalf("multi-word Chinese search failed: %d %s", rec.Code, rec.Body.String())
+	}
+	// Persons search via /Persons and via /Items?IncludeItemTypes=Person must return TotalRecordCount=1!
+	for _, personURL := range []string{
+		"/emby/Persons?SearchTerm=Denis",
+		"/emby/Users/" + uid + "/Items?Recursive=true&IncludeItemTypes=Person&SearchTerm=Denis",
+	} {
+		r := doJSON(t, h, http.MethodGet, personURL, tok, nil)
+		if r.Code != http.StatusOK || !strings.Contains(r.Body.String(), `"TotalRecordCount":1`) || !strings.Contains(r.Body.String(), "Denis Villeneuve") {
+			t.Fatalf("GET %s failed: %d %s", personURL, r.Code, r.Body.String())
+		}
+	}
+	// Genres/Studios/Tags SearchTerm must filter instead of returning all entries.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Genres?SearchTerm=%E7%A7%91%E5%B9%BB", tok, nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "科幻") || strings.Contains(rec.Body.String(), "犯罪") {
+		t.Fatalf("GET /Genres?SearchTerm did not filter: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = doJSON(t, h, http.MethodGet, "/emby/Studios?SearchTerm=Warner", tok, nil)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Warner Bros.") || strings.Contains(rec.Body.String(), "Legendary") {
+		t.Fatalf("GET /Studios?SearchTerm did not filter: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 4b. Yamby sorting: Chinese SortName pinyin order (阿凡达 < 哈利 < 沙丘 < 星际穿越), NameStartsWithOrGreater=S excludes 阿凡达,
+	// PremiereDate/CommunityRating ASC put missing/0 values LAST, PlayCount DESC works, repeated SortBy params work.
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?ParentId="+mvLibID+"&Ids=mv-a,mv-h,mv-s,mv-x&SortBy=SortName&SortOrder=Ascending", tok, nil)
+	var nameOrder struct {
+		Items []struct {
+			ID string `json:"Id"`
+		} `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &nameOrder)
+	wantNameIDs := []string{"mv-a", "mv-h", "mv-s", "mv-x"}
+	if len(nameOrder.Items) != 4 {
+		t.Fatalf("expected 4 movies, got %+v", nameOrder.Items)
+	}
+	for i, want := range wantNameIDs {
+		if nameOrder.Items[i].ID != want {
+			t.Fatalf("Chinese SortName order[%d] = %s, want %s (full=%+v)", i, nameOrder.Items[i].ID, want, nameOrder.Items)
+		}
+	}
+
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?ParentId="+mvLibID+"&Ids=mv-a,mv-h,mv-s,mv-x&NameStartsWithOrGreater=S", tok, nil)
+	if strings.Contains(rec.Body.String(), `"mv-a"`) || !strings.Contains(rec.Body.String(), `"mv-s"`) || !strings.Contains(rec.Body.String(), `"mv-x"`) {
+		t.Fatalf("NameStartsWithOrGreater=S wrong filter for Chinese items: %s", rec.Body.String())
+	}
+
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?ParentId="+mvLibID+"&Ids=mv-a,mv-h,mv-s,mv-x&SortBy=CommunityRating&SortOrder=Ascending", tok, nil)
+	var ratingAsc struct {
+		Items []struct {
+			ID string `json:"Id"`
+		} `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &ratingAsc)
+	if len(ratingAsc.Items) != 4 || ratingAsc.Items[0].ID != "mv-s" || ratingAsc.Items[3].ID != "mv-x" {
+		t.Fatalf("CommunityRating ASC must place unrated (0) item mv-x LAST, got %+v", ratingAsc.Items)
+	}
+
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?ParentId="+mvLibID+"&Ids=mv-a,mv-h,mv-s,mv-x&SortBy=PremiereDate&SortBy=SortName&SortOrder=Ascending", tok, nil)
+	var premiereAsc struct {
+		Items []struct {
+			ID string `json:"Id"`
+		} `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &premiereAsc)
+	if len(premiereAsc.Items) != 4 || premiereAsc.Items[0].ID != "mv-h" || premiereAsc.Items[3].ID != "mv-x" {
+		t.Fatalf("PremiereDate ASC must place missing date mv-x LAST, got %+v", premiereAsc.Items)
+	}
+
+	rec = doJSON(t, h, http.MethodGet, "/emby/Users/"+uid+"/Items?ParentId="+mvLibID+"&Ids=mv-a,mv-h,mv-s,mv-x&SortBy=PlayCount&SortOrder=Descending", tok, nil)
+	var playCntDesc struct {
+		Items []struct {
+			ID string `json:"Id"`
+		} `json:"Items"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &playCntDesc)
+	if len(playCntDesc.Items) != 4 || playCntDesc.Items[0].ID != "mv-h" {
+		t.Fatalf("PlayCount DESC expected mv-h first, got %+v", playCntDesc.Items)
 	}
 }
