@@ -84,7 +84,7 @@ func Default() *Config {
 			Type:         "sqlite",
 			SQLitePath:   "", // resolved under DataDir if empty
 			MaxOpenConns: 20,
-			MaxIdleConns: 5,
+			MaxIdleConns: 15,
 		},
 		Redis: RedisConfig{
 			Prefix: "embylite:",

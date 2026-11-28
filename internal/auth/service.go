@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"emby-lite/internal/cache"
@@ -57,14 +59,46 @@ type Principal struct {
 	Policy    EffectivePolicy
 }
 
+const authMemCacheTTL = 15 * time.Second
+
+type cachedUserEntry struct {
+	user      model.User
+	policy    EffectivePolicy
+	expiresAt time.Time
+}
+
+type cachedVisibleLibsEntry struct {
+	ids       []string
+	expiresAt time.Time
+}
+
+type cachedAllLibsEntry struct {
+	libs      []model.Library
+	idSet     map[string]bool
+	libRev    string
+	expiresAt time.Time
+}
+
 type Service struct {
 	db    *database.DB
 	cache cache.Store
 	cfg   *config.Config
+
+	memMu        sync.RWMutex
+	userCache    map[string]cachedUserEntry
+	visCache     map[string]cachedVisibleLibsEntry
+	allLibsCache cachedAllLibsEntry
+	userEpoch    atomic.Uint64
 }
 
 func NewService(db *database.DB, cacheStore cache.Store, cfg *config.Config) *Service {
-	return &Service{db: db, cache: cacheStore, cfg: cfg}
+	return &Service{
+		db:        db,
+		cache:     cacheStore,
+		cfg:       cfg,
+		userCache: make(map[string]cachedUserEntry, 16),
+		visCache:  make(map[string]cachedVisibleLibsEntry, 16),
+	}
 }
 
 func (s *Service) ImageSecret() string {
@@ -283,6 +317,15 @@ func (s *Service) Logout(ctx context.Context, plainToken string) error {
 
 // InvalidateUserCache clears cached auth/browse entries when user permissions change.
 func (s *Service) InvalidateUserCache(ctx context.Context, userID string) {
+	s.userEpoch.Add(1)
+	s.memMu.Lock()
+	if userID != "" {
+		delete(s.userCache, userID)
+	} else {
+		s.userCache = make(map[string]cachedUserEntry, 16)
+	}
+	s.visCache = make(map[string]cachedVisibleLibsEntry, 16)
+	s.memMu.Unlock()
 	_ = s.cache.DeletePrefix(ctx, "tok:")
 	_ = s.cache.DeletePrefix(ctx, "scope:"+userID)
 }
@@ -355,13 +398,46 @@ func (s *Service) hydratePrincipal(plain string, info cachedTokenInfo, meta Clie
 			},
 		}, nil
 	}
+	now := time.Now()
+	s.memMu.RLock()
+	cached, ok := s.userCache[info.UserID]
+	s.memMu.RUnlock()
+	if ok && now.Before(cached.expiresAt) {
+		user := cached.user
+		if user.Disabled || (user.ExpiresAt != nil && now.After(*user.ExpiresAt)) {
+			return nil, ErrUserDisabled
+		}
+		if meta.DeviceID == "" {
+			meta.DeviceID = info.DeviceID
+		}
+		return &Principal{
+			User:    &user,
+			Token:   plain,
+			TokenID: info.TokenID,
+			Client:  meta,
+			Policy:  cached.policy,
+		}, nil
+	}
+
 	var user model.User
-	if err := s.db.Gorm.Where("id = ?", info.UserID).First(&user).Error; err != nil {
+	if err := s.db.Read().Where("id = ?", info.UserID).First(&user).Error; err != nil {
 		return nil, ErrInvalidCredentials
 	}
-	if user.Disabled || (user.ExpiresAt != nil && time.Now().After(*user.ExpiresAt)) {
+	if user.Disabled || (user.ExpiresAt != nil && now.After(*user.ExpiresAt)) {
 		return nil, ErrUserDisabled
 	}
+	policy := s.ResolvePolicy(&user)
+	s.memMu.Lock()
+	if s.userCache == nil {
+		s.userCache = make(map[string]cachedUserEntry, 16)
+	}
+	s.userCache[info.UserID] = cachedUserEntry{
+		user:      user,
+		policy:    policy,
+		expiresAt: now.Add(authMemCacheTTL),
+	}
+	s.memMu.Unlock()
+
 	if meta.DeviceID == "" {
 		meta.DeviceID = info.DeviceID
 	}
@@ -370,7 +446,7 @@ func (s *Service) hydratePrincipal(plain string, info cachedTokenInfo, meta Clie
 		Token:   plain,
 		TokenID: info.TokenID,
 		Client:  meta,
-		Policy:  s.ResolvePolicy(&user),
+		Policy:  policy,
 	}, nil
 }
 
@@ -412,14 +488,72 @@ func (s *Service) ResolvePolicy(user *model.User) EffectivePolicy {
 	return policy
 }
 
+func (s *Service) cachedAllLibraries() ([]model.Library, map[string]bool, error) {
+	libRev := s.db.GetLibraryRevision()
+	now := time.Now()
+	s.memMu.RLock()
+	if s.allLibsCache.libRev == libRev && now.Before(s.allLibsCache.expiresAt) && s.allLibsCache.idSet != nil {
+		libs := s.allLibsCache.libs
+		idSet := s.allLibsCache.idSet
+		s.memMu.RUnlock()
+		return libs, idSet, nil
+	}
+	s.memMu.RUnlock()
+
+	var allLibs []model.Library
+	if err := s.db.Read().Order("sort_order ASC, name ASC").Find(&allLibs).Error; err != nil {
+		return nil, nil, err
+	}
+	idSet := make(map[string]bool, len(allLibs))
+	for _, l := range allLibs {
+		idSet[l.ID] = true
+	}
+	s.memMu.Lock()
+	s.allLibsCache = cachedAllLibsEntry{
+		libs:      allLibs,
+		idSet:     idSet,
+		libRev:    libRev,
+		expiresAt: now.Add(authMemCacheTTL),
+	}
+	s.memMu.Unlock()
+	return allLibs, idSet, nil
+}
+
+// IsKnownLibraryID reports whether id matches any configured Library without hitting the DB on every request.
+func (s *Service) IsKnownLibraryID(id string) bool {
+	if id == "" {
+		return false
+	}
+	_, idSet, err := s.cachedAllLibraries()
+	if err != nil {
+		return true // fail open so caller checks DB
+	}
+	return idSet[id]
+}
+
 // VisibleLibraryIDs resolves the list of libraries visible to a Principal.
 // Precedence: explicit UserLibrary rules > GroupLibrary rules > all libraries (filtered by Hidden unless CanViewHidden).
 func (s *Service) VisibleLibraryIDs(p *Principal) ([]string, error) {
 	if p == nil {
 		return nil, nil
 	}
-	var allLibs []model.Library
-	if err := s.db.Gorm.Order("sort_order ASC, name ASC").Find(&allLibs).Error; err != nil {
+	libRev := s.db.GetLibraryRevision()
+	cacheKey := fmt.Sprintf("%s:%d:api:%v", libRev, s.userEpoch.Load(), p.IsAPIKey)
+	if p.User != nil {
+		cacheKey = fmt.Sprintf("%s:%d:u:%s:%v:%v", libRev, s.userEpoch.Load(), p.User.ID, p.User.IsAdmin, p.Policy.CanViewHidden)
+	}
+	now := time.Now()
+	s.memMu.RLock()
+	if cached, ok := s.visCache[cacheKey]; ok && now.Before(cached.expiresAt) {
+		out := make([]string, len(cached.ids))
+		copy(out, cached.ids)
+		s.memMu.RUnlock()
+		return out, nil
+	}
+	s.memMu.RUnlock()
+
+	allLibs, _, err := s.cachedAllLibraries()
+	if err != nil {
 		return nil, err
 	}
 	if p.IsAPIKey || (p.User != nil && p.User.IsAdmin) {
@@ -427,6 +561,7 @@ func (s *Service) VisibleLibraryIDs(p *Principal) ([]string, error) {
 		for _, l := range allLibs {
 			ids = append(ids, l.ID)
 		}
+		s.storeVisibleCache(cacheKey, ids, now)
 		return ids, nil
 	}
 
@@ -435,14 +570,14 @@ func (s *Service) VisibleLibraryIDs(p *Principal) ([]string, error) {
 	hasExplicit := false
 
 	var userLibs []model.UserLibrary
-	if err := s.db.Gorm.Where("user_id = ?", user.ID).Find(&userLibs).Error; err == nil && len(userLibs) > 0 {
+	if err := s.db.Read().Where("user_id = ?", user.ID).Find(&userLibs).Error; err == nil && len(userLibs) > 0 {
 		hasExplicit = true
 		for _, ul := range userLibs {
 			allowedSet[ul.LibraryID] = true
 		}
 	} else if user.PermissionGroupID != "" {
 		var groupLibs []model.GroupLibrary
-		if err := s.db.Gorm.Where("group_id = ?", user.PermissionGroupID).Find(&groupLibs).Error; err == nil && len(groupLibs) > 0 {
+		if err := s.db.Read().Where("group_id = ?", user.PermissionGroupID).Find(&groupLibs).Error; err == nil && len(groupLibs) > 0 {
 			hasExplicit = true
 			for _, gl := range groupLibs {
 				allowedSet[gl.LibraryID] = true
@@ -460,7 +595,22 @@ func (s *Service) VisibleLibraryIDs(p *Principal) ([]string, error) {
 		}
 		ids = append(ids, l.ID)
 	}
+	s.storeVisibleCache(cacheKey, ids, now)
 	return ids, nil
+}
+
+func (s *Service) storeVisibleCache(key string, ids []string, now time.Time) {
+	cp := make([]string, len(ids))
+	copy(cp, ids)
+	s.memMu.Lock()
+	if s.visCache == nil || len(s.visCache) > 256 {
+		s.visCache = make(map[string]cachedVisibleLibsEntry, 16)
+	}
+	s.visCache[key] = cachedVisibleLibsEntry{
+		ids:       cp,
+		expiresAt: now.Add(authMemCacheTTL),
+	}
+	s.memMu.Unlock()
 }
 
 // CanAccessLibrary returns true if the Principal has read access to libraryID.

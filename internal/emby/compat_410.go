@@ -88,7 +88,7 @@ func (h *Handler) GetSectionItems(c *gin.Context) {
 		if startIndex < 0 {
 			startIndex = 0
 		}
-		all := h.buildLatestDTOsWithOpts(c.Request, p, visibleIDs, parentID, limit+startIndex, splitCSV(queryCI(c, "IncludeItemTypes")), queryCI(c, "IsPlayed"), fieldsNeedDetail(queryCI(c, "Fields")))
+		all := h.buildLatestDTOsWithMask(c.Request, p, visibleIDs, parentID, limit+startIndex, splitCSV(queryCI(c, "IncludeItemTypes")), queryCI(c, "IsPlayed"), parseDTOFields(queryAllCI(c, "Fields")))
 		total := len(all)
 		if startIndex >= len(all) {
 			all = []map[string]any{}
@@ -116,12 +116,12 @@ func (h *Handler) GetSectionItems(c *gin.Context) {
 		}
 		q := h.db.Read().Model(&model.Item{}).
 			Where("items.soft_deleted_at IS NULL AND items.library_id IN ?", visibleIDs).
-			Where("items.id IN (SELECT item_id FROM user_data WHERE user_id = ? AND is_favorite = ?)", p.User.ID, true)
+			Where("EXISTS (SELECT 1 FROM user_data ud WHERE ud.user_id = ? AND ud.item_id = items.id AND ud.is_favorite = ?)", p.User.ID, true)
 		var total int64
 		_ = q.Count(&total).Error
 		var rows []model.Item
 		_ = q.Order("items.sort_name ASC, items.id ASC").Offset(startIndex).Limit(limit).Find(&rows).Error
-		out := h.itemsToDTOs(c.Request, p, rows, fieldsNeedDetail(queryCI(c, "Fields")))
+		out := h.itemsToDTOsWithMask(c.Request, p, rows, parseDTOFields(queryAllCI(c, "Fields")))
 		c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": total, "StartIndex": startIndex})
 	default:
 		c.JSON(http.StatusOK, gin.H{"Items": []any{}, "TotalRecordCount": 0, "StartIndex": 0})
@@ -508,11 +508,15 @@ func (h *Handler) SystemConfigurationPublic(c *gin.Context) {
 }
 
 func (h *Handler) SystemConfiguration(c *gin.Context) {
+	rt := h.resumeThresholds()
 	c.JSON(http.StatusOK, gin.H{
-		"ServerName":             h.serverName(),
-		"UICulture":              "zh-cn",
-		"StartupWizardCompleted": true,
-		"EnableHttps":            strings.HasPrefix(playback.PublicOrigin(c.Request, h.cfg.Server.PublicURL), "https://"),
+		"ServerName":               h.serverName(),
+		"UICulture":                "zh-cn",
+		"StartupWizardCompleted":   true,
+		"EnableHttps":              strings.HasPrefix(playback.PublicOrigin(c.Request, h.cfg.Server.PublicURL), "https://"),
+		"MinResumePct":             rt.MinResumePct,
+		"MaxResumePct":             rt.MaxResumePct,
+		"MinResumeDurationSeconds": rt.MinResumeDurationSeconds,
 	})
 }
 
@@ -712,17 +716,111 @@ func normalizeItemTypes(raw []string) []string {
 	return out
 }
 
-func fieldsNeedDetail(fieldsRaw string) bool {
-	if fieldsRaw == "" {
-		return false
+// formatEmbyTime formats timestamps using Emby/Jellyfin's .NET ISO-8601 UTC format
+// with 7 fractional second digits (e.g. "2026-11-26T13:09:24.0000000Z").
+// Clients such as Yamby expect fractional seconds when parsing DateCreated/DateModified.
+func formatEmbyTime(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.0000000Z")
+}
+
+// dtoFieldMask specifies which optional DTO sub-queries and fields should be materialized.
+// Keeping this granular prevents list endpoints (e.g. Yamby sending Fields=...,Path,Container)
+// from accidentally loading People, full MediaSources/ProbeJSON, Chapters, and Tags.
+type dtoFieldMask struct {
+	Full         bool
+	Overview     bool
+	Genres       bool
+	Tags         bool
+	Studios      bool
+	People       bool
+	MediaSources bool
+	Chapters     bool
+	Path         bool
+	Container    bool
+	Counts       bool
+}
+
+func dtoFieldsFull() dtoFieldMask {
+	return dtoFieldMask{
+		Full:         true,
+		Overview:     true,
+		Genres:       true,
+		Tags:         true,
+		Studios:      true,
+		People:       true,
+		MediaSources: true,
+		Chapters:     true,
+		Path:         true,
+		Container:    true,
+		Counts:       true,
 	}
-	f := strings.ToLower(fieldsRaw)
-	for _, kw := range []string{"mediasources", "mediastreams", "people", "studios", "tags", "chapters", "taglines", "childcount", "recursiveitemcount", "container", "path", "itemcounts"} {
-		if strings.Contains(f, kw) {
-			return true
+}
+
+func dtoFieldsBasic() dtoFieldMask {
+	return dtoFieldMask{
+		Overview: true,
+		Genres:   true,
+	}
+}
+
+func parseDTOFields(fieldsRaw string) dtoFieldMask {
+	raw := strings.TrimSpace(fieldsRaw)
+	if raw == "" {
+		return dtoFieldsBasic()
+	}
+	var m dtoFieldMask
+	for _, tok := range splitCSV(raw) {
+		switch strings.ToLower(strings.TrimSpace(tok)) {
+		case "overview":
+			m.Overview = true
+		case "genres", "genreitems":
+			m.Genres = true
+		case "tags", "tagitems":
+			m.Tags = true
+		case "studios":
+			m.Studios = true
+		case "people":
+			m.People = true
+		case "mediasources", "mediastreams":
+			m.MediaSources = true
+		case "chapters":
+			m.Chapters = true
+		case "path":
+			m.Path = true
+		case "container":
+			m.Container = true
+		case "childcount", "recursiveitemcount", "itemcounts":
+			m.Counts = true
 		}
 	}
-	return false
+	return m
+}
+
+func (m dtoFieldMask) cacheKey() string {
+	var b [11]byte
+	boolByte := func(v bool) byte {
+		if v {
+			return '1'
+		}
+		return '0'
+	}
+	b[0] = boolByte(m.Full)
+	b[1] = boolByte(m.Overview)
+	b[2] = boolByte(m.Genres)
+	b[3] = boolByte(m.Tags)
+	b[4] = boolByte(m.Studios)
+	b[5] = boolByte(m.People)
+	b[6] = boolByte(m.MediaSources)
+	b[7] = boolByte(m.Chapters)
+	b[8] = boolByte(m.Path)
+	b[9] = boolByte(m.Container)
+	b[10] = boolByte(m.Counts)
+	return string(b[:])
+}
+
+func fieldsNeedDetail(fieldsRaw string) bool {
+	m := parseDTOFields(fieldsRaw)
+	return m.Full || m.MediaSources || m.People || m.Studios || m.Tags || m.Chapters || m.Counts || m.Path || m.Container
 }
 
 // flexInt64 accepts JSON integers, floats (e.g. 12345.0), or quoted numeric strings ("12345").

@@ -172,10 +172,16 @@ func (d *DB) Migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_items_browse_year ON items (library_id, soft_deleted_at, type, year DESC, id ASC)`,
 		`CREATE INDEX IF NOT EXISTS idx_items_parent_active ON items (parent_id, soft_deleted_at, sort_name ASC)`,
 		`CREATE INDEX IF NOT EXISTS idx_items_series_season_ep ON items (series_id, type, soft_deleted_at, season_num ASC, episode_num ASC)`,
+		`CREATE INDEX IF NOT EXISTS idx_items_season_ep ON items (season_id, type, soft_deleted_at, episode_num ASC)`,
+		`CREATE INDEX IF NOT EXISTS idx_items_ep_lib_series_added ON items (library_id, type, soft_deleted_at, series_id, added_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_data_resume ON user_data (user_id, played, hide_from_resume, position_ticks, updated_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_user_data_user_played_item ON user_data (user_id, played, item_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_user_data_fav ON user_data (user_id, is_favorite, item_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_item_images_item_kind_idx ON item_images (item_id, kind, index_num)`,
 		`CREATE INDEX IF NOT EXISTS idx_item_people_item_sort ON item_people (item_id, sort_idx ASC)`,
+		`CREATE INDEX IF NOT EXISTS idx_item_people_person_role_item ON item_people (person_id, role_type, item_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_item_tags_tag_item ON item_tags (tag, item_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_item_genres_genre_item ON item_genres (genre, item_id)`,
 	}
 	for _, stmt := range compositeIndexes {
 		if err := d.Gorm.Exec(stmt).Error; err != nil {

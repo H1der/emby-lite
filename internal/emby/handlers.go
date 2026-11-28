@@ -2,6 +2,8 @@ package emby
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -41,18 +44,26 @@ type Handler struct {
 	playback *playback.Service
 	images   *imgpipe.Pipeline
 	scraper  *scraper.Service
+
+	cacheFlightMu sync.Mutex
+	cacheFlights  map[string]*jsonFlightCall
+
+	personNoImgMu  sync.RWMutex
+	personNoImgMem map[string]time.Time
 }
 
 func NewHandler(db *database.DB, cacheStore cache.Store, cfg *config.Config, authSvc *auth.Service, scanSvc *scanner.Service, pbSvc *playback.Service, imgPipeline *imgpipe.Pipeline, scraperSvc *scraper.Service) *Handler {
 	return &Handler{
-		db:       db,
-		cache:    cacheStore,
-		cfg:      cfg,
-		auth:     authSvc,
-		scanner:  scanSvc,
-		playback: pbSvc,
-		images:   imgPipeline,
-		scraper:  scraperSvc,
+		db:             db,
+		cache:          cacheStore,
+		cfg:            cfg,
+		auth:           authSvc,
+		scanner:        scanSvc,
+		playback:       pbSvc,
+		images:         imgPipeline,
+		scraper:        scraperSvc,
+		cacheFlights:   make(map[string]*jsonFlightCall),
+		personNoImgMem: make(map[string]time.Time, 256),
 	}
 }
 
@@ -250,7 +261,7 @@ func (h *Handler) AuthenticateByName(c *gin.Context) {
 	}
 
 	policy := h.auth.ResolvePolicy(user)
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := formatEmbyTime(time.Now())
 	sid := h.serverID()
 	c.JSON(http.StatusOK, gin.H{
 		"User":        h.userDTO(user, policy),
@@ -603,6 +614,15 @@ func (h *Handler) GetItems(c *gin.Context) {
 		q = q.Where("items.id NOT IN ?", excludeIDs)
 	}
 	defaultVirtualSort := ""
+	parentIsLibrary := false
+	if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
+		for _, vid := range visibleIDs {
+			if vid == parentID {
+				parentIsLibrary = true
+				break
+			}
+		}
+	}
 	if strings.HasPrefix(parentID, "vlib-") {
 		var vl model.VirtualLibrary
 		if err := h.db.Gorm.Where("id = ? AND enabled = ?", parentID, true).First(&vl).Error; err != nil {
@@ -645,6 +665,15 @@ func (h *Handler) GetItems(c *gin.Context) {
 			q = q.Where("items.year <= ?", rule.MaxYear)
 		}
 		defaultVirtualSort = rule.SortBy
+	} else if parentIsLibrary {
+		// Fast path: parentID is a known Library ID -> pure equality on library_id so Postgres/SQLite
+		// uses idx_items_browse_* directly instead of a 4-column OR scan!
+		if recursive || searchTerm != "" || containsCI(includeTypes, "Episode") || containsCI(includeTypes, "Season") {
+			q = q.Where("items.library_id = ?", parentID)
+		} else {
+			q = q.Where("items.library_id = ? AND (items.parent_id = ? OR (items.parent_id = '' AND items.type IN ?))",
+				parentID, parentID, []string{"Movie", "Series", "BoxSet"})
+		}
 	} else if parentID != "" && parentID != "root" {
 		// BoxSet members are linked through box_set_items instead of parent_id (both recursive and direct).
 		var memberIDs []string
@@ -657,8 +686,21 @@ func (h *Handler) GetItems(c *gin.Context) {
 			} else {
 				q = q.Where("items.id IN ?", memberIDs)
 			}
+		} else if pItem := h.getItemByID(parentID); pItem != nil {
+			// Narrow by actual parent type so Postgres/SQLite uses idx_items_series_season_ep / idx_items_season_ep.
+			switch pItem.Type {
+			case "Series":
+				if recursive || searchTerm != "" || containsCI(includeTypes, "Episode") {
+					q = q.Where("items.series_id = ?", parentID)
+				} else {
+					q = q.Where("items.parent_id = ?", parentID)
+				}
+			case "Season":
+				q = q.Where("items.season_id = ?", parentID)
+			default:
+				q = q.Where("items.parent_id = ?", parentID)
+			}
 		} else if recursive || searchTerm != "" || containsCI(includeTypes, "Episode") || containsCI(includeTypes, "Season") {
-			// Parent could be a library, series, or season.
 			q = q.Where("(items.library_id = ? OR items.parent_id = ? OR items.series_id = ? OR items.season_id = ?)",
 				parentID, parentID, parentID, parentID)
 		} else {
@@ -760,7 +802,7 @@ func (h *Handler) GetItems(c *gin.Context) {
 		len(years) == 0 && len(officialRatings) == 0 && minRatingStr == "" &&
 		len(personIDs) == 0 && personName == "" && isFolderParam == "" &&
 		!strings.HasPrefix(parentID, "vlib-") {
-		needDetail := fieldsNeedDetail(queryCI(c, "Fields"))
+		mask := parseDTOFields(fieldsRaw)
 		out, total := h.buildResumeDTOsWithOpts(c.Request, p, visibleIDs, resumeQueryOpts{
 			ParentID:     parentID,
 			IncludeTypes: includeTypes,
@@ -768,7 +810,8 @@ func (h *Handler) GetItems(c *gin.Context) {
 			MediaTypes:   splitCSV(queryCI(c, "MediaTypes")),
 			StartIndex:   startIndex,
 			Limit:        limit,
-			Detail:       needDetail,
+			Mask:         mask,
+			HasMask:      true,
 		})
 		if isFilmlyRequest(c, p) {
 			applyFilmlyResumeCompatibility(out)
@@ -796,13 +839,13 @@ func (h *Handler) GetItems(c *gin.Context) {
 
 	if uid != "" {
 		if wantFav {
-			q = q.Where("items.id IN (SELECT item_id FROM user_data WHERE user_id = ? AND is_favorite = ?)", uid, true)
+			q = q.Where("EXISTS (SELECT 1 FROM user_data ud WHERE ud.user_id = ? AND ud.item_id = items.id AND ud.is_favorite = ?)", uid, true)
 		}
 		if wantPlayed {
-			q = q.Where("items.id IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", uid, true)
+			q = q.Where("EXISTS (SELECT 1 FROM user_data ud WHERE ud.user_id = ? AND ud.item_id = items.id AND ud.played = ?)", uid, true)
 		}
 		if wantUnplayed {
-			q = q.Where("items.id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", uid, true)
+			q = q.Where("NOT EXISTS (SELECT 1 FROM user_data ud WHERE ud.user_id = ? AND ud.item_id = items.id AND ud.played = ?)", uid, true)
 		}
 		if wantResumable {
 			if parentID == "" || parentID == "root" {
@@ -813,15 +856,13 @@ func (h *Handler) GetItems(c *gin.Context) {
 					q = q.Where("items.library_id IN ?", resumeLibIDs)
 				}
 			}
-			q = q.Where("items.id IN (SELECT item_id FROM user_data WHERE user_id = ? AND position_ticks > 0 AND played = ? AND hide_from_resume = ?)", uid, false, false)
-		}
-	}
-
-	var total int64
-	if !strings.EqualFold(queryCI(c, "EnableTotalRecordCount"), "false") {
-		if err := q.Count(&total).Error; err != nil {
-			jsonErr(c, http.StatusInternalServerError, err.Error())
-			return
+			rt := h.resumeThresholds()
+			minDurTicks := int64(rt.MinResumeDurationSeconds) * ticksPerSecond
+			minUnknownTicks := int64(rt.MinResumeUnknownSeconds) * ticksPerSecond
+			q = q.Where(
+				`EXISTS (SELECT 1 FROM user_data ud WHERE ud.user_id = ? AND ud.item_id = items.id AND ud.position_ticks > 0 AND ud.played = ? AND ud.hide_from_resume = ? AND ((items.runtime_ticks > 0 AND items.runtime_ticks >= ? AND ud.position_ticks * 100 >= items.runtime_ticks * ? AND ud.position_ticks * 100 < items.runtime_ticks * ?) OR (items.runtime_ticks <= 0 AND ud.position_ticks >= ?)))`,
+				uid, false, false, minDurTicks, rt.MinResumePct, rt.MaxResumePct, minUnknownTicks,
+			)
 		}
 	}
 
@@ -830,71 +871,129 @@ func (h *Handler) GetItems(c *gin.Context) {
 		sortByParam = defaultVirtualSort
 	}
 	sortFields := splitCSV(sortByParam)
-	useUserDataSort := uid != "" && hasAnyCI(sortFields, "DatePlayed", "SeriesDatePlayed", "PlayCount", "IsPlayed", "IsUnplayed", "IsFavoriteOrLiked")
-	useLatestEpisodeSort := hasAnyCI(sortFields, "DateLastContentAdded", "SeriesDateLastContentAdded", "DateLastEpisodeAdded")
-	listQ := q
-	if useUserDataSort || useLatestEpisodeSort {
-		listQ = listQ.Select("items.*")
+	mask := parseDTOFields(fieldsRaw)
+	isRandomSort := containsCI(sortFields, "Random")
+	hasCursor := strings.TrimSpace(queryCI(c, "Cursor")) != ""
+	enableTotalCount := !strings.EqualFold(queryCI(c, "EnableTotalRecordCount"), "false")
+
+	// Cache standard deterministic browse pages (non-Random, non-Search, non-Cursor) in CacheStore
+	// keyed by library_revision + user_rev so repeated library browsing is sub-millisecond.
+	canCacheList := !isRandomSort && searchTerm == "" && !hasCursor && !wantResumable
+	buildItemsResp := func() (any, error) {
+		var total int64
+		if enableTotalCount {
+			if err := q.Session(&gorm.Session{}).Count(&total).Error; err != nil {
+				return nil, err
+			}
+		}
+
+		useUserDataSort := uid != "" && hasAnyCI(sortFields, "DatePlayed", "SeriesDatePlayed", "PlayCount", "IsPlayed", "IsUnplayed", "IsFavoriteOrLiked")
+		useLatestEpisodeSort := hasAnyCI(sortFields, "DateLastContentAdded", "SeriesDateLastContentAdded", "DateLastEpisodeAdded")
+		listQ := q.Session(&gorm.Session{})
+		if useUserDataSort || useLatestEpisodeSort {
+			listQ = listQ.Select("items.*")
+		}
+		if useUserDataSort {
+			listQ = listQ.Joins("LEFT JOIN user_data AS ud_sort ON ud_sort.item_id = items.id AND ud_sort.user_id = ?", uid)
+		}
+		if useLatestEpisodeSort {
+			// Scope episode aggregation to the queried library/visible libraries so Postgres uses idx_items_ep_lib_series_added.
+			if parentIsLibrary {
+				listQ = listQ.Joins("LEFT JOIN (SELECT series_id, MAX(added_at) AS max_added_at FROM items WHERE library_id = ? AND type = 'Episode' AND soft_deleted_at IS NULL GROUP BY series_id) AS ep_latest ON ep_latest.series_id = items.id", parentID)
+			} else {
+				listQ = listQ.Joins("LEFT JOIN (SELECT series_id, MAX(added_at) AS max_added_at FROM items WHERE library_id IN ? AND type = 'Episode' AND soft_deleted_at IS NULL GROUP BY series_id) AS ep_latest ON ep_latest.series_id = items.id", visibleIDs)
+			}
+		}
+		var rows []model.Item
+		if sortByParam == "" && searchTerm != "" {
+			lowerTerm := strings.ToLower(searchTerm)
+			prefixTerm := escapeSQLLike(lowerTerm) + "%"
+			listQ = listQ.Order(gorm.Expr(
+				"CASE WHEN LOWER(items.name) = ? OR LOWER(items.original_name) = ? THEN 0 WHEN LOWER(items.name) LIKE ? ESCAPE '\\' OR LOWER(items.original_name) LIKE ? ESCAPE '\\' OR items.pinyin_initials = ? THEN 1 WHEN items.pinyin_initials LIKE ? ESCAPE '\\' THEN 2 ELSE 3 END ASC, "+effectiveSortNameExpr+" ASC, LOWER(items.sort_name) ASC, items.id ASC",
+				lowerTerm, lowerTerm, prefixTerm, prefixTerm, lowerTerm, prefixTerm,
+			))
+		} else {
+			orderClause := buildOrderClauseWithOpts(sortByParam, sortOrderRaw, orderBuildOpts{
+				Dialect:              h.db.Dialect,
+				HasUserDataJoin:      useUserDataSort,
+				HasLatestEpisodeJoin: useLatestEpisodeSort,
+			})
+			listQ = listQ.Order(orderClause)
+		}
+		if err := listQ.Offset(startIndex).Limit(limit).Find(&rows).Error; err != nil {
+			return nil, err
+		}
+
+		out := h.itemsToDTOsWithMask(c.Request, p, rows, mask)
+		if wantResumable {
+			attachResumeSeriesArtwork(out)
+			if isFilmlyRequest(c, p) {
+				applyFilmlyResumeCompatibility(out)
+			}
+		}
+		if total == 0 && len(out) > 0 {
+			total = int64(startIndex + len(out))
+		}
+
+		hasMore := int64(startIndex+len(out)) < total
+		nextCursor := ""
+		if hasMore {
+			nextCursor = signCursor(h.auth.ImageSecret(), cursorPayload{
+				Offset:    startIndex + len(out),
+				Limit:     limit,
+				ScopeHash: scopeHash,
+				Exp:       time.Now().Add(15 * time.Minute).Unix(),
+			})
+			if !canCacheList {
+				c.Header("X-Next-Cursor", nextCursor)
+			}
+		}
+
+		return gin.H{
+			"Items":            out,
+			"TotalRecordCount": total,
+			"StartIndex":       startIndex,
+			"NextCursor":       nextCursor,
+			"HasMore":          hasMore,
+		}, nil
 	}
-	if useUserDataSort {
-		listQ = listQ.Joins("LEFT JOIN user_data AS ud_sort ON ud_sort.item_id = items.id AND ud_sort.user_id = ?", uid)
-	}
-	if useLatestEpisodeSort {
-		listQ = listQ.Joins("LEFT JOIN (SELECT series_id, MAX(added_at) AS max_added_at FROM items WHERE type = 'Episode' AND soft_deleted_at IS NULL GROUP BY series_id) AS ep_latest ON ep_latest.series_id = items.id")
-	}
-	var rows []model.Item
-	if sortByParam == "" && searchTerm != "" {
-		lowerTerm := strings.ToLower(searchTerm)
-		prefixTerm := escapeSQLLike(lowerTerm) + "%"
-		listQ = listQ.Order(gorm.Expr(
-			"CASE WHEN LOWER(items.name) = ? OR LOWER(items.original_name) = ? THEN 0 WHEN LOWER(items.name) LIKE ? ESCAPE '\\' OR LOWER(items.original_name) LIKE ? ESCAPE '\\' OR items.pinyin_initials = ? THEN 1 WHEN items.pinyin_initials LIKE ? ESCAPE '\\' THEN 2 ELSE 3 END ASC, "+effectiveSortNameExpr+" ASC, LOWER(items.sort_name) ASC, items.id ASC",
-			lowerTerm, lowerTerm, prefixTerm, prefixTerm, lowerTerm, prefixTerm,
-		))
-	} else {
-		orderClause := buildOrderClauseWithOpts(sortByParam, sortOrderRaw, orderBuildOpts{
-			Dialect:              h.db.Dialect,
-			HasUserDataJoin:      useUserDataSort,
-			HasLatestEpisodeJoin: useLatestEpisodeSort,
-		})
-		listQ = listQ.Order(orderClause)
-	}
-	if err := listQ.Offset(startIndex).Limit(limit).Find(&rows).Error; err != nil {
-		jsonErr(c, http.StatusInternalServerError, err.Error())
+
+	if canCacheList {
+		originSuffix := ""
+		if mask.MediaSources {
+			originSuffix = ":" + playback.PublicOrigin(c.Request, h.cfg.Server.PublicURL)
+		}
+		rawSig := strings.Join([]string{
+			c.Request.URL.RawQuery,
+			parentID,
+			mask.cacheKey(),
+			strconv.Itoa(startIndex),
+			strconv.Itoa(limit),
+			originSuffix,
+		}, "|")
+		sum := sha256.Sum256([]byte(rawSig))
+		cacheUID := uid
+		if cacheUID == "" {
+			cacheUID = "anon"
+		}
+		cacheKey := dtoCacheVersion + ":items:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), cacheUID) + ":" + cacheUID + ":" + visibleIDsHash(visibleIDs) + ":" + hex.EncodeToString(sum[:12])
+		h.writeCachedJSONWithHook(c, cacheKey, hotCacheTTL, func(raw []byte) {
+			var meta struct {
+				NextCursor string `json:"NextCursor"`
+			}
+			if json.Unmarshal(raw, &meta) == nil && meta.NextCursor != "" {
+				c.Header("X-Next-Cursor", meta.NextCursor)
+			}
+		}, buildItemsResp)
 		return
 	}
 
-	needDetail := fieldsNeedDetail(fieldsRaw)
-
-	out := h.itemsToDTOs(c.Request, p, rows, needDetail)
-	if wantResumable {
-		attachResumeSeriesArtwork(out)
-		if isFilmlyRequest(c, p) {
-			applyFilmlyResumeCompatibility(out)
-		}
+	resp, err := buildItemsResp()
+	if err != nil {
+		jsonErr(c, http.StatusInternalServerError, err.Error())
+		return
 	}
-	if total == 0 && len(out) > 0 {
-		total = int64(startIndex + len(out))
-	}
-
-	hasMore := int64(startIndex+len(out)) < total
-	nextCursor := ""
-	if hasMore {
-		nextCursor = signCursor(h.auth.ImageSecret(), cursorPayload{
-			Offset:    startIndex + len(out),
-			Limit:     limit,
-			ScopeHash: scopeHash,
-			Exp:       time.Now().Add(15 * time.Minute).Unix(),
-		})
-		c.Header("X-Next-Cursor", nextCursor)
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"Items":            out,
-		"TotalRecordCount": total,
-		"StartIndex":       startIndex,
-		"NextCursor":       nextCursor,
-		"HasMore":          hasMore,
-	})
+	c.JSON(http.StatusOK, resp)
 }
 
 func (h *Handler) resolveGenreIDs(visibleIDs, ids []string) []string {
@@ -1025,20 +1124,20 @@ func (h *Handler) GetLatest(c *gin.Context) {
 	}
 	includeTypesRaw := queryCI(c, "IncludeItemTypes")
 	isPlayed := queryCI(c, "IsPlayed")
-	needDetail := fieldsNeedDetail(queryCI(c, "Fields"))
+	mask := parseDTOFields(queryAllCI(c, "Fields"))
 
 	uid := "anon"
 	if p != nil && p.User != nil {
 		uid = p.User.ID
 	}
 	originSuffix := ""
-	if needDetail {
+	if mask.MediaSources {
 		originSuffix = ":" + playback.PublicOrigin(c.Request, h.cfg.Server.PublicURL)
 	}
-	cacheKey := dtoCacheVersion + ":latest:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), uid) + ":" + uid + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.Itoa(limit) + ":" + includeTypesRaw + ":" + isPlayed + ":" + strconv.FormatBool(needDetail) + originSuffix
+	cacheKey := dtoCacheVersion + ":latest:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), uid) + ":" + uid + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.Itoa(limit) + ":" + includeTypesRaw + ":" + isPlayed + ":" + mask.cacheKey() + originSuffix
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		// Per Emby spec, /Items/Latest returns a plain JSON array.
-		return h.buildLatestDTOsWithOpts(c.Request, p, visibleIDs, parentID, limit, splitCSV(includeTypesRaw), isPlayed, needDetail), nil
+		return h.buildLatestDTOsWithMask(c.Request, p, visibleIDs, parentID, limit, splitCSV(includeTypesRaw), isPlayed, mask), nil
 	})
 }
 
@@ -1072,14 +1171,14 @@ func (h *Handler) GetResume(c *gin.Context) {
 	includeTypesRaw := queryCI(c, "IncludeItemTypes")
 	excludeTypesRaw := queryCI(c, "ExcludeItemTypes")
 	mediaTypesRaw := queryCI(c, "MediaTypes")
-	needDetail := fieldsNeedDetail(queryCI(c, "Fields"))
+	mask := parseDTOFields(queryAllCI(c, "Fields"))
 	filmlyMode := isFilmlyRequest(c, p)
 
 	originSuffix := ""
-	if needDetail {
+	if mask.MediaSources {
 		originSuffix = ":" + playback.PublicOrigin(c.Request, h.cfg.Server.PublicURL)
 	}
-	cacheKey := dtoCacheVersion + ":resume:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), p.User.ID) + ":" + p.User.ID + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.Itoa(startIndex) + ":" + strconv.Itoa(limit) + ":" + includeTypesRaw + ":" + excludeTypesRaw + ":" + mediaTypesRaw + ":" + strconv.FormatBool(needDetail) + ":" + strconv.FormatBool(filmlyMode) + originSuffix
+	cacheKey := dtoCacheVersion + ":resume:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), p.User.ID) + ":" + p.User.ID + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + strconv.Itoa(startIndex) + ":" + strconv.Itoa(limit) + ":" + includeTypesRaw + ":" + excludeTypesRaw + ":" + mediaTypesRaw + ":" + mask.cacheKey() + ":" + strconv.FormatBool(filmlyMode) + originSuffix
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
 		out, total := h.buildResumeDTOsWithOpts(c.Request, p, visibleIDs, resumeQueryOpts{
 			ParentID:     parentID,
@@ -1088,7 +1187,8 @@ func (h *Handler) GetResume(c *gin.Context) {
 			MediaTypes:   splitCSV(mediaTypesRaw),
 			StartIndex:   startIndex,
 			Limit:        limit,
-			Detail:       needDetail,
+			Mask:         mask,
+			HasMask:      true,
 		})
 		if filmlyMode {
 			applyFilmlyResumeCompatibility(out)
@@ -1129,7 +1229,7 @@ func (h *Handler) GetSeasons(c *gin.Context) {
 	_ = q.Count(&total).Error
 	var seasons []model.Item
 	_ = q.Order("season_num ASC").Offset(startIndex).Limit(limit).Find(&seasons).Error
-	out := h.itemsToDTOs(c.Request, p, seasons, fieldsNeedDetail(queryCI(c, "Fields")))
+	out := h.itemsToDTOsWithMask(c.Request, p, seasons, parseDTOFields(queryAllCI(c, "Fields")))
 	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": total, "StartIndex": startIndex})
 }
 
@@ -1142,19 +1242,46 @@ func (h *Handler) GetEpisodes(c *gin.Context) {
 	if uidScope != "" && !h.checkUserScope(c, p, uidScope) {
 		return
 	}
-	seriesID := c.Param("seriesId")
-	series := h.getItemByID(seriesID)
-	if series == nil || !h.auth.CanAccessLibrary(p, series.LibraryID) {
-		jsonErr(c, http.StatusNotFound, "series not found")
-		return
-	}
-	q := h.db.Read().Model(&model.Item{}).Where("series_id = ? AND type = ? AND soft_deleted_at IS NULL", seriesID, "Episode")
-	if sid := queryCI(c, "SeasonId"); sid != "" {
-		q = q.Where("season_id = ?", sid)
-	}
-	if snum := queryCI(c, "Season"); snum != "" {
-		if n, err := strconv.Atoi(snum); err == nil {
-			q = q.Where("season_num = ?", n)
+
+	// Emby / Jellyfin compatibility: clients like Yamby open an Episode detail page and call
+	// GET /Shows/{seasonId}/Episodes?SeasonId={seasonId}. Prioritize SeasonId (matching Jellyfin
+	// TvShowsController.GetEpisodes & MediaStationGo), and also allow path :seriesId to be a Season
+	// or Episode ID directly instead of strictly requiring series_id = :seriesId.
+	seasonIDParam := strings.TrimSpace(queryCI(c, "SeasonId"))
+	pathID := strings.TrimSpace(c.Param("seriesId"))
+
+	var q *gorm.DB
+	if seasonIDParam != "" {
+		seasonItem := h.getItemByID(seasonIDParam)
+		if seasonItem == nil || !h.auth.CanAccessLibrary(p, seasonItem.LibraryID) {
+			jsonErr(c, http.StatusNotFound, "season not found")
+			return
+		}
+		q = h.db.Read().Model(&model.Item{}).Where("season_id = ? AND type = ? AND soft_deleted_at IS NULL", seasonItem.ID, "Episode")
+	} else {
+		target := h.getItemByID(pathID)
+		if target == nil || !h.auth.CanAccessLibrary(p, target.LibraryID) {
+			jsonErr(c, http.StatusNotFound, "series not found")
+			return
+		}
+		switch target.Type {
+		case "Season":
+			q = h.db.Read().Model(&model.Item{}).Where("season_id = ? AND type = ? AND soft_deleted_at IS NULL", target.ID, "Episode")
+		case "Episode":
+			if target.SeasonID != "" {
+				q = h.db.Read().Model(&model.Item{}).Where("season_id = ? AND type = ? AND soft_deleted_at IS NULL", target.SeasonID, "Episode")
+			} else if target.SeriesID != "" {
+				q = h.db.Read().Model(&model.Item{}).Where("series_id = ? AND type = ? AND soft_deleted_at IS NULL", target.SeriesID, "Episode")
+			} else {
+				q = h.db.Read().Model(&model.Item{}).Where("id = ? AND soft_deleted_at IS NULL", target.ID)
+			}
+		default:
+			q = h.db.Read().Model(&model.Item{}).Where("series_id = ? AND type = ? AND soft_deleted_at IS NULL", target.ID, "Episode")
+			if snum := queryCI(c, "Season"); snum != "" {
+				if n, err := strconv.Atoi(snum); err == nil {
+					q = q.Where("season_num = ?", n)
+				}
+			}
 		}
 	}
 	startIndex := queryIntCI(c, "StartIndex", 0)
@@ -1173,7 +1300,7 @@ func (h *Handler) GetEpisodes(c *gin.Context) {
 		epOrder = "RANDOM()"
 	}
 	_ = q.Order(epOrder).Offset(startIndex).Limit(limit).Find(&eps).Error
-	out := h.itemsToDTOs(c.Request, p, eps, true)
+	out := h.itemsToDTOsWithMask(c.Request, p, eps, parseDTOFields(queryAllCI(c, "Fields")))
 	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": total, "StartIndex": startIndex})
 }
 
@@ -1205,15 +1332,15 @@ func (h *Handler) GetNextUp(c *gin.Context) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	needDetail := fieldsNeedDetail(queryCI(c, "Fields"))
+	mask := parseDTOFields(queryAllCI(c, "Fields"))
 
 	originSuffix := ""
-	if needDetail {
+	if mask.MediaSources {
 		originSuffix = ":" + playback.PublicOrigin(c.Request, h.cfg.Server.PublicURL)
 	}
-	cacheKey := dtoCacheVersion + ":nextup:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), p.User.ID) + ":" + p.User.ID + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + seriesID + ":" + strconv.Itoa(startIndex) + ":" + strconv.Itoa(limit) + ":" + strconv.FormatBool(needDetail) + originSuffix
+	cacheKey := dtoCacheVersion + ":nextup:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), p.User.ID) + ":" + p.User.ID + ":" + visibleIDsHash(visibleIDs) + ":" + parentID + ":" + seriesID + ":" + strconv.Itoa(startIndex) + ":" + strconv.Itoa(limit) + ":" + mask.cacheKey() + originSuffix
 	h.writeCachedJSON(c, cacheKey, hotCacheTTL, func() (any, error) {
-		out, total := h.buildNextUpDTOsPaged(c.Request, p, visibleIDs, parentID, seriesID, startIndex, limit, needDetail)
+		out, total := h.buildNextUpDTOsPagedMask(c.Request, p, visibleIDs, parentID, seriesID, startIndex, limit, mask)
 		return gin.H{"Items": out, "TotalRecordCount": total, "StartIndex": startIndex}, nil
 	})
 }
@@ -1250,6 +1377,19 @@ func (h *Handler) GetSimilar(c *gin.Context) {
 		limit = 100
 	}
 
+	mask := parseDTOFields(queryAllCI(c, "Fields"))
+	uid := "anon"
+	if p != nil && p.User != nil {
+		uid = p.User.ID
+	}
+	excludeParam := queryAllCI(c, "ExcludeItemIds")
+	simCacheKey := dtoCacheVersion + ":similar:" + h.db.GetLibraryRevision() + ":" + h.getUserDataRev(c.Request.Context(), uid) + ":" + uid + ":" + visibleIDsHash(visibleIDs) + ":" + item.ID + ":" + strconv.Itoa(limit) + ":" + excludeParam + ":" + mask.cacheKey()
+	h.writeCachedJSON(c, simCacheKey, hotCacheTTL, func() (any, error) {
+		return h.buildSimilarResponse(c.Request, p, item, visibleIDs, limit, splitCSV(excludeParam), mask), nil
+	})
+}
+
+func (h *Handler) buildSimilarResponse(r *http.Request, p *auth.Principal, item *model.Item, visibleIDs []string, limit int, extraExclude []string, mask dtoFieldMask) gin.H {
 	// Emby official behavior: Episode and Season detail pages recommend similar Series (never Episodes/Seasons),
 	// and always exclude the episode's/season's own parent Series.
 	targetItem := item
@@ -1304,7 +1444,7 @@ func (h *Handler) GetSimilar(c *gin.Context) {
 	if targetItem != nil && targetItem.ID != "" {
 		excludeSet[targetItem.ID] = true
 	}
-	for _, eid := range splitCSV(queryAllCI(c, "ExcludeItemIds")) {
+	for _, eid := range extraExclude {
 		excludeSet[eid] = true
 	}
 	excludeIDs := make([]string, 0, len(excludeSet))
@@ -1567,19 +1707,19 @@ func (h *Handler) GetSimilar(c *gin.Context) {
 		}
 		var fallback []model.Item
 		fbQ := rdb.Model(&model.Item{}).
-			Where("library_id = ? AND type = ? AND id NOT IN ? AND soft_deleted_at IS NULL",
+			Where("items.library_id = ? AND items.type = ? AND items.id NOT IN ? AND items.soft_deleted_at IS NULL",
 				preferLibID, targetType, backfillExclude)
 		if hidePlayed {
-			fbQ = fbQ.Where("id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true)
+			fbQ = fbQ.Where("NOT EXISTS (SELECT 1 FROM user_data ud WHERE ud.user_id = ? AND ud.item_id = items.id AND ud.played = ?)", p.User.ID, true)
 		}
-		_ = fbQ.Order("community_rating DESC, added_at DESC, id ASC").
+		_ = fbQ.Order("items.community_rating DESC, items.added_at DESC, items.id ASC").
 			Limit(rem).
 			Find(&fallback).Error
 		rows = append(rows, fallback...)
 	}
 
-	out := h.itemsToDTOs(c.Request, p, rows, fieldsNeedDetail(queryAllCI(c, "Fields")))
-	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": len(out), "StartIndex": 0})
+	out := h.itemsToDTOsWithMask(r, p, rows, mask)
+	return gin.H{"Items": out, "TotalRecordCount": len(out), "StartIndex": 0}
 }
 
 func stringSetFromJSON(raw string) map[string]bool {
@@ -1728,7 +1868,7 @@ func (h *Handler) GetInstantMix(c *gin.Context) {
 
 	var rows []model.Item
 	_ = q.Order("RANDOM()").Limit(limit).Find(&rows).Error
-	out := h.itemsToDTOs(c.Request, p, rows, fieldsNeedDetail(queryAllCI(c, "Fields")))
+	out := h.itemsToDTOsWithMask(c.Request, p, rows, parseDTOFields(queryAllCI(c, "Fields")))
 	c.JSON(http.StatusOK, gin.H{"Items": out, "TotalRecordCount": len(out), "StartIndex": 0})
 }
 
@@ -2029,7 +2169,11 @@ func (h *Handler) GetItemImage(c *gin.Context) {
 	// Check VirtualLibrary cover first.
 	if strings.HasPrefix(itemID, "vlib-") {
 		var cover model.LibraryCover
-		if err := h.db.Gorm.Where("library_id = ?", itemID).First(&cover).Error; err == nil {
+		if err := h.db.Read().Where("library_id = ?", itemID).First(&cover).Error; err == nil {
+			if h.images != nil {
+				_ = h.images.ServeBytes(c.Writer, c.Request, cover.Data, cover.Mime, cover.Revision, maxWidth, maxHeight, quality)
+				return
+			}
 			etag := `"` + cover.Revision + `"`
 			if c.GetHeader("If-None-Match") == etag {
 				c.Status(http.StatusNotModified)
@@ -2044,33 +2188,39 @@ func (h *Handler) GetItemImage(c *gin.Context) {
 		return
 	}
 
-	// Check Library cover first.
-	var lib model.Library
-	if err := h.db.Gorm.Where("id = ?", itemID).First(&lib).Error; err == nil {
-		if p != nil && !h.auth.CanAccessLibrary(p, lib.ID) {
+	// Check Library cover only when itemID is a known Library ID (skips a wasted DB query on 99.9% of item images).
+	if h.auth.IsKnownLibraryID(itemID) {
+		var lib model.Library
+		if err := h.db.Read().Where("id = ?", itemID).First(&lib).Error; err == nil {
+			if p != nil && !h.auth.CanAccessLibrary(p, lib.ID) {
+				c.Status(http.StatusNotFound)
+				return
+			}
+			var cover model.LibraryCover
+			if err := h.db.Read().Where("library_id = ?", lib.ID).First(&cover).Error; err == nil {
+				if h.images != nil {
+					_ = h.images.ServeBytes(c.Writer, c.Request, cover.Data, cover.Mime, cover.Revision, maxWidth, maxHeight, quality)
+					return
+				}
+				c.Header("ETag", `"`+cover.Revision+`"`)
+				c.Header("Cache-Control", "private, max-age=86400")
+				c.Data(http.StatusOK, cover.Mime, cover.Data)
+				return
+			}
+			// Fallback to latest item's Primary image in that library.
+			var firstImg model.ItemImage
+			err := h.db.Read().Table("item_images").
+				Joins("JOIN items ON items.id = item_images.item_id").
+				Where("items.library_id = ? AND items.soft_deleted_at IS NULL AND item_images.kind = ?", lib.ID, "Primary").
+				Order("items.added_at DESC").
+				First(&firstImg).Error
+			if err == nil && firstImg.SourceType == "local" {
+				h.serveLocalImage(c, firstImg.SourceRef, firstImg.Tag, maxWidth, maxHeight, quality)
+				return
+			}
 			c.Status(http.StatusNotFound)
 			return
 		}
-		var cover model.LibraryCover
-		if err := h.db.Gorm.Where("library_id = ?", lib.ID).First(&cover).Error; err == nil {
-			c.Header("ETag", `"`+cover.Revision+`"`)
-			c.Header("Cache-Control", "private, max-age=86400")
-			c.Data(http.StatusOK, cover.Mime, cover.Data)
-			return
-		}
-		// Fallback to latest item's Primary image in that library.
-		var firstImg model.ItemImage
-		err := h.db.Gorm.Table("item_images").
-			Joins("JOIN items ON items.id = item_images.item_id").
-			Where("items.library_id = ? AND items.soft_deleted_at IS NULL AND item_images.kind = ?", lib.ID, "Primary").
-			Order("items.added_at DESC").
-			First(&firstImg).Error
-		if err == nil && firstImg.SourceType == "local" {
-			h.serveLocalImage(c, firstImg.SourceRef, firstImg.Tag, maxWidth, maxHeight, quality)
-			return
-		}
-		c.Status(http.StatusNotFound)
-		return
 	}
 
 	item := h.getItemByID(itemID)
@@ -2244,15 +2394,45 @@ func personNoImgCacheKey(personID string) string {
 }
 
 func (h *Handler) isPersonPortraitMissing(ctx context.Context, personID string) bool {
-	if h.cache == nil || personID == "" {
+	if personID == "" {
+		return false
+	}
+	now := time.Now()
+	h.personNoImgMu.RLock()
+	if exp, ok := h.personNoImgMem[personID]; ok {
+		h.personNoImgMu.RUnlock()
+		if now.Before(exp) {
+			return true
+		}
+	} else {
+		h.personNoImgMu.RUnlock()
+	}
+	if h.cache == nil {
 		return false
 	}
 	_, ok := h.cache.Get(ctx, personNoImgCacheKey(personID))
+	if ok {
+		h.personNoImgMu.Lock()
+		if h.personNoImgMem == nil || len(h.personNoImgMem) > 16384 {
+			h.personNoImgMem = make(map[string]time.Time, 256)
+		}
+		h.personNoImgMem[personID] = now.Add(15 * time.Minute)
+		h.personNoImgMu.Unlock()
+	}
 	return ok
 }
 
 func (h *Handler) markPersonPortraitMissing(ctx context.Context, personID string) {
-	if h.cache == nil || personID == "" {
+	if personID == "" {
+		return
+	}
+	h.personNoImgMu.Lock()
+	if h.personNoImgMem == nil || len(h.personNoImgMem) > 16384 {
+		h.personNoImgMem = make(map[string]time.Time, 256)
+	}
+	h.personNoImgMem[personID] = time.Now().Add(15 * time.Minute)
+	h.personNoImgMu.Unlock()
+	if h.cache == nil {
 		return
 	}
 	_ = h.cache.Set(ctx, personNoImgCacheKey(personID), []byte("1"), 24*time.Hour)
@@ -2603,40 +2783,66 @@ func (h *Handler) handlePlaybackEvent(c *gin.Context, kind string) {
 		_ = h.auth.AcquireOrRenewLease(p, body.PlaySessionID, body.ItemID, body.MediaSourceID, pos, body.IsPaused)
 	}
 
-	// Persist UserData progress.
+	// Persist UserData progress with Jellyfin/Emby/MediaStationGo-aligned thresholds so
+	// brief accidental opens (e.g. 1-59s on unprobed STRM or <5% on known-runtime items)
+	// do not pollute Continue Watching.
 	var ud model.UserData
 	err := h.db.Gorm.Where("user_id = ? AND item_id = ?", p.User.ID, body.ItemID).First(&ud).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
+	isNewRecord := errors.Is(err, gorm.ErrRecordNotFound)
+	if isNewRecord {
 		ud = model.UserData{UserID: p.User.ID, ItemID: body.ItemID}
 	}
 	now := time.Now().UTC()
-	ud.LastPlayedAt = &now
-	ud.UpdatedAt = now
-	if kind == "start" && ud.PlayCount == 0 {
-		ud.PlayCount = 1
-	}
-	if hasPos {
-		ud.PositionTicks = pos
-		ud.HideFromResume = false
+	shouldPersist := false
+
+	if hasPos && pos > 0 {
 		var runtime int64
 		if body.RunTimeTicks != nil && int64(*body.RunTimeTicks) > 0 {
 			runtime = int64(*body.RunTimeTicks)
 		} else if item := h.getItemByID(body.ItemID); item != nil {
 			runtime = item.RuntimeTicks
 		}
-		// Mark played when reaching >= 90% of runtime; otherwise re-watching clears Played so Resume tracks it.
-		if runtime > 0 && float64(pos)/float64(runtime) >= 0.90 {
+		decision := classifyPlaybackPosition(pos, runtime, h.resumeThresholds())
+		switch decision {
+		case playbackDecisionCompleted:
 			ud.Played = true
 			ud.PositionTicks = 0
 			if ud.PlayCount == 0 {
 				ud.PlayCount = 1
 			}
-		} else if pos > 0 {
+			ud.LastPlayedAt = &now
+			ud.UpdatedAt = now
+			shouldPersist = true
+		case playbackDecisionResumable:
+			ud.PositionTicks = pos
+			ud.HideFromResume = false
 			ud.Played = false
+			if ud.PlayCount == 0 {
+				ud.PlayCount = 1
+			}
+			ud.LastPlayedAt = &now
+			ud.UpdatedAt = now
+			shouldPersist = true
+		case playbackDecisionIgnoreTooEarly, playbackDecisionShortClip:
+			// Below resume threshold (e.g. opened for 1s) or too short for resume:
+			// never add a new Resume entry, and if an existing resumable entry was scrubbed
+			// back near the start, clear its PositionTicks so it exits Continue Watching.
+			if !isNewRecord && ud.PositionTicks > 0 {
+				ud.PositionTicks = 0
+				ud.UpdatedAt = now
+				shouldPersist = true
+			}
 		}
+	} else if hasPos && pos == 0 && kind != "start" && !isNewRecord && ud.PositionTicks > 0 {
+		ud.PositionTicks = 0
+		ud.UpdatedAt = now
+		shouldPersist = true
 	}
-	_ = h.db.Gorm.Save(&ud).Error
-	h.bumpUserDataRev(c.Request.Context(), p.User.ID)
+
+	if shouldPersist {
+		_ = h.db.Gorm.Save(&ud).Error
+		h.bumpUserDataRev(c.Request.Context(), p.User.ID)
+	}
 	c.Status(http.StatusNoContent)
 }
 
@@ -2829,7 +3035,7 @@ func (h *Handler) ListSessionsCompat(c *gin.Context) {
 			"DeviceId":         l.DeviceID,
 			"DeviceName":       l.DeviceName,
 			"Client":           l.Client,
-			"LastActivityDate": l.UpdatedAt.UTC().Format(time.RFC3339),
+			"LastActivityDate": formatEmbyTime(l.UpdatedAt),
 			"PlayState": map[string]any{
 				"PositionTicks": l.PositionTicks,
 				"IsPaused":      l.IsPaused,
@@ -2970,7 +3176,7 @@ func userDataResponse(itemID string, ud *model.UserData) map[string]any {
 		"ItemId":                itemID,
 	}
 	if ud.LastPlayedAt != nil {
-		m["LastPlayedDate"] = ud.LastPlayedAt.UTC().Format(time.RFC3339)
+		m["LastPlayedDate"] = formatEmbyTime(*ud.LastPlayedAt)
 	}
 	return m
 }

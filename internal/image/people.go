@@ -4,8 +4,81 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
 )
+
+const personDirCacheTTL = 5 * time.Minute
+
+type cachedBucketDir struct {
+	expiresAt time.Time
+	dirs      []string // subdirectory names
+	lowerMap  map[string]string
+}
+
+type cachedPersonImg struct {
+	expiresAt time.Time
+	path      string // empty string = confirmed negative hit
+}
+
+var (
+	personCacheMu      sync.RWMutex
+	bucketDirCache     = make(map[string]cachedBucketDir, 64)
+	personImgPathCache = make(map[string]cachedPersonImg, 1024)
+)
+
+func readBucketDirsCached(bdir string) (cachedBucketDir, bool) {
+	now := time.Now()
+	personCacheMu.RLock()
+	entry, ok := bucketDirCache[bdir]
+	personCacheMu.RUnlock()
+	if ok && now.Before(entry.expiresAt) {
+		return entry, true
+	}
+
+	entries, err := os.ReadDir(bdir)
+	if err != nil {
+		entry = cachedBucketDir{expiresAt: now.Add(personDirCacheTTL)}
+		personCacheMu.Lock()
+		bucketDirCache[bdir] = entry
+		personCacheMu.Unlock()
+		return entry, false
+	}
+	dirs := make([]string, 0, len(entries))
+	lowerMap := make(map[string]string, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		dirs = append(dirs, name)
+		ln := strings.ToLower(name)
+		if _, exists := lowerMap[ln]; !exists {
+			lowerMap[ln] = name
+		}
+	}
+	entry = cachedBucketDir{
+		expiresAt: now.Add(personDirCacheTTL),
+		dirs:      dirs,
+		lowerMap:  lowerMap,
+	}
+	personCacheMu.Lock()
+	if len(bucketDirCache) > 2048 {
+		bucketDirCache = make(map[string]cachedBucketDir, 64)
+	}
+	bucketDirCache[bdir] = entry
+	personCacheMu.Unlock()
+	return entry, true
+}
+
+// InvalidatePersonImageCache clears in-memory Emby metadata/people directory caches.
+func InvalidatePersonImageCache() {
+	personCacheMu.Lock()
+	bucketDirCache = make(map[string]cachedBucketDir, 64)
+	personImgPathCache = make(map[string]cachedPersonImg, 1024)
+	personCacheMu.Unlock()
+}
 
 var personImageNames = []string{
 	"folder.jpg", "folder.jpeg", "folder.png", "folder.webp",
@@ -37,6 +110,7 @@ func ResolveEmbyPeopleRoot(metadataDir string) string {
 
 // FindEmbyPersonImage looks up an actor/director portrait inside an Emby metadata/people directory.
 // Supports both Emby 4.x (<initial>/<Name>/folder.jpg or <Name>-tmdb-<id>) and 3.x (<Name>/folder.jpg).
+// Uses an in-memory TTL cache for bucket listings and resolved paths to avoid repeated HDD ReadDir storms.
 func FindEmbyPersonImage(metadataDir, personName, tmdbID string) string {
 	peopleRoot := ResolveEmbyPeopleRoot(metadataDir)
 	if peopleRoot == "" {
@@ -47,6 +121,30 @@ func FindEmbyPersonImage(metadataDir, personName, tmdbID string) string {
 		return ""
 	}
 
+	cacheKey := peopleRoot + "|" + strings.ToLower(safeName) + "|" + strings.TrimSpace(tmdbID)
+	now := time.Now()
+	personCacheMu.RLock()
+	if cached, ok := personImgPathCache[cacheKey]; ok && now.Before(cached.expiresAt) {
+		personCacheMu.RUnlock()
+		return cached.path
+	}
+	personCacheMu.RUnlock()
+
+	foundPath := findEmbyPersonImageUncached(peopleRoot, safeName, tmdbID)
+
+	personCacheMu.Lock()
+	if len(personImgPathCache) > 32768 {
+		personImgPathCache = make(map[string]cachedPersonImg, 1024)
+	}
+	personImgPathCache[cacheKey] = cachedPersonImg{
+		expiresAt: now.Add(personDirCacheTTL),
+		path:      foundPath,
+	}
+	personCacheMu.Unlock()
+	return foundPath
+}
+
+func findEmbyPersonImageUncached(peopleRoot, safeName, tmdbID string) string {
 	initial := personInitialBucket(safeName)
 	var bucketDirs []string
 	if initial != "" {
@@ -72,31 +170,35 @@ func FindEmbyPersonImage(metadataDir, personName, tmdbID string) string {
 		}
 		seenBucket[bkey] = true
 
-		// 1. Direct exact folder hit (<bucket>/<safeName>/folder.jpg)
-		if found := findImageInDir(filepath.Join(bdir, safeName)); found != "" {
-			return found
+		// Use cached bucket directory index first: avoids 12+ stat syscalls on missing folders
+		// and avoids re-reading large HDD directories on every request.
+		bucket, ok := readBucketDirsCached(bdir)
+		if !ok || len(bucket.dirs) == 0 {
+			continue
 		}
-		if tmdbSuffix != "" {
-			if found := findImageInDir(filepath.Join(bdir, safeName+"-"+tmdbSuffix)); found != "" {
+
+		// 1. O(1) exact case-insensitive folder match.
+		if dirName, exists := bucket.lowerMap[lowerSafe]; exists {
+			if found := findImageInDir(filepath.Join(bdir, dirName)); found != "" {
 				return found
 			}
 		}
-
-		// 2. Case-insensitive / tmdb-suffix scan within the single initial bucket (fast, small dir).
-		entries, err := os.ReadDir(bdir)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
+		if tmdbSuffix != "" {
+			if dirName, exists := bucket.lowerMap[lowerSafe+"-"+strings.ToLower(tmdbSuffix)]; exists {
+				if found := findImageInDir(filepath.Join(bdir, dirName)); found != "" {
+					return found
+				}
 			}
-			en := strings.ToLower(e.Name())
-			if en == lowerSafe ||
-				(tmdbSuffix != "" && strings.Contains(en, tmdbSuffix)) ||
+		}
+
+		// 2. Scan cached in-memory directory list for tmdb-suffix matches (zero disk I/O until hit).
+		lowerTMDB := strings.ToLower(tmdbSuffix)
+		for _, dirName := range bucket.dirs {
+			en := strings.ToLower(dirName)
+			if (lowerTMDB != "" && strings.Contains(en, lowerTMDB)) ||
 				strings.HasPrefix(en, lowerSafe+"-tmdb-") ||
 				strings.HasPrefix(en, lowerSafe+" [tmdb-") {
-				if found := findImageInDir(filepath.Join(bdir, e.Name())); found != "" {
+				if found := findImageInDir(filepath.Join(bdir, dirName)); found != "" {
 					return found
 				}
 			}
@@ -143,6 +245,7 @@ func WriteEmbyPersonImageIfMissing(metadataDir, personName, tmdbID string, data 
 		_ = os.Remove(tmpFile)
 		return "", false
 	}
+	InvalidatePersonImageCache()
 	return targetFile, true
 }
 

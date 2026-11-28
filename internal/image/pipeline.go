@@ -56,6 +56,101 @@ func NewPipeline(cacheRoot string) *Pipeline {
 	}
 }
 
+// ServeBytes serves an in-memory image (e.g. LibraryCover) with optional resizing and disk caching.
+func (p *Pipeline) ServeBytes(w http.ResponseWriter, r *http.Request, data []byte, mime, tag string, maxWidth, maxHeight, quality int) error {
+	if len(data) == 0 {
+		return os.ErrNotExist
+	}
+	if maxWidth < 0 {
+		maxWidth = 0
+	}
+	if maxHeight < 0 {
+		maxHeight = 0
+	}
+	if maxWidth > 3840 {
+		maxWidth = 3840
+	}
+	if maxHeight > 2160 {
+		maxHeight = 2160
+	}
+	if quality <= 0 || quality > 95 {
+		quality = 85
+	}
+	if (maxWidth == 0 && maxHeight == 0) || tag == "" {
+		etag := `"` + tag + `"`
+		if tag != "" && r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return nil
+		}
+		if tag != "" {
+			w.Header().Set("ETag", etag)
+		}
+		w.Header().Set("Cache-Control", "private, max-age=86400")
+		if mime != "" {
+			w.Header().Set("Content-Type", mime)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+		return nil
+	}
+
+	variantKey := cacheKey("mem:"+tag, maxWidth, maxHeight, quality)
+	etag := `"` + variantKey + `"`
+	if r.Header.Get("If-None-Match") == etag {
+		w.WriteHeader(http.StatusNotModified)
+		return nil
+	}
+	cachedPath := p.cachePath(variantKey)
+	if _, err := os.Stat(cachedPath); err == nil {
+		return serveWithETag(w, r, cachedPath, variantKey)
+	}
+	err := p.doSingleflight(variantKey, func() error {
+		if _, err := os.Stat(cachedPath); err == nil {
+			return nil
+		}
+		return p.renderBytesToCache(data, cachedPath, maxWidth, maxHeight, quality)
+	})
+	if err == nil {
+		if _, statErr := os.Stat(cachedPath); statErr == nil {
+			return serveWithETag(w, r, cachedPath, variantKey)
+		}
+	}
+	w.Header().Set("ETag", `"`+tag+`"`)
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+	if mime != "" {
+		w.Header().Set("Content-Type", mime)
+	}
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
+	return nil
+}
+
+func (p *Pipeline) renderBytesToCache(data []byte, cachedPath string, maxWidth, maxHeight, quality int) error {
+	img, format, err := stdimg.Decode(bytes.NewReader(data))
+	if err != nil {
+		return err
+	}
+	bounds := img.Bounds()
+	srcW, srcH := bounds.Dx(), bounds.Dy()
+	dstW, dstH := fitDimensions(srcW, srcH, maxWidth, maxHeight)
+	if dstW >= srcW && dstH >= srcH {
+		return nil
+	}
+	dst := stdimg.NewRGBA(stdimg.Rect(0, 0, dstW, dstH))
+	draw.BiLinear.Scale(dst, dst.Bounds(), img, bounds, draw.Over, nil)
+	var buf bytes.Buffer
+	if strings.EqualFold(format, "png") && hasAlpha(img) {
+		if err := png.Encode(&buf, dst); err != nil {
+			return err
+		}
+	} else {
+		if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: quality}); err != nil {
+			return err
+		}
+	}
+	return p.writeCacheFile(cachedPath, buf.Bytes())
+}
+
 // ServeFile serves an image with optional maxWidth/maxHeight resizing, disk caching, and ETag/304.
 func (p *Pipeline) ServeFile(w http.ResponseWriter, r *http.Request, srcPath, tag string, maxWidth, maxHeight, quality int) error {
 	if maxWidth < 0 {

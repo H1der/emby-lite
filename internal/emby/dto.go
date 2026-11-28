@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -97,7 +99,7 @@ func (h *Handler) userDTO(u *model.User, policy auth.EffectivePolicy) map[string
 		},
 	}
 	if u.LastLoginAt != nil {
-		ts := u.LastLoginAt.UTC().Format(time.RFC3339)
+		ts := formatEmbyTime(*u.LastLoginAt)
 		m["LastLoginDate"] = ts
 		m["LastActivityDate"] = ts
 	}
@@ -163,7 +165,7 @@ func (h *Handler) libraryViewDTOWithFallback(lib *model.Library, p *auth.Princip
 		"ProviderIds":              map[string]string{},
 		"ChildCount":               lib.ItemCount,
 		"RecursiveItemCount":       lib.ItemCount,
-		"DateCreated":              lib.CreatedAt.UTC().Format(time.RFC3339),
+		"DateCreated":              formatEmbyTime(lib.CreatedAt),
 		"UserData": map[string]any{
 			"PlaybackPositionTicks": 0,
 			"PlayCount":             0,
@@ -241,7 +243,7 @@ func (h *Handler) virtualLibraryViewDTO(vl *model.VirtualLibrary, p *auth.Princi
 		"Studios":                  []map[string]any{},
 		"ExternalUrls":             []any{},
 		"ProviderIds":              map[string]string{},
-		"DateCreated":              vl.CreatedAt.UTC().Format(time.RFC3339),
+		"DateCreated":              formatEmbyTime(vl.CreatedAt),
 		"UserData": map[string]any{
 			"PlaybackPositionTicks": 0,
 			"PlayCount":             0,
@@ -267,6 +269,15 @@ func (h *Handler) itemDTO(r *http.Request, p *auth.Principal, item *model.Item, 
 // itemsToDTOs converts a batch of Items into Emby-compatible DTOs using O(1) batched SQL queries
 // instead of per-item N+1 queries.
 func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.Item, detail bool) []map[string]any {
+	if detail {
+		return h.itemsToDTOsWithMask(r, p, items, dtoFieldsFull())
+	}
+	return h.itemsToDTOsWithMask(r, p, items, dtoFieldsBasic())
+}
+
+// itemsToDTOsWithMask converts a batch of Items into Emby-compatible DTOs, materializing
+// only the optional relations/fields requested by mask.
+func (h *Handler) itemsToDTOsWithMask(r *http.Request, p *auth.Principal, items []model.Item, mask dtoFieldMask) []map[string]any {
 	if len(items) == 0 {
 		return []map[string]any{}
 	}
@@ -288,6 +299,7 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 	var seriesTypeIDs []string
 	var seasonTypeIDs []string
 	var boxsetTypeIDs []string
+	needLightSource := !mask.MediaSources && (mask.Path || mask.Container)
 	for i := range items {
 		it := &items[i]
 		itemIDs = append(itemIDs, it.ID)
@@ -315,10 +327,11 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 				parentCandidateSet[it.ParentID] = true
 			}
 		}
-		if detail {
-			if it.Type == "Movie" || it.Type == "Episode" {
-				playableItems = append(playableItems, *it)
-			} else if it.Type == "Series" {
+		if (mask.MediaSources || needLightSource) && (it.Type == "Movie" || it.Type == "Episode") {
+			playableItems = append(playableItems, *it)
+		}
+		if mask.Counts {
+			if it.Type == "Series" {
 				seriesTypeIDs = append(seriesTypeIDs, it.ID)
 			} else if it.Type == "Season" {
 				seasonTypeIDs = append(seasonTypeIDs, it.ID)
@@ -543,7 +556,7 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			Select("series_id AS owner_id, COUNT(*) AS cnt").
 			Where("series_id IN ? AND type = ? AND soft_deleted_at IS NULL", allSeriesIDs, "Episode")
 		if uid != "" {
-			uq = uq.Where("id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", uid, true)
+			uq = uq.Where("NOT EXISTS (SELECT 1 FROM user_data ud WHERE ud.user_id = ? AND ud.item_id = items.id AND ud.played = ?)", uid, true)
 		}
 		_ = uq.Group("series_id").Scan(&rows).Error
 		for _, ur := range rows {
@@ -561,7 +574,7 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			Select("season_id AS owner_id, COUNT(*) AS cnt").
 			Where("season_id IN ? AND type = ? AND soft_deleted_at IS NULL", allSeasonIDs, "Episode")
 		if uid != "" {
-			uq = uq.Where("id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", uid, true)
+			uq = uq.Where("NOT EXISTS (SELECT 1 FROM user_data ud WHERE ud.user_id = ? AND ud.item_id = items.id AND ud.played = ?)", uid, true)
 		}
 		_ = uq.Group("season_id").Scan(&rows).Error
 		for _, ur := range rows {
@@ -569,19 +582,30 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		}
 	}
 
-	// 4. Batch-load Genres.
-	genresByItem := make(map[string][]string, len(itemIDs))
-	var allGenres []model.ItemGenre
-	_ = rdb.Where("item_id IN ?", itemIDs).Find(&allGenres).Error
-	for _, g := range allGenres {
-		genresByItem[g.ItemID] = append(genresByItem[g.ItemID], g.Genre)
+	// 4. Batch-load Genres only when requested.
+	var genresByItem map[string][]string
+	if mask.Genres {
+		genresByItem = make(map[string][]string, len(itemIDs))
+		var allGenres []model.ItemGenre
+		_ = rdb.Where("item_id IN ?", itemIDs).Find(&allGenres).Error
+		for _, g := range allGenres {
+			genresByItem[g.ItemID] = append(genresByItem[g.ItemID], g.Genre)
+		}
 	}
 
-	// 5. Batch-load detail relations when detail == true.
+	// 5. Batch-load optional relations strictly according to mask.
+	type lightSourceRow struct {
+		ItemID     string
+		SourceType string
+		Path       string
+		StrmURL    string
+		Container  string
+	}
 	var (
 		tagsByItem         map[string][]string
 		peopleByItem       map[string][]map[string]any
 		mediaSourcesByItem map[string][]map[string]any
+		lightSourceByItem  map[string]lightSourceRow
 		introByItem        map[string]model.IntroMarker
 		introBySeriesSeas  map[string]model.IntroMarker
 		seriesSeasonCounts map[string]int64
@@ -591,20 +615,24 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		chaptersByItem     map[string][]model.ItemChapter
 	)
 
-	if detail {
+	if mask.Tags {
 		tagsByItem = make(map[string][]string, len(itemIDs))
 		var allTags []model.ItemTag
 		_ = rdb.Where("item_id IN ?", itemIDs).Find(&allTags).Error
 		for _, t := range allTags {
 			tagsByItem[t.ItemID] = append(tagsByItem[t.ItemID], t.Tag)
 		}
+	}
+	if mask.Chapters {
 		chaptersByItem = make(map[string][]model.ItemChapter, len(itemIDs))
 		var allChapters []model.ItemChapter
 		_ = rdb.Where("item_id IN ?", itemIDs).Order("item_id, index_num").Find(&allChapters).Error
 		for _, c := range allChapters {
 			chaptersByItem[c.ItemID] = append(chaptersByItem[c.ItemID], c)
 		}
+	}
 
+	if mask.People {
 		type personRow struct {
 			ItemID    string
 			PersonID  string
@@ -641,94 +669,113 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			}
 			peopleByItem[pr.ItemID] = append(peopleByItem[pr.ItemID], pe)
 		}
+	}
 
-		if len(playableItems) > 0 {
-			mediaSourcesByItem = h.playback.BuildMediaSourcesBatch(r, p, playableItems)
-
-			playableIDs := make([]string, 0, len(playableItems))
-			playSeriesSet := map[string]bool{}
-			for i := range playableItems {
-				playableIDs = append(playableIDs, playableItems[i].ID)
-				if playableItems[i].SeriesID != "" {
-					playSeriesSet[playableItems[i].SeriesID] = true
-				}
-			}
-			introByItem = make(map[string]model.IntroMarker)
-			introBySeriesSeas = make(map[string]model.IntroMarker)
-			var markers []model.IntroMarker
-			mq := rdb.Where("item_id IN ?", playableIDs)
-			if len(playSeriesSet) > 0 {
-				sIDs := make([]string, 0, len(playSeriesSet))
-				for sid := range playSeriesSet {
-					sIDs = append(sIDs, sid)
-				}
-				mq = rdb.Where("item_id IN ? OR (series_id IN ? AND item_id = '')", playableIDs, sIDs)
-			}
-			_ = mq.Find(&markers).Error
-			for _, mk := range markers {
-				if mk.ItemID != "" {
-					introByItem[mk.ItemID] = mk
-				} else if mk.SeriesID != "" {
-					introBySeriesSeas[seriesSeasonKey(mk.SeriesID, mk.SeasonNum)] = mk
-				}
+	if mask.MediaSources && len(playableItems) > 0 {
+		mediaSourcesByItem = h.playback.BuildMediaSourcesBatch(r, p, playableItems)
+	} else if needLightSource && len(playableItems) > 0 {
+		playIDs := make([]string, len(playableItems))
+		for i := range playableItems {
+			playIDs[i] = playableItems[i].ID
+		}
+		var lRows []lightSourceRow
+		_ = rdb.Table("media_sources").
+			Select("item_id, source_type, path, strm_url, container").
+			Where("item_id IN ?", playIDs).
+			Order("height DESC, bitrate DESC, file_size DESC, id ASC").
+			Scan(&lRows).Error
+		lightSourceByItem = make(map[string]lightSourceRow, len(playIDs))
+		for _, lr := range lRows {
+			if _, exists := lightSourceByItem[lr.ItemID]; !exists {
+				lightSourceByItem[lr.ItemID] = lr
 			}
 		}
+	}
 
-		if len(seriesTypeIDs) > 0 {
-			seriesSeasonCounts = make(map[string]int64, len(seriesTypeIDs))
-			seriesEpCounts = make(map[string]int64, len(seriesTypeIDs))
-			type cntRow struct {
-				SeriesID string
-				Type     string
-				Cnt      int64
-			}
-			var cnts []cntRow
-			_ = rdb.Table("items").
-				Select("series_id, type, COUNT(*) AS cnt").
-				Where("series_id IN ? AND type IN ? AND soft_deleted_at IS NULL", seriesTypeIDs, []string{"Season", "Episode"}).
-				Group("series_id, type").
-				Scan(&cnts).Error
-			for _, cr := range cnts {
-				if cr.Type == "Season" {
-					seriesSeasonCounts[cr.SeriesID] = cr.Cnt
-				} else if cr.Type == "Episode" {
-					seriesEpCounts[cr.SeriesID] = cr.Cnt
-				}
+	if mask.Chapters && len(playableItems) > 0 {
+		playableIDs := make([]string, 0, len(playableItems))
+		playSeriesSet := map[string]bool{}
+		for i := range playableItems {
+			playableIDs = append(playableIDs, playableItems[i].ID)
+			if playableItems[i].SeriesID != "" {
+				playSeriesSet[playableItems[i].SeriesID] = true
 			}
 		}
-
-		if len(seasonTypeIDs) > 0 {
-			seasonEpCounts = make(map[string]int64, len(seasonTypeIDs))
-			type cntRow struct {
-				SeasonID string
-				Cnt      int64
+		introByItem = make(map[string]model.IntroMarker)
+		introBySeriesSeas = make(map[string]model.IntroMarker)
+		var markers []model.IntroMarker
+		mq := rdb.Where("item_id IN ?", playableIDs)
+		if len(playSeriesSet) > 0 {
+			sIDs := make([]string, 0, len(playSeriesSet))
+			for sid := range playSeriesSet {
+				sIDs = append(sIDs, sid)
 			}
-			var cnts []cntRow
-			_ = rdb.Table("items").
-				Select("season_id, COUNT(*) AS cnt").
-				Where("season_id IN ? AND type = ? AND soft_deleted_at IS NULL", seasonTypeIDs, "Episode").
-				Group("season_id").
-				Scan(&cnts).Error
-			for _, cr := range cnts {
-				seasonEpCounts[cr.SeasonID] = cr.Cnt
+			mq = rdb.Where("item_id IN ? OR (series_id IN ? AND item_id = '')", playableIDs, sIDs)
+		}
+		_ = mq.Find(&markers).Error
+		for _, mk := range markers {
+			if mk.ItemID != "" {
+				introByItem[mk.ItemID] = mk
+			} else if mk.SeriesID != "" {
+				introBySeriesSeas[seriesSeasonKey(mk.SeriesID, mk.SeasonNum)] = mk
 			}
 		}
+	}
 
-		if len(boxsetTypeIDs) > 0 {
-			boxsetMemberCounts = make(map[string]int64, len(boxsetTypeIDs))
-			type boxCntRow struct {
-				BoxSetID string
-				Cnt      int64
+	if mask.Counts && len(seriesTypeIDs) > 0 {
+		seriesSeasonCounts = make(map[string]int64, len(seriesTypeIDs))
+		seriesEpCounts = make(map[string]int64, len(seriesTypeIDs))
+		type cntRow struct {
+			SeriesID string
+			Type     string
+			Cnt      int64
+		}
+		var cnts []cntRow
+		_ = rdb.Table("items").
+			Select("series_id, type, COUNT(*) AS cnt").
+			Where("series_id IN ? AND type IN ? AND soft_deleted_at IS NULL", seriesTypeIDs, []string{"Season", "Episode"}).
+			Group("series_id, type").
+			Scan(&cnts).Error
+		for _, cr := range cnts {
+			if cr.Type == "Season" {
+				seriesSeasonCounts[cr.SeriesID] = cr.Cnt
+			} else if cr.Type == "Episode" {
+				seriesEpCounts[cr.SeriesID] = cr.Cnt
 			}
-			var cnts []boxCntRow
-			_ = rdb.Table("box_set_items").
-				Select("box_set_id, COUNT(*) AS cnt").
-				Where("box_set_id IN ?", boxsetTypeIDs).
-				Group("box_set_id").
-				Scan(&cnts).Error
-			for _, cr := range cnts {
-				boxsetMemberCounts[cr.BoxSetID] = cr.Cnt
-			}
+		}
+	}
+
+	if mask.Counts && len(seasonTypeIDs) > 0 {
+		seasonEpCounts = make(map[string]int64, len(seasonTypeIDs))
+		type cntRow struct {
+			SeasonID string
+			Cnt      int64
+		}
+		var cnts []cntRow
+		_ = rdb.Table("items").
+			Select("season_id, COUNT(*) AS cnt").
+			Where("season_id IN ? AND type = ? AND soft_deleted_at IS NULL", seasonTypeIDs, "Episode").
+			Group("season_id").
+			Scan(&cnts).Error
+		for _, cr := range cnts {
+			seasonEpCounts[cr.SeasonID] = cr.Cnt
+		}
+	}
+
+	if mask.Counts && len(boxsetTypeIDs) > 0 {
+		boxsetMemberCounts = make(map[string]int64, len(boxsetTypeIDs))
+		type boxCntRow struct {
+			BoxSetID string
+			Cnt      int64
+		}
+		var cnts []boxCntRow
+		_ = rdb.Table("box_set_items").
+			Select("box_set_id, COUNT(*) AS cnt").
+			Where("box_set_id IN ?", boxsetTypeIDs).
+			Group("box_set_id").
+			Scan(&cnts).Error
+		for _, cr := range cnts {
+			boxsetMemberCounts[cr.BoxSetID] = cr.Cnt
 		}
 	}
 
@@ -762,7 +809,7 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			userDataMap["UnplayedItemCount"] = unplayedBySeason[item.ID]
 		}
 		if ud.LastPlayedAt != nil {
-			userDataMap["LastPlayedDate"] = ud.LastPlayedAt.UTC().Format(time.RFC3339)
+			userDataMap["LastPlayedDate"] = formatEmbyTime(*ud.LastPlayedAt)
 		}
 		if item.RuntimeTicks > 0 && ud.PositionTicks > 0 {
 			pct := float64(ud.PositionTicks) / float64(item.RuntimeTicks) * 100
@@ -782,6 +829,10 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			aspectRatio = 16.0 / 9.0
 		}
 
+		modifiedAt := item.UpdatedAt
+		if modifiedAt.IsZero() {
+			modifiedAt = item.AddedAt
+		}
 		m := map[string]any{
 			"Name":                    item.Name,
 			"OriginalTitle":           item.OriginalName,
@@ -792,8 +843,8 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			"ParentId":                item.ParentID,
 			"Type":                    item.Type,
 			"IsFolder":                isFolder,
-			"Overview":                item.Overview,
-			"DateCreated":             item.AddedAt.UTC().Format(time.RFC3339),
+			"DateCreated":             formatEmbyTime(item.AddedAt),
+			"DateModified":            formatEmbyTime(modifiedAt),
 			"ImageTags":               imageTags,
 			"BackdropImageTags":       backdropTags,
 			"PrimaryImageAspectRatio": aspectRatio,
@@ -806,6 +857,9 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			"ExternalUrls":            []any{},
 			"RemoteTrailers":          []any{},
 			"SupportsSync":            false,
+		}
+		if mask.Overview {
+			m["Overview"] = item.Overview
 		}
 		if primaryTag := imageTags["Primary"]; primaryTag != "" {
 			m["PrimaryImageItemId"] = item.ID
@@ -981,19 +1035,21 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 		}
 		m["ProviderIds"] = providerIDs
 
-		gNames := genresByItem[item.ID]
-		if gNames == nil {
-			gNames = []string{}
+		if mask.Genres {
+			gNames := genresByItem[item.ID]
+			if gNames == nil {
+				gNames = []string{}
+			}
+			// Emby OpenAPI BaseItemDto.GenreItems is NameLongIdPair[] (Id MUST be int64).
+			genreItems := make([]map[string]any, 0, len(gNames))
+			for _, g := range gNames {
+				genreItems = append(genreItems, map[string]any{"Name": g, "Id": stableNumericID("genre", g)})
+			}
+			m["Genres"] = gNames
+			m["GenreItems"] = genreItems
 		}
-		// Emby OpenAPI BaseItemDto.GenreItems is NameLongIdPair[] (Id MUST be int64).
-		genreItems := make([]map[string]any, 0, len(gNames))
-		for _, g := range gNames {
-			genreItems = append(genreItems, map[string]any{"Name": g, "Id": stableNumericID("genre", g)})
-		}
-		m["Genres"] = gNames
-		m["GenreItems"] = genreItems
 
-		if detail {
+		if mask.Tags {
 			tNames := tagsByItem[item.ID]
 			if tNames == nil {
 				tNames = []string{}
@@ -1004,7 +1060,9 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 			}
 			m["Tags"] = tNames
 			m["TagItems"] = tagItems
+		}
 
+		if mask.Studios {
 			var studios []string
 			if item.StudiosJSON != "" {
 				_ = json.Unmarshal([]byte(item.StudiosJSON), &studios)
@@ -1019,14 +1077,18 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 				studioObjs = append(studioObjs, map[string]any{"Name": st, "Id": stableNumericID("studio", st)})
 			}
 			m["Studios"] = studioObjs
+		}
 
+		if mask.People {
 			pList := peopleByItem[item.ID]
 			if pList == nil {
 				pList = []map[string]any{}
 			}
 			m["People"] = pList
+		}
 
-			if item.Type == "Movie" || item.Type == "Episode" {
+		if item.Type == "Movie" || item.Type == "Episode" {
+			if mask.MediaSources {
 				sources := mediaSourcesByItem[item.ID]
 				if sources == nil {
 					sources = []map[string]any{}
@@ -1036,6 +1098,23 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 				if len(sources) > 0 {
 					applyMediaSourceSummaryToItemDTO(m, sources[0])
 				}
+			} else if needLightSource {
+				if lr, ok := lightSourceByItem[item.ID]; ok {
+					if mask.Path {
+						pVal := lr.Path
+						if lr.SourceType == "strm" && strings.TrimSpace(lr.StrmURL) != "" {
+							pVal = strings.TrimSpace(lr.StrmURL)
+						}
+						if strings.TrimSpace(pVal) != "" {
+							m["Path"] = pVal
+						}
+					}
+					if mask.Container && strings.TrimSpace(lr.Container) != "" {
+						m["Container"] = lr.Container
+					}
+				}
+			}
+			if mask.Chapters {
 				if cs := chaptersByItem[item.ID]; len(cs) > 0 {
 					chapters := make([]map[string]any, 0, len(cs))
 					for idx, c := range cs {
@@ -1063,22 +1142,19 @@ func (h *Handler) itemsToDTOs(r *http.Request, p *auth.Principal, items []model.
 					}
 				}
 			}
-
-			if item.Type == "Series" {
-				if strings.TrimSpace(item.DirPath) != "" {
-					m["Path"] = item.DirPath
-				}
-				m["ChildCount"] = seriesSeasonCounts[item.ID]
-				m["RecursiveItemCount"] = seriesEpCounts[item.ID]
-			} else if item.Type == "Season" {
-				if strings.TrimSpace(item.DirPath) != "" {
-					m["Path"] = item.DirPath
-				}
-				m["ChildCount"] = seasonEpCounts[item.ID]
-			} else if item.Type == "BoxSet" {
-				m["ChildCount"] = boxsetMemberCounts[item.ID]
-			} else if item.Type == "Folder" && strings.TrimSpace(item.DirPath) != "" {
+		} else {
+			if mask.Path && strings.TrimSpace(item.DirPath) != "" {
 				m["Path"] = item.DirPath
+			}
+			if mask.Counts {
+				if item.Type == "Series" {
+					m["ChildCount"] = seriesSeasonCounts[item.ID]
+					m["RecursiveItemCount"] = seriesEpCounts[item.ID]
+				} else if item.Type == "Season" {
+					m["ChildCount"] = seasonEpCounts[item.ID]
+				} else if item.Type == "BoxSet" {
+					m["ChildCount"] = boxsetMemberCounts[item.ID]
+				}
 			}
 		}
 
@@ -1209,17 +1285,28 @@ func itemEtag(item *model.Item) string {
 
 func applyMediaSourceSummaryToItemDTO(m map[string]any, src map[string]any) {
 	delete(m, "Path")
+	delete(m, "FileName")
 	delete(m, "MediaStreams")
 	delete(m, "HasSubtitles")
 	delete(m, "Container")
 	delete(m, "Width")
 	delete(m, "Height")
 	delete(m, "IsHD")
+	delete(m, "Size")
+	delete(m, "Bitrate")
+	delete(m, "PartCount")
 	if src == nil {
 		return
 	}
 	if pathStr, _ := src["Path"].(string); strings.TrimSpace(pathStr) != "" {
 		m["Path"] = pathStr
+		if strings.HasPrefix(strings.ToLower(pathStr), "http://") || strings.HasPrefix(strings.ToLower(pathStr), "https://") {
+			if base := path.Base(pathStr); base != "" && base != "." && base != "/" {
+				m["FileName"] = base
+			}
+		} else if base := filepath.Base(pathStr); base != "" && base != "." && base != "/" {
+			m["FileName"] = base
+		}
 	}
 	if streams, ok := src["MediaStreams"]; ok {
 		m["MediaStreams"] = streams
@@ -1237,6 +1324,13 @@ func applyMediaSourceSummaryToItemDTO(m map[string]any, src map[string]any) {
 	if container, ok := src["Container"]; ok {
 		m["Container"] = container
 	}
+	if sz, ok := src["Size"].(int64); ok && sz > 0 {
+		m["Size"] = sz
+	}
+	if br, ok := src["Bitrate"].(int64); ok && br > 0 {
+		m["Bitrate"] = br
+	}
+	m["PartCount"] = 1
 	w, _ := src["Width"].(int)
 	h, _ := src["Height"].(int)
 	if w > 0 {

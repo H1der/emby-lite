@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"emby-lite/internal/auth"
@@ -20,8 +21,14 @@ import (
 
 const (
 	hotCacheTTL     = 60 * time.Second
-	dtoCacheVersion = "v4"
+	dtoCacheVersion = "v5"
 )
+
+type jsonFlightCall struct {
+	wg  sync.WaitGroup
+	raw []byte
+	err error
+}
 
 func (h *Handler) userDataRevKey(uid string) string {
 	return "udrev:" + uid
@@ -57,25 +64,68 @@ func visibleIDsHash(ids []string) string {
 }
 
 func (h *Handler) writeCachedJSON(c *gin.Context, key string, ttl time.Duration, build func() (any, error)) {
+	h.writeCachedJSONWithHook(c, key, ttl, nil, build)
+}
+
+func (h *Handler) writeCachedJSONWithHook(c *gin.Context, key string, ttl time.Duration, beforeWrite func(raw []byte), build func() (any, error)) {
 	ctx := c.Request.Context()
 	if h.cache != nil {
 		if raw, ok := h.cache.Get(ctx, key); ok {
+			if beforeWrite != nil {
+				beforeWrite(raw)
+			}
 			c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
 			return
 		}
 	}
+
+	h.cacheFlightMu.Lock()
+	if h.cacheFlights == nil {
+		h.cacheFlights = make(map[string]*jsonFlightCall)
+	}
+	if existing, ok := h.cacheFlights[key]; ok {
+		h.cacheFlightMu.Unlock()
+		existing.wg.Wait()
+		if existing.err != nil {
+			jsonErr(c, http.StatusInternalServerError, existing.err.Error())
+			return
+		}
+		if beforeWrite != nil {
+			beforeWrite(existing.raw)
+		}
+		c.Data(http.StatusOK, "application/json; charset=utf-8", existing.raw)
+		return
+	}
+	call := &jsonFlightCall{}
+	call.wg.Add(1)
+	h.cacheFlights[key] = call
+	h.cacheFlightMu.Unlock()
+
+	defer func() {
+		call.wg.Done()
+		h.cacheFlightMu.Lock()
+		delete(h.cacheFlights, key)
+		h.cacheFlightMu.Unlock()
+	}()
+
 	payload, err := build()
 	if err != nil {
+		call.err = err
 		jsonErr(c, http.StatusInternalServerError, err.Error())
 		return
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
+		call.err = err
 		jsonErr(c, http.StatusInternalServerError, err.Error())
 		return
 	}
+	call.raw = raw
 	if h.cache != nil {
 		_ = h.cache.Set(ctx, key, raw, ttl)
+	}
+	if beforeWrite != nil {
+		beforeWrite(raw)
 	}
 	c.Data(http.StatusOK, "application/json; charset=utf-8", raw)
 }
@@ -121,10 +171,18 @@ func (h *Handler) buildUserViewsItems(p *auth.Principal, visibleIDs []string, in
 }
 
 func (h *Handler) buildLatestDTOs(r *http.Request, p *auth.Principal, visibleIDs []string, parentID string, limit int) []map[string]any {
-	return h.buildLatestDTOsWithOpts(r, p, visibleIDs, parentID, limit, nil, "", false)
+	return h.buildLatestDTOsWithMask(r, p, visibleIDs, parentID, limit, nil, "", dtoFieldsBasic())
 }
 
 func (h *Handler) buildLatestDTOsWithOpts(r *http.Request, p *auth.Principal, visibleIDs []string, parentID string, limit int, includeTypes []string, isPlayed string, detail bool) []map[string]any {
+	mask := dtoFieldsBasic()
+	if detail {
+		mask = dtoFieldsFull()
+	}
+	return h.buildLatestDTOsWithMask(r, p, visibleIDs, parentID, limit, includeTypes, isPlayed, mask)
+}
+
+func (h *Handler) buildLatestDTOsWithMask(r *http.Request, p *auth.Principal, visibleIDs []string, parentID string, limit int, includeTypes []string, isPlayed string, mask dtoFieldMask) []map[string]any {
 	if len(visibleIDs) == 0 {
 		return []map[string]any{}
 	}
@@ -140,21 +198,21 @@ func (h *Handler) buildLatestDTOsWithOpts(r *http.Request, p *auth.Principal, vi
 		types = []string{"Movie", "Series"}
 	}
 	q := h.db.Read().Model(&model.Item{}).
-		Where("soft_deleted_at IS NULL AND library_id IN ? AND type IN ?", effectiveIDs, types)
+		Where("items.soft_deleted_at IS NULL AND items.library_id IN ? AND items.type IN ?", effectiveIDs, types)
 	if parentID != "" && parentID != "root" && !strings.HasPrefix(parentID, "vlib-") {
-		q = q.Where("library_id = ?", parentID)
+		q = q.Where("items.library_id = ?", parentID)
 	}
 	if p != nil && p.User != nil {
 		hidePlayed := isPlayed == "" && h.loadUserConfig(p.User.ID).HidePlayedInLatest
 		if strings.EqualFold(isPlayed, "false") || hidePlayed {
-			q = q.Where("id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true)
+			q = q.Where("NOT EXISTS (SELECT 1 FROM user_data ud WHERE ud.user_id = ? AND ud.item_id = items.id AND ud.played = ?)", p.User.ID, true)
 		} else if strings.EqualFold(isPlayed, "true") {
-			q = q.Where("id IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true)
+			q = q.Where("EXISTS (SELECT 1 FROM user_data ud WHERE ud.user_id = ? AND ud.item_id = items.id AND ud.played = ?)", p.User.ID, true)
 		}
 	}
 	var rows []model.Item
-	_ = q.Order("added_at DESC, id ASC").Limit(limit).Find(&rows).Error
-	return h.itemsToDTOs(r, p, rows, detail)
+	_ = q.Order("items.added_at DESC, items.id ASC").Limit(limit).Find(&rows).Error
+	return h.itemsToDTOsWithMask(r, p, rows, mask)
 }
 
 type resumeQueryOpts struct {
@@ -165,6 +223,8 @@ type resumeQueryOpts struct {
 	StartIndex   int
 	Limit        int
 	Detail       bool
+	Mask         dtoFieldMask
+	HasMask      bool
 }
 
 func (h *Handler) buildResumeDTOs(r *http.Request, p *auth.Principal, visibleIDs []string, limit int) []map[string]any {
@@ -217,18 +277,26 @@ func (h *Handler) buildResumeDTOsWithOpts(r *http.Request, p *auth.Principal, vi
 		SeriesID       string
 		SeasonID       string
 		SeasonSeriesID string
+		PositionTicks  int64
+		RuntimeTicks   int64
 	}
 	var candidates []resumeCandidate
 	_ = base.Session(&gorm.Session{}).
-		Select("items.id, items.type, items.series_id, items.season_id, COALESCE(season_parent.series_id, '') AS season_series_id").
+		Select("items.id, items.type, items.series_id, items.season_id, COALESCE(season_parent.series_id, '') AS season_series_id, user_data.position_ticks, items.runtime_ticks").
 		Joins("LEFT JOIN items AS season_parent ON season_parent.id = items.season_id AND items.type = 'Episode' AND items.series_id = ''").
 		Order("COALESCE(user_data.last_played_at, user_data.updated_at) DESC, user_data.updated_at DESC, items.season_num DESC, items.episode_num DESC, items.id ASC").
 		Scan(&candidates).Error
 
-	// Keep at most one resumable episode per series (most recently watched, breaking ties by latest season/episode).
+	thresholds := h.resumeThresholds()
+
+	// Filter out entries outside Resume thresholds (e.g. 1s/2s opens, <5% progress, short clips, >=90%)
+	// and keep at most one resumable episode per series (most recently watched, breaking ties by latest season/episode).
 	seenSeries := make(map[string]bool, len(candidates))
 	winnerIDs := make([]string, 0, len(candidates))
 	for _, cand := range candidates {
+		if !isPositionResumable(cand.PositionTicks, cand.RuntimeTicks, thresholds) {
+			continue
+		}
 		if cand.Type == "Episode" {
 			seriesKey := cand.SeriesID
 			if seriesKey == "" {
@@ -270,17 +338,30 @@ func (h *Handler) buildResumeDTOsWithOpts(r *http.Request, p *auth.Principal, vi
 		}
 	}
 
-	dtos := h.itemsToDTOs(r, p, rows, opts.Detail)
+	var dtos []map[string]any
+	if opts.HasMask {
+		dtos = h.itemsToDTOsWithMask(r, p, rows, opts.Mask)
+	} else {
+		dtos = h.itemsToDTOs(r, p, rows, opts.Detail)
+	}
 	attachResumeSeriesArtwork(dtos)
 	return dtos, total
 }
 
 func (h *Handler) buildNextUpDTOs(r *http.Request, p *auth.Principal, visibleIDs []string, limit int) []map[string]any {
-	out, _ := h.buildNextUpDTOsPaged(r, p, visibleIDs, "", "", 0, limit, false)
+	out, _ := h.buildNextUpDTOsPagedMask(r, p, visibleIDs, "", "", 0, limit, dtoFieldsBasic())
 	return out
 }
 
 func (h *Handler) buildNextUpDTOsPaged(r *http.Request, p *auth.Principal, visibleIDs []string, parentID, seriesID string, startIndex, limit int, detail bool) ([]map[string]any, int) {
+	mask := dtoFieldsBasic()
+	if detail {
+		mask = dtoFieldsFull()
+	}
+	return h.buildNextUpDTOsPagedMask(r, p, visibleIDs, parentID, seriesID, startIndex, limit, mask)
+}
+
+func (h *Handler) buildNextUpDTOsPagedMask(r *http.Request, p *auth.Principal, visibleIDs []string, parentID, seriesID string, startIndex, limit int, mask dtoFieldMask) ([]map[string]any, int) {
 	if p == nil || p.User == nil || len(visibleIDs) == 0 {
 		return []map[string]any{}, 0
 	}
@@ -291,8 +372,13 @@ func (h *Handler) buildNextUpDTOsPaged(r *http.Request, p *auth.Principal, visib
 			return []map[string]any{}, 0
 		}
 	}
+	type playedEpRow struct {
+		SeriesID   string
+		SeasonNum  int
+		EpisodeNum int
+	}
 	q := h.db.Read().Table("items").
-		Select("items.*").
+		Select("items.series_id, items.season_num, items.episode_num").
 		Joins("JOIN user_data ON user_data.item_id = items.id").
 		Where("items.soft_deleted_at IS NULL AND items.type = ? AND items.library_id IN ?", "Episode", effectiveIDs).
 		Where("user_data.user_id = ? AND user_data.played = ?", p.User.ID, true)
@@ -302,24 +388,54 @@ func (h *Handler) buildNextUpDTOsPaged(r *http.Request, p *auth.Principal, visib
 	if seriesID != "" {
 		q = q.Where("items.series_id = ?", seriesID)
 	}
-	var playedEps []model.Item
-	_ = q.Order("COALESCE(user_data.last_played_at, user_data.updated_at) DESC, user_data.updated_at DESC").Limit(200).Find(&playedEps).Error
+	var playedEps []playedEpRow
+	_ = q.Order("COALESCE(user_data.last_played_at, user_data.updated_at) DESC, user_data.updated_at DESC").Limit(200).Scan(&playedEps).Error
 
-	seenSeries := map[string]bool{}
-	allNext := make([]model.Item, 0, limit)
+	// Deduplicate to the most recently played episode per series, preserving watch recency order.
+	type seriesCursor struct {
+		seriesID   string
+		seasonNum  int
+		episodeNum int
+	}
+	seenSeries := make(map[string]bool, len(playedEps))
+	orderedSeries := make([]seriesCursor, 0, len(playedEps))
+	seriesIDs := make([]string, 0, len(playedEps))
 	for _, ep := range playedEps {
 		if ep.SeriesID == "" || seenSeries[ep.SeriesID] {
 			continue
 		}
 		seenSeries[ep.SeriesID] = true
-		var next model.Item
-		err := h.db.Read().Where("series_id = ? AND type = ? AND soft_deleted_at IS NULL", ep.SeriesID, "Episode").
-			Where("(season_num > ? OR (season_num = ? AND episode_num > ?))", ep.SeasonNum, ep.SeasonNum, ep.EpisodeNum).
-			Where("id NOT IN (SELECT item_id FROM user_data WHERE user_id = ? AND played = ?)", p.User.ID, true).
-			Order("season_num ASC, episode_num ASC").
-			First(&next).Error
-		if err == nil {
-			allNext = append(allNext, next)
+		orderedSeries = append(orderedSeries, seriesCursor{
+			seriesID:   ep.SeriesID,
+			seasonNum:  ep.SeasonNum,
+			episodeNum: ep.EpisodeNum,
+		})
+		seriesIDs = append(seriesIDs, ep.SeriesID)
+	}
+	if len(seriesIDs) == 0 {
+		return []map[string]any{}, 0
+	}
+
+	// Single batched query for all candidate unplayed episodes across those series (eliminates N+1 loop).
+	var candidates []model.Item
+	_ = h.db.Read().Model(&model.Item{}).
+		Where("items.series_id IN ? AND items.type = ? AND items.soft_deleted_at IS NULL", seriesIDs, "Episode").
+		Where("NOT EXISTS (SELECT 1 FROM user_data ud WHERE ud.user_id = ? AND ud.item_id = items.id AND ud.played = ?)", p.User.ID, true).
+		Order("items.series_id ASC, items.season_num ASC, items.episode_num ASC, items.id ASC").
+		Find(&candidates).Error
+
+	candsBySeries := make(map[string][]model.Item, len(seriesIDs))
+	for _, c := range candidates {
+		candsBySeries[c.SeriesID] = append(candsBySeries[c.SeriesID], c)
+	}
+
+	allNext := make([]model.Item, 0, len(orderedSeries))
+	for _, sc := range orderedSeries {
+		for _, cand := range candsBySeries[sc.seriesID] {
+			if cand.SeasonNum > sc.seasonNum || (cand.SeasonNum == sc.seasonNum && cand.EpisodeNum > sc.episodeNum) {
+				allNext = append(allNext, cand)
+				break
+			}
 		}
 	}
 	total := len(allNext)
@@ -330,7 +446,7 @@ func (h *Handler) buildNextUpDTOsPaged(r *http.Request, p *auth.Principal, visib
 	if end > total {
 		end = total
 	}
-	return h.itemsToDTOs(r, p, allNext[startIndex:end], detail), total
+	return h.itemsToDTOsWithMask(r, p, allNext[startIndex:end], mask), total
 }
 
 func (h *Handler) buildCounts(visibleIDs []string) map[string]int64 {

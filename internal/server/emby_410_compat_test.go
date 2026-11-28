@@ -435,7 +435,7 @@ func TestEmby410AndYambyCompatibility(t *testing.T) {
 	// 10. Progress reporting with float PositionTicks + Sections/resume/Items
 	rec = doJSON(t, h, http.MethodPost, "/emby/Sessions/Playing/Progress", tok, map[string]any{
 		"ItemId":        movie.ID,
-		"PositionTicks": 1200000000.0,
+		"PositionTicks": 6000000000.0, // 600s (~6.45% of 9300s movie, above 5% MinResumePct)
 		"IsPaused":      false,
 	})
 	if rec.Code != http.StatusNoContent {

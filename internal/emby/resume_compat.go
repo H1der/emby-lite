@@ -4,12 +4,97 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"emby-lite/internal/auth"
 
 	"github.com/gin-gonic/gin"
 )
+
+const (
+	ticksPerSecond int64 = 10_000_000
+
+	// Default resume thresholds aligned with Emby/Jellyfin (MinResumePct=5%, MaxResumePct=90%,
+	// MinResumeDurationSeconds=300s) plus a 60s minimum floor for unprobed STRM sources with
+	// unknown runtime (inspired by MediaStationGo's playback_progress_rules).
+	defaultMinResumePct             = 5
+	defaultMaxResumePct             = 90
+	defaultMinResumeDurationSeconds = 300
+	defaultMinResumeUnknownSeconds  = 60
+)
+
+type resumeThresholdConfig struct {
+	MinResumePct             int
+	MaxResumePct             int
+	MinResumeDurationSeconds int
+	MinResumeUnknownSeconds  int
+}
+
+func (h *Handler) resumeThresholds() resumeThresholdConfig {
+	cfg := resumeThresholdConfig{
+		MinResumePct:             defaultMinResumePct,
+		MaxResumePct:             defaultMaxResumePct,
+		MinResumeDurationSeconds: defaultMinResumeDurationSeconds,
+		MinResumeUnknownSeconds:  defaultMinResumeUnknownSeconds,
+	}
+	if h == nil || h.db == nil {
+		return cfg
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(h.db.GetSetting("min_resume_pct", ""))); err == nil && v >= 0 && v < 50 {
+		cfg.MinResumePct = v
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(h.db.GetSetting("max_resume_pct", ""))); err == nil && v > 50 && v <= 100 {
+		cfg.MaxResumePct = v
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(h.db.GetSetting("min_resume_duration_seconds", ""))); err == nil && v >= 0 {
+		cfg.MinResumeDurationSeconds = v
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(h.db.GetSetting("min_resume_seconds", ""))); err == nil && v >= 0 {
+		cfg.MinResumeUnknownSeconds = v
+	}
+	return cfg
+}
+
+type playbackDecisionKind int
+
+const (
+	playbackDecisionIgnoreTooEarly playbackDecisionKind = iota
+	playbackDecisionResumable
+	playbackDecisionCompleted
+	playbackDecisionShortClip
+)
+
+// classifyPlaybackPosition applies Jellyfin/Emby percentage & duration thresholds when runtime
+// is known, and a 60s absolute floor when runtime is unknown (e.g. unprobed STRM files).
+func classifyPlaybackPosition(posTicks, runtimeTicks int64, cfg resumeThresholdConfig) playbackDecisionKind {
+	if posTicks <= 0 {
+		return playbackDecisionIgnoreTooEarly
+	}
+	if runtimeTicks > 0 {
+		pct := float64(posTicks) / float64(runtimeTicks) * 100.0
+		if pct >= float64(cfg.MaxResumePct) || posTicks >= runtimeTicks-ticksPerSecond {
+			return playbackDecisionCompleted
+		}
+		if cfg.MinResumeDurationSeconds > 0 && runtimeTicks < int64(cfg.MinResumeDurationSeconds)*ticksPerSecond {
+			return playbackDecisionShortClip
+		}
+		if cfg.MinResumePct > 0 && pct < float64(cfg.MinResumePct) {
+			return playbackDecisionIgnoreTooEarly
+		}
+		return playbackDecisionResumable
+	}
+	// Unknown runtime (unprobed STRM): require at least MinResumeUnknownSeconds (default 60s)
+	// so opening a video for 1-59 seconds never pollutes Continue Watching.
+	if cfg.MinResumeUnknownSeconds > 0 && posTicks < int64(cfg.MinResumeUnknownSeconds)*ticksPerSecond {
+		return playbackDecisionIgnoreTooEarly
+	}
+	return playbackDecisionResumable
+}
+
+func isPositionResumable(posTicks, runtimeTicks int64, cfg resumeThresholdConfig) bool {
+	return classifyPlaybackPosition(posTicks, runtimeTicks, cfg) == playbackDecisionResumable
+}
 
 const filmlyResumeETagSuffix = "-filmly-resume-episode-v1"
 
